@@ -1,0 +1,7 @@
+- insert:
+    - id: session-link
+      name: dsh-session-link
+    - id: tool-session-link
+      name: dsh-session-link/tools
+    - id: command-session-link
+      name: dsh-session-link/command

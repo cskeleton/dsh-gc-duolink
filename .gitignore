@@ -1,0 +1,11 @@
+node_modules/
+lib/
+artifacts/
+tsconfig.sdk.json
+tsconfig.build.json
+output/
+.DS_Store
+.env
+.env.*
+!.env.example
+*.log
