@@ -222,6 +222,12 @@ export interface SessionLinkSendRequest {
   readonly idempotencyKey?: string
   /** Optional pre-delivery cancellation. */
   readonly signal?: AbortSignal
+  /**
+   * Caller-derived message identity (tracked-task admission only). Legacy
+   * model-less calls NEVER pass this and keep the mailbox's own random
+   * identity mint untouched.
+   */
+  readonly messageId?: SessionLinkMessageId
 }
 
 /** Deployment limits for the Session Link service. */

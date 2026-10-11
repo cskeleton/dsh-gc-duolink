@@ -116,6 +116,12 @@ export {
   TaskInvariantError,
   taskIdFor,
 } from './tasks.ts'
+export {
+  installTaskRuntime,
+  PERSISTENT_SELECTION_SKIPPED,
+  precheckFailureOf,
+  requestedRouteOf,
+} from './task-runtime.ts'
 export type {
   AttachBindingInput,
   CreateTaskIntentInput,

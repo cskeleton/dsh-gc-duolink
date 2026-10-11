@@ -803,7 +803,7 @@ export class SessionLinkService extends TypertRemoteService {
     if (this.ctx.workspaceRegistry.archivedSessionIds.includes(targetId)) {
       throw new SessionLinkError(`session "${targetId}" is archived`, 'TARGET_ARCHIVED')
     }
-    const messageId = SessionLinkMessageId(`session-link-message-${randomUUID()}`)
+    const messageId = request.messageId ?? SessionLinkMessageId(`session-link-message-${randomUUID()}`)
     const senderTitle = this.titleOf(caller)
     const framed = frameSessionLinkText({ senderTitle, senderId: caller.id, messageId, text: request.text })
     if (Buffer.byteLength(framed, 'utf8') > this.resolved.maxMessageBytes) {
