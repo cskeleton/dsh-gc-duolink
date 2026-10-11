@@ -1,21 +1,89 @@
-# Verification — current 0.4.1 workspace
+# Verification — dsh-session-link 0.4.1 workspace
 
-## Approved preset / UI / return-wake implementation
+## Current round — model-routing integration proof (2026-10-12)
 
-The current source and generated bundles implement the approved update. This is **workspace completion, not a live-profile upgrade**. No Host source, installed plugin, user profile, existing group authorization or historical messages were changed. An unrelated pre-existing model-routing plan was left untouched.
+This round verified the model-routing feature line end to end in an **isolated environment**: no live profile was switched, no real paid-model request was made, and the original DSH checkout was never committed, pushed, reverted, or cleaned. Everything below is THIS round's fresh evidence; the prior-round results are kept at the bottom labeled historical.
 
-| Check | Fresh result |
+### Environment facts
+
+- Plugin: `dsh-session-link 0.4.1` (workspace), built with npm SDK `0.2.0-rc.2` dev peers; zod pinned `4.4.3`.
+- Host source: DSH checkout `/Users/gc/Dev/Opensource/deepseek-harness` @ `656ca652a0` (`feat(session-link): human-granted peer messaging between top-level Sessions`), plus the **additive task-host extension that is NOT committed in the checkout** (working-tree state: untracked `packages/api/session-controller/src/task-host/` (error-classifier.ts, facts.ts, index.ts, types.ts) + a modified `packages/api/session-controller/src/index.ts` export block; `TASK_HOST_VERSION = 1`).
+- Storage domains: `session_link` v1 (unchanged; Task 5 added optional `statusKind`/`taskStatus` fields — additive, zod-optional, old rows read unchanged) and `session_link_tasks` v1 (new domain this feature line introduces).
+- Capability gate: `taskHostVersion` reports `1`; tracked paths require the host task-execution capability and refuse with `HOST_CAPABILITY_UNAVAILABLE` when it is absent.
+- UI smoke runtime: official `dsh 0.2.0-rc.2` CLI, isolated `DSH_HOME`/profile/npm cache, Brave; zero model calls (`modelCalls: 0` in the machine-readable result).
+
+### Commands run this round — all PASS
+
+| Command | Result |
 | --- | --- |
-| `pnpm build` using installed npm SDK `0.2.0-rc.2` | PASS; TypeScript + Host/browser bundles |
-| `pnpm typecheck` | PASS using installed SDK |
-| `DSH_SOURCE_ROOT=/Users/gc/Dev/Opensource/deepseek-harness pnpm typecheck` | PASS using checkout declarations; default installed-SDK configuration restored afterward |
-| `pnpm test:client` | PASS; 39 tests in 5 suites, including 11 preset tests and 2 formal-slot/wire-owner tests |
-| `DSH_SOURCE_ROOT=… pnpm test:host` | PASS; 117 tests in 4 suites |
-| `pnpm test:contracts` | PASS; 3 built-artifact tests, including React-only browser imports and unminified RPC parameters |
-| Packed official-CLI browser smoke | PASS; `dsh 0.2.0-rc.2`, isolated Web profile/npm cache and Brave, no model requests |
-| `git diff --check` | PASS |
+| `pnpm run typecheck` | PASS (installed SDK `0.2.0-rc.2` declarations) |
+| `pnpm run build` | PASS (`lib` 5 files, 258.22 kB ESM total) |
+| `pnpm run test:contracts` | PASS — 3 built-artifact tests |
+| `pnpm run test:policy` (new) | PASS — 32 tests / 1 file (`tests/model-policy.spec.ts`, plain run, no DSH_SOURCE_ROOT) |
+| `pnpm run test:client` | PASS — 55 tests / 5 files (`client-turn` 16, `client-panel` 17, `client-state` 8, `client-registration` 3, `scope` 11); suites now listed explicitly |
+| `pnpm test` | PASS — runs `test:client` + `test:policy` + `test:contracts` (requires `build` first) |
+| `DSH_SOURCE_ROOT=/Users/gc/Dev/Opensource/deepseek-harness pnpm run test:host` | PASS — **219 tests / 9 files** (`link` 59, `remote` 17, `tool-session-link` 33, `command-session-link` 16, `model-runtime` 19, `task-routing` 22, `tasks` 37, `task-notifications` 15, `task-runtime-mixed` 1) |
+| `DSH_SOURCE_ROOT=… pnpm exec vitest run` (root, all suites incl. client+policy) | PASS — **306 tests / 15 files** |
+| `BROWSER_EXECUTABLE_PATH='/Applications/Brave Browser.app/Contents/MacOS/Brave Browser' pnpm run test:integration` | PASS — packed tarball installed into an isolated Web profile, browser exercised; result JSON: `{"result":"PASS","dshVersion":"0.2.0-rc.2","modelCalls":0,…}` |
 
-Coverage and evidence boundaries:
+Suite-registration changes this round: `scripts/test-host.mjs` now lists the three Task 3/5 host suites explicitly (previously 6 files, before/after: 161 tests → 219 tests); `package.json` gained `test:policy` and wires it into `pnpm test`; `test:client` lists its five suites by exact path instead of a `tests/client` prefix pattern (pattern already matched the suites via Vitest prefix semantics — verified before the change: 55 tests both before and after — but precision now no longer depends on that matching rule).
+
+### Automation matrix (plan Task 7) — row-by-row evidence
+
+| 场景 | Result | Evidence (test file → test name) |
+| --- | --- | --- |
+| 无模型参数旧调用 | PASS | Four tools keep legacy wire/attribution/order/idempotency/budgets: `tests/tool-session-link.spec.ts` (33 tests incl. reply-chain budget, replay, idempotency), `tests/command-session-link.spec.ts` (16), `tests/link.spec.ts` (59), `tests/remote.spec.ts` (17); legacy first-segment byte-identity: `tests/task-routing.spec.ts` → `legacy spawn/send first segments stay byte-identical and carry NO sidecar` |
+| 指定模型 spawn | PASS | `tests/task-routing.spec.ts` → `tracked spawn: admitted wire shape, first request on the requested model, task row bound`; `multi-step task turn freezes the route across both a tool step and the final answer`; post-task baseline restore: `tests/task-runtime-mixed.spec.ts` → mixed-batch regression (BASE → MODEL_A → BASE route log) |
+| 已有会话 busy + A/B 两任务 | PASS | `tests/task-routing.spec.ts` → `a running busy target keeps its current request untouched; the task waits and runs on its own route`; `a second model-bound task to the same busy target executes IN ORDER behind the first`; `tracked and untracked tasks coexist; ONLY the tracked delivery leaves a task row` |
+| session scope + fallback | PASS | `tests/task-routing.spec.ts` → `model_scope session commits only the SUCCEEDED route as the baseline; app default untouched`; `first-request route-availability failure switches to the fallback inside the same step`; `tests/model-policy.spec.ts` → `checkCandidateRoutes ordered precheck` suite |
+| 手动改模竞争 | PASS | `tests/task-routing.spec.ts` → `a mid-turn human selection change skips the session persist and projects persistent_selection_skipped`; `tests/model-runtime.spec.ts` → `mid-task baseline change blocks the persist CAS and reports human_selection_changed`; `commits the task route as baseline only when the human baseline is unchanged` |
+| admission 不可用 | PASS | `tests/task-routing.spec.ts` → `sync precheck failure: needs_decision wire shape, durable waiting row, NO Session and NO message`; `catalog read failure: needs_decision with catalog_unavailable reason, never an empty-model verdict`; replay returns the same task: `tests/tasks.spec.ts` → `replaying the same caller+callId returns the existing row after a simulated restart`; `tests/task-routing.spec.ts` → `spawn replay under a CHANGED catalog returns the stored task as-is (no re-precheck)` |
+| 排队后失效 | PASS | Queued tracked task refuses execution after unlink: `tests/task-routing.spec.ts` → `a queued tracked task never runs after unlink`; activation revalidation inside the runtime: `src/task-runtime.ts` grant re-check (covered by the same test); candidate exhaustion async report: `tests/task-notifications.spec.ts` → `a sync precheck failure notification rides the real mailbox to the idle sender exactly once with task-status attribution` |
+| first request 不可用 | PASS | `tests/task-routing.spec.ts` → `first-request route-availability failure switches to the fallback inside the same step` (limited fallback inside one step; F1 `model_fallback_selected` event asserted); prompt/route identity: `tests/model-runtime.spec.ts` → `prompt route ≡ request header: prompt variables match the committed header` |
+| 部分输出/工具后失败 | PASS | `tests/task-routing.spec.ts` → `a mid-turn failure AFTER the first response is terminal: partial class forbids auto-fallback (no retry attempted)`; retry refusal on partial/unknown: `tests/tasks.spec.ts` → `rejects retry on partial or unknown execution progress`; checkpoint honesty: `tests/task-notifications.spec.ts` → `continue on a partial task without a host resumable checkpoint answers TASK_NOT_RESUMABLE honestly` |
+| retry/continue/cancel 竞争 | PASS | CAS + decision idempotency: `tests/tasks.spec.ts` → `fails a concurrent writer with TASK_STALE_REVISION and loses none of the winner's write`, `is idempotent across resolution replays and safe under two concurrent decisions`, `records a stale revision as a no-op outcome the same call id replays forever`; wire-level: `tests/task-notifications.spec.ts` → `replayed decisions apply exactly once…`, `stale expected_revision returns the current state with a stale indicator and mutates nothing else`, `a RUNNING task answers cancel with TASK_RUNNING…`, `cancel closes a never-executed waiting_decision task; retry on cancelled is refused` |
+| 重启/崩溃 | PASS | Task-service row reload + write-boundary fault injection: `tests/tasks.spec.ts` → `crash and restart` describe, `write-boundary fault injection` describe; route/intent durable facts: `tests/model-runtime.spec.ts` → `restart reconciliation: persisted intents survive, orphan is observable, isManaged answers`; outbox identity across restart: `tests/task-notifications.spec.ts` → `a queued pending event survives a restart and is delivered EXACTLY once when the sender comes back` (this round added: SAME `notifiedMessageId` asserted, not just the event id — fix-wave item a) |
+| unlink/归档/未授权 caller | PASS | `tests/task-routing.spec.ts` → `a queued tracked task never runs after unlink`; `tests/task-notifications.spec.ts` → `an unlink blocks events the pump attempts after the grant vanished, with the revocation reason, and keeps them queryable` + NEW `a blocked event is never re-blocked, duplicated, or re-emitted by later pump passes` (exactly one blocked entry, stable `blockedReason`, zero minted mailbox rows — fix-wave item b); archived: `an archived sender follows the mailbox's existing archived-target behavior and the event stays queryable`; unauthorized: `both original parties keep read access after unlink; a third party never sees the task` |
+| 通知无唤醒权限/超预算 | PASS | Queued/blocked durable, never claimed processed: `tests/task-notifications.spec.ts` → `a notification under a spent daily wake budget rides as queued mail and the sender's own turn claims it without a fresh wake`; chain budget as its OWN gate (Task 5 flagged it shared the daily path): NEW `chain-budget exhaustion is its own gate…` (spent chain queues its continuation while the daily ledger has room; fresh-chain notification claims exactly its own wake; counts never reset); no new messageId minting (chain count never resets): restart + identity assertions above |
+| 存储/flush 故障 | PASS | Row-level atomicity for the new domain: `tests/tasks.spec.ts` → `write-boundary fault injection` describe (intent/binding/state/decision writes each fail closed; no second task, no dispatch on failed intent write); mailbox write/flush failures: `tests/link.spec.ts` fault-injection suites (message store, wake record, marker boundaries — 59 tests); terminal-held protection: `tests/task-notifications.spec.ts` restart+blocked suites never duplicate or falsely settle |
+| 旧宿主/插件移除/降级 | PASS(host side) + NOT_RUN(bits swap) | Old host refuses tracked params while legacy paths work: `src/tools.ts` `requireTaskHost` + `taskServiceOf` gate (wired `HOST_CAPABILITY_UNAVAILABLE`, asserted capability flag: `tests/model-policy.spec.ts` → `projectModelCatalog discovery output`; pause/resume fail-closed: `tests/model-runtime.spec.ts` → `pause/resume fail closed with honest unsupported codes`; `taskHostVersion reports the minimum host contract`). Old-PLUGIN downgrade fail-closed: durable model-bound pending input is hosted as a managed task — orphan/intent facts observable, never executable as ordinary mail: `tests/model-runtime.spec.ts` → `restart reconciliation: persisted intents survive, orphan is observable, isManaged answers`, `unload releases the claim lease; the durable record reads as orphaned, not executable`, `duplicate mail by messageId with a live claim is not claimable`; `tests/tasks.spec.ts` → `crash and restart` reconcile tests. NOT_RUN: installing an actual OLD-plugin build over seeded model-bound tasks (requires building a downgrade artifact; no plugin-removal-with-task-rows installed smoke exists) — repro: seed tasks with this build in an isolated profile, install 0.4.1-pre-model-routing bits, restart, and assert the parked tasks stay queryable and the notification rows read as ordinary durable mail |
+| fork/compact/resume | PASS(fork/isolation + durable facts) + NOT_RUN(real compaction) | NEW `tests/task-notifications.spec.ts` → `a forked copy of the bound target NEVER gains the task's execution rights`: the unlinked/forked copy keeps the task row (revision, owner target) but activation is grant-gated (queue stays parked; zero model requests on the fork; the already-admitted event reconciles under its original identity, never re-minted); task/turn-intent durable facts + baseline survive a full context teardown/reload: same test + `tests/model-runtime.spec.ts` → `restart reconciliation…`. NOT_RUN: survival across a REAL transcript compaction — this test harness (agent-loop testkit over memory backends) has no compaction op; repro would need a host build exposing compaction, then assert the `session_link_tasks` row + host `taskTurnIntents` facts (Task 1 host extension fields) still answer `getTurnIntentByMessageId` |
+| UI/构建合约 | PASS | Old logs replay: `tests/client-turn.spec.tsx` → `ignores replayed append results with bad or missing sidecars (legacy replay compatibility)` + `tracked spawn admitted keeps the legacy first segment byte-identical…` (`tests/task-routing.spec.ts`); outputs/declarations/peers/RPC param names: `tests/built-contract.test.mjs` (3 tests, PASS); cards/panel/taskView: `tests/client-turn.spec.tsx` (16), `tests/client-panel.spec.tsx` (17), `tests/client-registration.spec.ts` → `drives the read-only task projection through the same Remote bridge with 'request'` |
+
+Real paid-model tests: **NOT_RUN** (no authorization this round).
+
+### Known limits this round (unchanged unless noted)
+
+- `continue` on a partial task: today's host exposes no resumable checkpoint; the tool refuses with `TASK_NOT_RESUMABLE` honestly (tested). Pause/resume fail closed on the host capability (tested).
+- Task-status attribution is **body-framing only**: the report body states it is host-generated; no transcript badge ships (a badge awaits a host message-attribution seat). README row updated to match.
+- Plain-run baseline: running the full vitest root **without** `DSH_SOURCE_ROOT` fails to import the five host-source-dependent suites (`link`, `tasks`, `task-notifications`, `task-routing`, `task-runtime-mixed`) — they resolve `@deepseek-ai/dsh-storage` / agent-loop testkit through the checkout. This is the long-standing documented split; pure suites (`model-policy`, all client suites, `scope`) and `test:contracts` run plain.
+- Cosmetic: on a `CATALOG_UNAVAILABLE` precheck outcome the failure trail covers catalog-checked candidates only; a `session_default` late-binding candidate contributes no trail row by design.
+- Mailbox rows and task rows are not auto-pruned; budget scans read the full tables (long-standing; flagged for large deployments).
+- Installed smoke does not exercise tracked-task UI in a real host (the shipped `dsh 0.2.0-rc.2` runtime lacks the task-host capability, so the tracked path correctly refuses there; UI coverage of tracked cards/panel is the client suites).
+
+## Publish boundary
+
+**Minimum host**: DSH checkout @ `656ca652a0` + the additive task-host extension (`taskHostVersion 1`). The extension currently lives as **uncommitted working-tree changes** in `/Users/gc/Dev/Opensource/deepseek-harness` (exact paths: untracked `packages/api/session-controller/src/task-host/` and the `packages/api/session-controller/src/index.ts` export block).
+
+**Before a real publish**: the host-side extension must be upstreamed into DSH and the checkout's declarations rebuilt; only then can a host guarantee the tracked-task capability. Until then this plugin must be published with the boundary stated on the tin.
+
+**Fallback when the capability is absent**: model routing parameters on `session_spawn_linked_session` / `session_send_session_message` fail with `HOST_CAPABILITY_UNAVAILABLE` (no task created, no fake queued/accepted), while the four legacy tools (`session_list_links`, `session_send_session_message` untracked, `session_cancel_session_message`, `session_spawn_linked_session` untracked) and the human command keep working unchanged. `session_list_models` reports `taskHost: false`.
+
+**Downgrade safety**: installing an OLD plugin (pre-model-routing bits) over a profile holding model-bound pending tasks fails closed — the durable task/turn-intent facts live in the host and the `session_link_tasks` domain; the old plugin has no activation wiring, so parked tasks are never executed as ordinary messages, stay queryable after an upgrade, and already-written task-status notification rows remain ordinary durable mail (readable history). The one piece not machine-verified this round is the physical old-bits install attempt (matrix row above, NOT_RUN with repro).
+
+**Schema compatibility**: `session_link` v1 unchanged — Task 5 added optional `statusKind`/`taskStatus` fields on mailbox rows; old readers ignore them via zod `.optional()`. `session_link_tasks` v1 is a NEW domain; uninstalling the plugin removes the plugin only — the domain's rows persist under profile storage state-residue rules (plugin storage domains are profile data, removed only with explicit profile cleanup); no model/baseline pollution results because baselines only ever change through the user-visible persisted selection path (session-scope CAS) or not at all.
+
+**Uninstall**: leaves no model pollution — task-scope routes are per-turn freezes restored on close (never persisted), session-scope routes persist only through the visible CAS commit; plugin removal preserves session histories and the `session-link-message` attribution (verified by the installed smoke's removal scenario this round).
+
+## Historical verification — prior rounds (before the model-routing feature line)
+
+The results below document earlier rounds of this same 0.4.1 workspace (approved preset/UI/return-wake update and the original 2026-10-10 verification). They are kept for provenance and are **not** this round's evidence.
+
+### Prior round — approved preset / UI / return-wake implementation
+
+The approved update round verified: `pnpm build` / `pnpm typecheck` (PASS, installed SDK); `DSH_SOURCE_ROOT=… pnpm typecheck` (PASS); `pnpm test:client` (PASS, 39 tests in 5 suites incl. 11 preset tests and 2 formal-slot/wire-owner tests); `DSH_SOURCE_ROOT=… pnpm test:host` (PASS, 117 tests in 4 suites); `pnpm test:contracts` (PASS, 3 tests); packed official-CLI browser smoke (PASS, `dsh 0.2.0-rc.2`, isolated Web profile/npm cache and Brave, no model requests); `git diff --check` (PASS).
+
+Coverage and evidence boundaries from that round:
 
 - Omitted preset config survives Loader schema resolution as automatic mode, includes effective default and standard/ptc/cordis, excludes minimal/subagents; explicit lists and empty lists remain exact. Default-id changes take effect when an Agent is next evaluated through the existing lifecycle; no synthetic default-change event was added.
 - The leading mark is no longer registered. Formal workspace right-hover action and menu seats are registered. Component and wire-owner tests prove that management params bind mutations to the clicked Session, not the foreground Session. The installed browser exercise switches management between alpha/beta in the same tab without switching the foreground conversation.
@@ -27,11 +95,11 @@ Coverage and evidence boundaries:
 
 Rerun results: [installed smoke](tests/integration/RESULTS.md). Screenshots: [light](output/playwright/session-link-light.png), [dark](output/playwright/session-link-dark.png).
 
-## Historical verification — 2026-10-10 (before this update)
+### Historical verification — 2026-10-10 (original 0.4.1)
 
 `dsh-session-link 0.4.1` is an independently built and installed plugin. The original DSH checkout remains at `656ca65`, with its pre-existing modified/untracked files left untouched. The user's running Desktop profile was not switched.
 
-| Check | Current result |
+| Check | Result |
 | --- | --- |
 | `pnpm build` with installed npm SDK `0.2.0-rc.2` | PASS; TypeScript and both bundles |
 | `DSH_SOURCE_ROOT=/Users/gc/Dev/Opensource/deepseek-harness pnpm typecheck` | PASS with checkout `0.2.1-alpha.1` declarations |

@@ -1,6 +1,10 @@
 # Shipped-runtime verification
 
-## Current approved UI update — PASS
+## Model-routing verification round (2026-10-12) — PASS
+
+The fresh `BROWSER_EXECUTABLE_PATH='/Applications/Brave Browser.app/Contents/MacOS/Brave Browser' pnpm test:integration` run exited 0 against `dsh 0.2.0-rc.2` with the packed `dsh-session-link 0.4.1` workspace artifact that includes the Task 7 registration and test changes. Machine-readable result: `{"result":"PASS","dshVersion":"0.2.0-rc.2","installation":"packed tarball","modelCalls":0,"toolsScopedToListedPresets":true,"explicitSessionIdAdopted":true,"invalidPluginConfigCoreUsable":true,"pluginAbsentSessionsReadable":true}` ([installed-smoke-result.json](../../output/playwright/installed-smoke-result.json)). It used a temporary `DSH_HOME`, profile and npm cache; it did not replace the running GUI or any live profile and issued no model request. The scenario set is unchanged from the approved-UI round below (the shipped runtime has no task-host capability, so the tracked-task path correctly stays out of its scope here; tracked surfaces are covered by the host and client suites).
+
+## Prior round — approved UI update — PASS
 
 The fresh `BROWSER_EXECUTABLE_PATH='/Applications/Brave Browser.app/Contents/MacOS/Brave Browser' pnpm test:integration` run exited 0 against `dsh 0.2.0-rc.2` with the current packed `dsh-session-link 0.4.1` workspace artifact. It used a temporary `DSH_HOME`, profile and npm cache; it did not replace the running GUI or any live profile and issued no model request.
 
