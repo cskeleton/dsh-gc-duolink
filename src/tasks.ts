@@ -812,6 +812,49 @@ export class SessionLinkTaskService extends Service {
     })
   }
 
+  /**
+   * Rebind the task's durable host turn intent after a fallback switch
+   * (IMPORTANT-4): the runtime cancels the OLD intent and records a fresh one
+   * on the same bound message; this primitive swaps
+   * `execution.turnIntentId` to the live intent in ONE atomic row write so a
+   * post-restart fold never references the cancelled intent. The write is
+   * guarded on the intent being replaced (`from`): a row that already points
+   * elsewhere (a concurrent projection) is left untouched and surfaces as
+   * `TASK_STALE_REVISION`-class refusal, never a silent overwrite.
+   */
+  async rebindTurnIntent(
+    taskId: SessionLinkTaskId,
+    expectedRevision: number,
+    rebind: { from: string; to: string },
+  ): Promise<SessionLinkTaskRecordData> {
+    return await this.update(taskId, expectedRevision, row => {
+      if (row.execution.messageId === undefined) {
+        throw new SessionLinkTaskError(
+          TASK_BINDING_INCOMPLETE,
+          `task "${taskId}" has no message binding; a turn-intent rebind attaches only after the binding commits`,
+        )
+      }
+      if (row.execution.turnIntentId !== rebind.from) {
+        throw new SessionLinkTaskError(
+          TASK_STALE_REVISION,
+          `task "${taskId}" turn intent moved past "${rebind.from}" (now ${row.execution.turnIntentId ?? 'absent'}); `
+          + 're-read the task and rebind against its current intent',
+        )
+      }
+      const now = this.clock()
+      return {
+        ...row,
+        execution: {
+          ...row.execution,
+          turnIntentId: rebind.to,
+          turnIntentAttachedAt: now,
+        },
+        revision: row.revision + 1,
+        updatedAt: now,
+      }
+    })
+  }
+
   /* ----------------------------------------------------------------------
    * Outbox lifecycle (Task 5 sends; this service stores)
    * -------------------------------------------------------------------- */
@@ -1314,44 +1357,73 @@ export class SessionLinkTaskService extends Service {
     }
 
     // Report each binding-repair task to the caller: exactly one pending
-    // repair intent per task (regardless of its restart history).
+    // repair intent per task (regardless of its restart history). Per-row
+    // resilience (final review): one racing row (TASK_STALE_REVISION) is
+    // re-read and retried once, then skipped — it can never abort the whole
+    // reconcile and leave every later row unclassified.
     for (const row of needsBindingRepair) {
       if (row.outbox.some(isRepairNoticePending)) continue
       if (row.taskState === 'waiting_decision' && row.executionState !== undefined) continue
       const taskId = taskIdFor(row.callerId, row.callId)
-      const updated = await this.update(taskId, row.revision, current => {
-        if (current.outbox.some(isRepairNoticePending)) return current
-        if (current.taskState === 'waiting_decision') return current
-        const nextRevision = current.revision + 1
-        const event = this.buildEvent(taskId, nextRevision, {
-          kind: 'model_unavailable',
-          executionState: 'not_started',
-          reason: 'repair_binding_missing',
-          requestedModel: defaultRequestedRoute(current.policy),
-          attempts: 0,
-          decisionRequired: true,
-          resumable: true,
-        }, this.clock())
-        return {
-          ...current,
-          taskState: 'waiting_decision',
-          executionState: 'not_started',
-          reason: 'repair_binding_missing',
-          outbox: [...current.outbox, event],
-          revision: nextRevision,
-          updatedAt: this.clock(),
-        }
-      })
-      if (updated.revision !== row.revision && updated.outbox.some(event =>
-        event.reason === 'repair_binding_missing' && event.revision === updated.revision)) {
-        notifiedRepairs.push(taskId)
-      }
+      if (await this.repairOne(taskId, row)) notifiedRepairs.push(taskId)
     }
 
     return {
       report: { resumableIntents, needsBindingRepair, orphanChecks },
       notifiedRepairs,
     }
+  }
+
+  /**
+   * Commit the one-shot binding-repair projection for ONE row, tolerating a
+   * concurrent writer: a `TASK_STALE_REVISION` re-reads the live row and
+   * retries once; any later failure (still racing, or a durability fault)
+   * skips THIS row so `reconcile()` still classifies the rest. Returns the
+   * taskId-reporting flag (true only when THIS run committed the notice).
+   */
+  private async repairOne(
+    taskId: SessionLinkTaskId,
+    row: SessionLinkTaskRecordData,
+  ): Promise<boolean> {
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const current = attempt === 0 ? row : this.tasks.get(taskId)
+      if (current === undefined) return false
+      if (current.outbox.some(isRepairNoticePending)) return false
+      if (current.taskState === 'waiting_decision') return false
+      try {
+        const updated = await this.update(taskId, current.revision, mutating => {
+          if (mutating.outbox.some(isRepairNoticePending)) return mutating
+          if (mutating.taskState === 'waiting_decision') return mutating
+          const nextRevision = mutating.revision + 1
+          const event = this.buildEvent(taskId, nextRevision, {
+            kind: 'model_unavailable',
+            executionState: 'not_started',
+            reason: 'repair_binding_missing',
+            requestedModel: defaultRequestedRoute(mutating.policy),
+            attempts: 0,
+            decisionRequired: true,
+            resumable: true,
+          }, this.clock())
+          return {
+            ...mutating,
+            taskState: 'waiting_decision',
+            executionState: 'not_started',
+            reason: 'repair_binding_missing',
+            outbox: [...mutating.outbox, event],
+            revision: nextRevision,
+            updatedAt: this.clock(),
+          }
+        })
+        return updated.revision !== current.revision && updated.outbox.some(event =>
+          event.reason === 'repair_binding_missing' && event.revision === updated.revision)
+      } catch (error: unknown) {
+        if (error instanceof SessionLinkTaskError && error.code === TASK_STALE_REVISION) continue
+        // A durability failure on THIS row skips it; the next reconcile pass
+        // retries it honestly. Never abort the whole scan.
+        return false
+      }
+    }
+    return false
   }
 
   /** Build one outbox event with its deterministic id inside a CAS mutator. */

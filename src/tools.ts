@@ -36,6 +36,7 @@ import {
 import type { ModelCatalogLike, ModelRouteSelection, ModelRoutingPolicy } from './model-policy.ts'
 import { installTaskNotifications } from './task-notifications.ts'
 import type { TaskNotificationPump } from './task-notifications.ts'
+import { ensureTaskHostLazy } from './task-host-lazy.ts'
 import { installTaskRuntime, precheckFailureOf, requestedRouteOf } from './task-runtime.ts'
 import { taskIdFor } from './tasks.ts'
 import type { CreateTaskIntentInput, SavedTaskIntent, TaskEventInput } from './tasks.ts'
@@ -522,6 +523,26 @@ export function apply(ctx: Context, config: Config = {}): void {
     tasks: () => taskServiceOf(ctx),
     links: () => ctx.sessionLinks,
   })
+  /* F-C1c (final review): classify the durable rows a prior process left
+   * half-written. reconcile() is pure, safe, and idempotent — it NEVER
+   * executes, wakes, or fabricates; needsBindingRepair rows drop to
+   * waiting_decision with exactly one repair outbox event per task, and the
+   * pump pass scheduled afterwards delivers those notices. A deployment
+   * without the task service (legacy tool stacks) skips this silently. */
+  void (async () => {
+    let tasks: Context['sessionLinkTasks']
+    try {
+      tasks = taskServiceOf(ctx)
+    } catch {
+      return
+    }
+    try {
+      const result = await tasks.reconcile()
+      if (result.notifiedRepairs.length > 0) pumpSchedule()
+    } catch (error: unknown) {
+      ctx.logger.warn(`session-link: task reconcile at mount failed: ${reason(error)}`)
+    }
+  })()
   const tools = definitions(ctx, pumpSchedule)
   mountPerPresetAgent(ctx, resolvePresets(config), 'session-link-tools', ['tools'], (scoped) => {
     for (const tool of tools) scoped.tools.register(tool)
@@ -539,11 +560,36 @@ export function apply(ctx: Context, config: Config = {}): void {
 
 
   function contributeRuntime(rootCtx: Context, agent: Agent): void {
-
+    /* F-C1b (final review): a cold target that becomes live (agent/created,
+     * or the mount-time list above) with DURABLE managed work already naming
+     * it is armed eagerly through the SAME single-flight lazy install the
+     * admission path uses — concurrent arming joins one flight and never
+     * duplicates the capability's listeners. Agents with no durable binding
+     * stay unarmed until a tracked admission or the runtime's own claim
+     * backstop (pre-step `ensureHost`) arms them, so unrelated Agents keep a
+     * clean capability surface. */
+    void (async () => {
+      let needsArm = false
+      try {
+        needsArm = taskServiceOf(rootCtx).listRows().some(row =>
+          row.targetSessionId === agent.id && row.execution.messageId !== undefined)
+      } catch { /* a deployment without the task service never arms eagerly */ }
+      if (needsArm) await ensureTaskHostLazy(agent)
+    })()
     installTaskRuntime(agent.ctx, agent, () => taskServiceOf(rootCtx), {
       pairLinked: (linkId, first, second) =>
         rootCtx.sessionLinks.list(first as never).some(link =>
           String(link.id) === String(linkId) && link.memberIds.includes(second as never)),
+    }, {
+      /* CRITICAL-2 (final review): runtime-written outbox events schedule the
+       * outbox pump themselves — a sender never waits for an unrelated tool
+       * call to see turn_finished / model_unavailable / interrupted /
+       * cancelled / model_fallback_selected notifications. */
+      schedulePump: pumpSchedule,
+      /* F-C1b runtime-side fallback: if no path armed this Agent before a
+       * managed claim arrived, the gate arms it on the spot (still the same
+       * single flight) instead of letting the message run unmanaged. */
+      ensureHost: () => ensureTaskHostLazy(agent),
     })
   }
 }
@@ -827,7 +873,9 @@ function definitions(ctx: Context, pumpSchedule: () => void): ToolDefinition[] {
             ? value.outcome === 'admitted'
               ? `task ${value.taskId} admitted: session ${value.sessionId ?? ''} linked (${value.linkId ?? ''}); task message ${value.messageId} ${value.status}`
                 + ` (requested ${value.requestedModel.provider}/${value.requestedModel.model}${value.selectedModel === undefined ? '' : `, selected ${value.selectedModel.provider}/${value.selectedModel.model}`})`
-              : `task ${value.taskId} needs a decision (${value.reason}); no Session was created and nothing was sent`
+              : value.sessionId === undefined
+                ? `task ${value.taskId} needs a decision (${value.reason}); no Session was created and nothing was sent`
+                : `task ${value.taskId} needs a decision (${value.reason}); session ${value.sessionId} exists but the task was never admitted to it`
             : `session ${value.sessionId} created and linked (${value.linkId}); task message ${value.messageId} ${value.status}`,
         },
         ...taskResultSidecar(ctx, 'session_spawn_linked_session', value as Record<string, unknown>),
@@ -1010,7 +1058,7 @@ function definitions(ctx: Context, pumpSchedule: () => void): ToolDefinition[] {
       const caller = requireCaller(ctx, exec)
       const tasks = taskServiceOf(ctx)
       const view = tasks.getTask(caller.id, SessionLinkTaskId(args.task_id))
-      return getTaskWire(ctx, tasks, view)
+      return getTaskWire(tasks, view)
     },
     presentCall: args => ({ card: 'generic', title: `Read task ${args.task_id}`, kind: 'other' }),
   }), defineTool({
@@ -1155,19 +1203,23 @@ function admittedResult(
   }
 }
 
-/** Persist the sync-precheck failure and answer it. NO Session/mailbox message exists at this point. */
-async function savePrecheckFailure(
-  ctx: Context,
-  intent: Omit<CreateTaskIntentInput, 'precheckFailure'>,
+/**
+ * Project one sync precheck failure into the {reason, results} the durable
+ * waiting_decision row commits. F-review: a catalog POISONING must keep the
+ * concrete per-candidate results the walk collected BEFORE the poisoned
+ * provider (`precheckFailureOf` marks everything after the poison
+ * catalog_unavailable and aggregates the reason); only a whole-catalog read
+ * failure (no candidate was ever checked) commits the genuinely empty trail.
+ */
+function precheckFailureWire(
   policy: ModelRoutingPolicy,
   error: ModelRoutingError,
-): Promise<NeedsDecisionWire> {
-  const tasks = taskServiceOf(ctx)
-  const precheck = error.code === CATALOG_UNAVAILABLE
-    ? { reason: 'catalog_unavailable', results: [] as { route: ModelRouteSelection; code: string; message?: string }[] }
-    : precheckFailureOf(policy, error instanceof PrecheckExhausted ? error.checks : [])
-  const saved = await tasks.saveTaskIntent({ ...intent, precheckFailure: precheck })
-  return needsDecisionResult(saved.row)
+): { reason: string; results: { route: ModelRouteSelection; code: string; message?: string }[] } {
+  if (error instanceof PrecheckExhausted) return precheckFailureOf(policy, error.checks)
+  if (error.code === CATALOG_UNAVAILABLE) {
+    return { reason: 'catalog_unavailable', results: [] as { route: ModelRouteSelection; code: string; message?: string }[] }
+  }
+  return precheckFailureOf(policy, [])
 }
 
 /** Internal carrier for an exhausted per-candidate precheck trail. */
@@ -1176,6 +1228,63 @@ class PrecheckExhausted extends ModelRoutingError {
     super('MODEL_NOT_FOUND', 'every authorized candidate failed the catalog precheck')
     this.name = 'PrecheckExhausted'
   }
+}
+
+/**
+ * F-C1a honest refusal: the model binding could not be made durable before
+ * the mailbox admission (capability unavailable for the target, or the host
+ * intent record failed). The row drops `preparing → waiting_decision` /
+ * `not_started` with ONE `model_unavailable` outbox event IN THE SAME CAS
+ * and the caller receives the needs_decision wire shape — NO fake half-bound
+ * bare admission ever reaches the mailbox, so a tracked task can never
+ * silently execute on the deployment's default model.
+ *
+ * Reason vocabulary: `model_unavailable` — the same vocabulary family as the
+ * sync catalog precheck (`model_unavailable` vs `catalog_unavailable`): the
+ * route/capability for THIS task is unavailable; the catalog answered fine.
+ */
+async function failCapabilityAdmission(
+  ctx: Context,
+  taskId: ReturnType<typeof taskIdFor>,
+  row: SessionLinkTaskRecordData,
+  pumpSchedule: () => void,
+  resolveLinkId?: (row: SessionLinkTaskRecordData) => SessionLinkId | undefined,
+): Promise<NeedsDecisionWire> {
+  const tasks = taskServiceOf(ctx)
+  let settled = row
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const live = tasks.getRow(taskId) ?? settled
+    if (live.taskState !== 'preparing') {
+      settled = live
+      break
+    }
+    try {
+      settled = await tasks.requestStateChange(taskId, live.revision, {
+        toState: 'waiting_decision',
+        executionState: 'not_started',
+        reason: 'model_unavailable',
+        events: [{
+          kind: 'model_unavailable',
+          executionState: 'not_started',
+          reason: 'model_unavailable',
+          requestedModel: requestedRouteOf(live.policy),
+          attempts: live.attempts.at(-1)?.results.length ?? 0,
+          decisionRequired: true,
+          resumable: true,
+        }],
+      })
+      break
+    } catch (error: unknown) {
+      if (error instanceof Error && 'code' in error && (error as { code?: string }).code === 'TASK_STALE_REVISION') {
+        settled = tasks.getRow(taskId) ?? live
+        continue
+      }
+      settled = tasks.getRow(taskId) ?? live
+      break
+    }
+  }
+  pumpSchedule()
+  return needsDecisionResult(settled, resolveLinkId)
 }
 
 /**
@@ -1296,11 +1405,7 @@ async function trackedSend(
     request: { kind: 'send', callId: request.callId, text: request.text, targetSessionId: targetId },
     policy: request.policy,
     tracked: true,
-    ...(precheckError === undefined ? {} : {
-      precheckFailure: precheckError.code === CATALOG_UNAVAILABLE
-        ? { reason: 'catalog_unavailable', results: [] as { route: ModelRouteSelection; code: string; message?: string }[] }
-        : precheckFailureOf(request.policy, precheckError instanceof PrecheckExhausted ? precheckError.checks : []),
-    }),
+    ...(precheckError === undefined ? {} : { precheckFailure: precheckFailureWire(request.policy, precheckError) }),
   }, pumpSchedule)
   const row = saved.row
   if (precheckError !== undefined) {
@@ -1315,8 +1420,22 @@ async function trackedSend(
   // derived up front.
   const host = await hostForTarget(ctx, targetId)
   const messageId = mintTaskMessageId(caller.id, request.callId)
+  /* F-C1a (final review): when the durable model binding CANNOT be made
+   * before the mailbox admission (capability unavailable for the target —
+   * host.recordTurnIntent impossible), the task is NOT admitted as a bare
+   * managed message. A bare admission would see the tracked delivery execute
+   * as ordinary mail on the baseline model: a silent contract break. Instead
+   * the row drops to waiting_decision/not_started with ONE model_unavailable
+   * outbox event (reason vocabulary per the needs_decision contract) and the
+   * caller receives the honest needs_decision shape. */
+  if (host === undefined) {
+    return await failCapabilityAdmission(ctx, taskId, row, pumpSchedule,
+      stored => stored.targetSessionId === undefined
+        ? undefined
+        : ctx.sessionLinks.list(caller.id).find(link => link.memberIds.includes(stored.targetSessionId!))?.id)
+  }
   let intentId: string | undefined
-  if (host !== undefined) {
+  try {
     const intent = host.recordTurnIntent({
       taskId,
       attemptId: row.currentAttemptId,
@@ -1326,6 +1445,13 @@ async function trackedSend(
     })
     await host.claimTurnIntent(intent.intentId).catch(() => { /* the gate claims it at activation */ })
     intentId = intent.intentId
+  } catch {
+    /* Host-side record failure is the same contract break: refuse honestly
+     * instead of admitting a delivery whose route nothing enforces. */
+    return await failCapabilityAdmission(ctx, taskId, row, pumpSchedule,
+      stored => stored.targetSessionId === undefined
+        ? undefined
+        : ctx.sessionLinks.list(caller.id).find(link => link.memberIds.includes(stored.targetSessionId!))?.id)
   }
   // Attach the task binding BEFORE the mailbox admission: a granted wake's
   // synchronous delivery inside `send` claims the delivery and runs its first
@@ -1443,11 +1569,7 @@ async function trackedSpawn(
     },
     policy: request.policy,
     tracked: true,
-    ...(precheckError === undefined ? {} : {
-      precheckFailure: precheckError.code === CATALOG_UNAVAILABLE
-        ? { reason: 'catalog_unavailable', results: [] as { route: ModelRouteSelection; code: string; message?: string }[] }
-        : precheckFailureOf(request.policy, precheckError instanceof PrecheckExhausted ? precheckError.checks : []),
-    }),
+    ...(precheckError === undefined ? {} : { precheckFailure: precheckFailureWire(request.policy, precheckError) }),
   }, pumpSchedule)
   const row = saved.row
   if (precheckError !== undefined) return needsDecisionResult(row)
@@ -1474,8 +1596,18 @@ async function trackedSpawn(
   }
   const host = await hostForTarget(ctx, target)
   const messageId = mintTaskMessageId(caller.id, request.callKey)
+  /* F-C1a (final review): the capability for the freshly created target is
+   * unavailable — refuse honestly instead of admitting a bare managed
+   * message that would execute on the deployment's default model. The
+   * created Session itself is durable state the wire honestly names (it
+   * exists; the task simply was not admitted); a retry decision re-arms the
+   * SAME derived Session through the replay ledger. */
+  if (host === undefined) {
+    const refusal = await failCapabilityAdmission(ctx, taskId, row, pumpSchedule)
+    return { ...refusal, sessionId: String(target), linkId: String(linkId) }
+  }
   let intentId: string | undefined
-  if (host !== undefined) {
+  try {
     const intent = host.recordTurnIntent({
       taskId,
       attemptId: row.currentAttemptId,
@@ -1485,6 +1617,9 @@ async function trackedSpawn(
     })
     await host.claimTurnIntent(intent.intentId).catch(() => { /* the gate claims it at activation */ })
     intentId = intent.intentId
+  } catch {
+    const refusal = await failCapabilityAdmission(ctx, taskId, row, pumpSchedule)
+    return { ...refusal, sessionId: String(target), linkId: String(linkId) }
   }
   // Binding BEFORE the mailbox admission (same brief-4d ordering as send):
   // the spawned first-task wake claims the delivery synchronously inside
@@ -1525,44 +1660,19 @@ async function trackedSpawn(
   return admittedResult(tasks.getRow(taskId) ?? recorded, sent, selected)
 }
 
-/** Resolve (or lazily install) the HOST capability of the TARGET Session the
- * runtime claims through. A capability-capable host exposes it on `agent.ctx`;
- * in stacks where the plugin row attaches it (tests, capability-present
- * deployments integrating the row), first resolution creates and publishes it
- * so later gate/freeze order matches a host-owned mount. Hosts that can never
- * satisfy the contract yield `undefined` and the caller keeps the plain tool
- * path for untracked calls or HOST_CAPABILITY_UNAVAILABLE for tracked ones. */
+/** Resolve (or lazily install, single-flighted) the HOST capability of the
+ * TARGET Session the runtime claims through. A capability-capable host exposes
+ * it on `agent.ctx`; in stacks where the plugin row attaches it (tests,
+ * capability-present deployments integrating the row), first resolution
+ * creates and publishes it so later gate/freeze order matches a host-owned
+ * mount. Hosts that can never satisfy the contract yield `undefined` and the
+ * caller keeps the plain tool path for untracked calls or an honest
+ * needs_decision/HOST_CAPABILITY_UNAVAILABLE refusal for tracked ones
+ * (F-C1a: a tracked call NEVER admits a bare managed message). */
 async function hostForTarget(ctx: Context, targetId: SessionId) {
   const agent = ctx.agents.get(targetId)
   if (agent === undefined) return undefined
-  const existing = resolveTaskHost(agent.ctx)
-  if (existing !== undefined) return existing
-  try {
-    const capability = await createTaskHostLazy(agent.ctx, agent)
-    if (capability === undefined) return undefined
-    // cordis' service accessor publishes through `Fiber.provide`;
-    // defineProperty makes the value visible to every later
-    // `resolveTaskHost(agent.ctx)` the plugin and the runtime call.
-    Object.defineProperty(agent.ctx, 'taskHost', { value: capability, configurable: true })
-    return capability
-  } catch {
-    return undefined
-  }
-}
-
-/**
- * The capability factory, hosted outside the plugin's type surface because the
- * published `lib/types` declarations precede the host extension. Resolved
- * through the installed module's runtime namespace so the capability class is
- * the SAME identity any host-mounted capability the caller also resolved.
- */
-async function createTaskHostLazy(
-  ctx: Context,
-  agent: Agent,
-): Promise<ReturnType<typeof resolveTaskHost>> {
-  const mod = await import('@deepseek-ai/dsh-api-session-controller') as Record<string, unknown>
-  const factory = mod.createTaskHost as ((ctx: Context, agent: Agent) => ReturnType<typeof resolveTaskHost>) | undefined
-  return factory === undefined ? undefined : factory(ctx, agent)
+  return await ensureTaskHostLazy(agent)
 }
 
 /** The Agent that owns one scoped runtime context, resolved through the registry. */
@@ -1610,7 +1720,6 @@ function routeWire(route: ModelRouteSelection | undefined): TaskWireRoute | unde
 
 /** The session_get_task wire projection: read-only view of one stored task row. */
 function getTaskWire(
-  ctx: Context,
   tasks: Context['sessionLinkTasks'],
   view: ReturnType<Context['sessionLinkTasks']['getTask']>,
 ) {
@@ -1639,7 +1748,6 @@ function getTaskWire(
     appliedRevision: decision.appliedRevision,
     appliedAt: decision.appliedAt,
   })) ?? []
-  void ctx
   return {
     taskId: String(view.taskId),
     taskState: view.taskState,
@@ -1745,7 +1853,7 @@ async function resolveTaskWire(
     hostResumable = false
     if (row.taskState === 'waiting_decision' && row.executionState === 'partial') {
       throw new SessionLinkError(
-        `task "${taskId}" host does not expose a resumable checkpoint; continue is refused honestly — start a new remediation task instead of replaying unknown effects`,
+        `TASK_NOT_RESUMABLE: task "${taskId}" host does not expose a resumable checkpoint; continue is refused honestly — start a new remediation task instead of replaying unknown effects`,
         'TASK_NOT_RESUMABLE' as never,
       )
     }
@@ -1784,7 +1892,7 @@ async function resolveTaskWire(
         ...(resolved.decision.attemptId === undefined ? {} : { attemptId: resolved.decision.attemptId }),
         appliedRevision: resolved.decision.appliedRevision,
       },
-      task: getTaskWire(ctx, tasks, tasks.getTask(caller.id, taskId)),
+      task: getTaskWire(tasks, tasks.getTask(caller.id, taskId)),
       stale: true,
     }
   }
@@ -1797,7 +1905,7 @@ async function resolveTaskWire(
         ...(resolved.decision.attemptId === undefined ? {} : { attemptId: resolved.decision.attemptId }),
         appliedRevision: resolved.decision.appliedRevision,
       },
-      task: getTaskWire(ctx, tasks, tasks.getTask(caller.id, taskId)),
+      task: getTaskWire(tasks, tasks.getTask(caller.id, taskId)),
     }
   }
 
@@ -1833,7 +1941,45 @@ async function resolveTaskWire(
       ...(resolved.decision.attemptId === undefined ? {} : { attemptId: resolved.decision.attemptId }),
       appliedRevision: resolved.decision.appliedRevision,
     },
-    task: getTaskWire(ctx, tasks, tasks.getTask(caller.id, taskId)),
+    task: getTaskWire(tasks, tasks.getTask(caller.id, taskId)),
+  }
+}
+
+/**
+ * The retry re-admission's honest capability refusal: a `preparing` task
+ * whose target cannot carry a durable intent drops back to
+ * `waiting_decision`/`not_started` with ONE model_unavailable event. Best
+ * effort under stale revisions — the row's own CAS guards repeat runs, and
+ * the pump's dedupe keeps the notification single.
+ */
+async function reAdmitRefuseCapability(
+  tasks: Context['sessionLinkTasks'],
+  taskId: SessionLinkTaskId,
+  policy: ModelRoutingPolicy,
+): Promise<void> {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const live = tasks.getRow(taskId)
+    if (live === undefined || live.taskState !== 'preparing') return
+    try {
+      await tasks.requestStateChange(taskId, live.revision, {
+        toState: 'waiting_decision',
+        executionState: 'not_started',
+        reason: 'model_unavailable',
+        events: [{
+          kind: 'model_unavailable',
+          executionState: 'not_started',
+          reason: 'model_unavailable',
+          requestedModel: requestedRouteOf(policy),
+          attempts: live.attempts.at(-1)?.results.length ?? 0,
+          decisionRequired: true,
+          resumable: true,
+        }],
+      })
+      return
+    } catch (error: unknown) {
+      if (error instanceof Error && 'code' in error && (error as { code?: string }).code === 'TASK_STALE_REVISION') continue
+      return
+    }
   }
 }
 
@@ -1874,14 +2020,13 @@ async function reAdmitRetriedTask(
     // original precheck-failure event was already delivered exactly once).
     const live = tasks.getRow(taskId)
     if (live !== undefined && live.taskState === 'preparing') {
+      const failure = precheckFailureWire(policy, precheckError)
       try {
         await tasks.requestStateChange(taskId, live.revision, {
           toState: 'waiting_decision',
           executionState: 'not_started',
-          reason: precheckError.code === CATALOG_UNAVAILABLE ? 'catalog_unavailable' : 'model_unavailable',
-          events: [precheckFailureOf(policy, precheckError instanceof PrecheckExhausted ? precheckError.checks : []).results.length === 0
-            ? { kind: 'model_unavailable', executionState: 'not_started', reason: 'catalog_unavailable', decisionRequired: true, resumable: true }
-            : { kind: 'model_unavailable', executionState: 'not_started', reason: 'model_unavailable', decisionRequired: true, resumable: true }],
+          reason: failure.reason,
+          events: [{ kind: 'model_unavailable', executionState: 'not_started', reason: failure.reason, decisionRequired: true, resumable: true }],
         })
       } catch { /* concurrent transition */ }
       pumpSchedule()
@@ -1892,11 +2037,18 @@ async function reAdmitRetriedTask(
   // Spawn-kind tasks re-create the SAME derived Session; the ledger's claim
   // keeps the original group. Send-kind tasks use the existing pair.
   const messageId = mintTaskMessageId(caller.id, row.callId)
-  const host = row.kind === 'spawn' && row.spawn !== undefined
-    ? await hostForTarget(ctx, targetId as never)
-    : await hostForTarget(ctx, targetId as never)
+  const host = await hostForTarget(ctx, targetId as never)
+  /* F-C1a on the decision path: a retried task whose target capability is
+   * unavailable NEVER re-admits a bare managed message — it drops back to
+   * waiting_decision with ONE model_unavailable event, exactly like the
+   * first-sight admission. The sender decides again honestly. */
   let intentId: string | undefined
-  if (host !== undefined) {
+  if (host === undefined) {
+    await reAdmitRefuseCapability(tasks, taskId, policy)
+    pumpSchedule()
+    return
+  }
+  try {
     const intent = host.recordTurnIntent({
       taskId,
       attemptId: row.currentAttemptId,
@@ -1906,6 +2058,10 @@ async function reAdmitRetriedTask(
     })
     await host.claimTurnIntent(intent.intentId).catch(() => { /* the gate claims it at activation */ })
     intentId = intent.intentId
+  } catch {
+    await reAdmitRefuseCapability(tasks, taskId, policy)
+    pumpSchedule()
+    return
   }
   const linkId = row.execution.linkId ?? ctx.sessionLinks.list(caller.id).find(link => link.memberIds.includes(targetId))?.id
   /* The decision and the outbox pump both moved the revision since the read

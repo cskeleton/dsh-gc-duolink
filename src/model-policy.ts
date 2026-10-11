@@ -275,9 +275,11 @@ export function normalizeModelRoutingParams(params: ModelRoutingParams): ModelRo
   }
 }
 
-/** Deduplication identity of one candidate: exact provider, model, and effort. */
+/** Deduplication identity of one candidate: exact provider, model, and effort.
+ * The NUL separator cannot appear inside any component, so distinct triples
+ * can never collide (a space-joined key would conflate e.g. `a b/c` with `a/b c`). */
 function routeKey(route: ModelRouteSelection): string {
-  return `${route.provider}${route.model}${route.reasoningEffort ?? ''}`
+  return `${route.provider}\u0000${route.model}\u0000${route.reasoningEffort ?? ''}`
 }
 
 /* --------------------------------------------------------------------------

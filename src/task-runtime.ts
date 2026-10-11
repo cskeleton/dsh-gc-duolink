@@ -129,9 +129,23 @@ interface AgentRuntime {
    * pre-existing no-claim work and must not drain the parked baseline.
    */
   freezeTurn?: number
+  /**
+   * IMPORTANT-2: a turn the pre-step gate REFUSED to activate (mixed
+   * batch). The host capability already bound its own per-turn lease when
+   * the tracked message claimed (the admission pre-claim), so its request /
+   * prompt waterfalls would still freeze this turn's HUMAN steps onto the
+   * task route. The runtime — registered BEFORE the capability and thus
+   * outermost in every waterfall — restores the session baseline on this
+   * turn's requests and prompt, strictly for the one refused turn.
+   */
+  mixedDeniedTurn?: number
   /** Seeded provider/model the Agent declared at creation, used as the baseline
    * fallback when the durable projection has not yet recorded one. */
   seededOptions?: { provider?: string; model?: string; reasoningEffort?: string }
+  /** Outbox-pump trigger fired after every event-producing projection so a
+   * runtime-committed event reaches the sender without waiting for an
+   * unrelated tool call (CRITICAL-2). */
+  schedulePump?: () => void
 }
 
 /* --------------------------------------------------------------------------
@@ -214,20 +228,36 @@ export type TaskServiceResolver = () => SessionLinkTaskService
  * @param tasks - resolver for the durable task service (root context; shared domain).
  * @param links - live link-pair probe re-validated at activation.
  * @param options.host - injectable capability (tests); defaults to resolveTaskHost.
+ * @param options.schedulePump - outbox-pump trigger the runtime calls after
+ *   every event-producing projection (CRITICAL-2): runtime-committed events
+ *   never wait for an unrelated tool call to reach the sender.
+ * @param options.ensureHost - single-flight capability arming (F-C1b): the
+ *   claimed gates call it when no capability resolves yet, so a cold target
+ *   that became live without the row's arming is armed before claim instead
+ *   of dropping the managed message onto the baseline.
  */
 export function installTaskRuntime(
   ctx: Context,
   agent: Agent,
   tasks: SessionLinkTaskService | TaskServiceResolver,
   links: TaskRuntimeLinksProbe,
-  options: { host?: HostTaskHostCapability } = {},
+  options: {
+    host?: HostTaskHostCapability
+    schedulePump?: () => void
+    ensureHost?: () => Promise<HostTaskHostCapability | undefined>
+  } = {},
 ): void {
   const resolveTasks = typeof tasks === 'function' ? tasks : () => tasks
+  /** Fire-and-forget pump trigger for a just-committed projection. */
+  const pumpNow = (): void => {
+    try { options.schedulePump?.() } catch { /* the pump's own pass logs */ }
+  }
   const runtime: AgentRuntime = {
     seededOptions: (() => {
       const options = (agent as unknown as { options?: { provider?: string; model?: string; reasoningEffort?: string } }).options
       return options === undefined ? undefined : { ...options }
     })(),
+    schedulePump: pumpNow,
   }
   /**
    * The capability MUST be resolvable at mount on a capable host. The tool
@@ -239,6 +269,18 @@ export function installTaskRuntime(
    * first used.
    */
   const cap = (): HostTaskHostCapability | undefined => options.host ?? resolveTaskHost(agent.ctx)
+  /**
+   * F-C1b backstop: arm the capability through the injected single flight when
+   * a managed message arrived before any other path installed it. Returns the
+   * capability when arming succeeded; a host that cannot fabricate one yields
+   * undefined and the message stays unmanaged (legacy honesty).
+   */
+  const armHost = async (): Promise<HostTaskHostCapability | undefined> => {
+    const current = cap()
+    if (current !== undefined) return current
+    if (options.ensureHost === undefined) return undefined
+    return await options.ensureHost().catch(() => undefined)
+  }
 
   /* ------------------------------------------------------------------
    * Runtime-owned request + prompt freeze. The host capability freezes the
@@ -278,6 +320,33 @@ export function installTaskRuntime(
     }
     const resolved = await next()
     const active = runtime.active
+    /* IMPORTANT-2: the pre-step gate refused to activate this turn (mixed
+     * batch), but the host capability's own claim-bound lease froze the
+     * turn's route at claim time. The runtime is the OUTERMOST waterfall on
+     * this context (mounted before the lazily created capability), so it
+     * restores the session baseline on the refused turn's requests —
+     * strictly human steps; the task's own solo turn is not denied. */
+    if (runtime.mixedDeniedTurn === payload.turn
+      && (active === undefined || active.closed || active.turn !== payload.turn)) {
+      const host = cap()
+      const seeded = runtime.seededOptions
+      const baseline = host?.readBaseline().effective ?? (
+        seeded !== undefined && seeded.provider !== undefined && seeded.model !== undefined
+          ? { provider: seeded.provider, model: seeded.model, ...(seeded.reasoningEffort === undefined ? {} : { reasoningEffort: seeded.reasoningEffort }) }
+          : null
+      )
+      if (baseline !== null
+        && (resolved.provider !== baseline.provider || resolved.model !== baseline.model)) {
+        const { reasoningEffort: _dropped, ...rest } = resolved
+        return {
+          ...rest,
+          provider: baseline.provider,
+          model: baseline.model,
+          ...(baseline.reasoningEffort === undefined ? {} : { reasoningEffort: baseline.reasoningEffort }),
+        } as typeof resolved
+      }
+      return resolved
+    }
     if (active !== undefined && !active.closed && payload.turn === active.turn) {
       const { reasoningEffort: _dropped, ...rest } = resolved
       return {
@@ -313,6 +382,32 @@ export function installTaskRuntime(
   })
 
   /* ------------------------------------------------------------------
+   * IMPORTANT-2 prompt mirror: the host capability's prompt waterfall freezes
+   * the provider/model template variables onto its claim-bound lease route;
+   * on a DENIED mixed turn the visible prompt must match the restored
+   * baseline header (the runtime's own request waterfall above). Registered
+   * before the capability exists, so this rewrite is outermost. */
+  ctx.on('system-prompt/assemble', async (_assembly, _context, next) => {
+    const assembled = await next()
+    if (runtime.mixedDeniedTurn === undefined) return assembled
+    const active = runtime.active
+    if (active !== undefined && !active.closed) return assembled
+    const host = cap()
+    const seeded = runtime.seededOptions
+    const baseline = host?.readBaseline().effective ?? (
+      seeded !== undefined && seeded.provider !== undefined && seeded.model !== undefined
+        ? { provider: seeded.provider, model: seeded.model }
+        : null
+    )
+    if (baseline === null) return assembled
+    if (assembled.variables.provider === baseline.provider && assembled.variables.model === baseline.model) return assembled
+    return {
+      ...assembled,
+      variables: { ...assembled.variables, provider: baseline.provider, model: baseline.model },
+    }
+  })
+
+  /* ------------------------------------------------------------------
    * Claimed-message gate: the delivered session-link message just entered a
    * turn. The runtime activates ONLY against the durable binding (brief 4d):
    * a pre-bound delivery activates synchronously; a delivery whose binding
@@ -320,34 +415,44 @@ export function installTaskRuntime(
    * is claimed just-in-time by the first `agent/request` of that turn.
    * ---------------------------------------------------------------- */
   ctx.on('agent/inbox/claimed', (payload: { agent: Agent; message: { source?: unknown }; turn: number }) => {
+    if (agent.session.header.origin === 'subagent') return
     const host = cap()
-    if (host === undefined || agent.session.header.origin === 'subagent') return
+    if (host === undefined) {
+      /* F-C1b: a session-link message reached a claim before ANY path armed
+       * this Agent (a cold target that became live between admission and
+       * delivery, or a post-restart claim). Park the identity, arm the
+       * capability through the single flight, and let the pre-step gate
+       * (which awaits the same flight) manage the turn when arming
+       * succeeds; a non-fabricating host leaves the message unmanaged, the
+       * same legacy honesty a host without the capability always had. */
+      const parkedId = messageIdOf(payload.message as { source?: unknown })
+      if (parkedId === undefined) return
+      const pending = runtime.claimedPending ?? new Map<number, SessionLinkMessageId>()
+      runtime.claimedPending = pending
+      pending.set(payload.turn, parkedId)
+      void armHost()
+      return
+    }
     const record = hostRecordFor(payload.message as { source?: unknown }, host)
     const messageId = record === undefined
       ? messageIdOf(payload.message as { source?: unknown })
       : record.messageId as unknown as SessionLinkMessageId
     if (messageId === undefined) return
 
-    /* F2 (Task-5 review): the pre-step gate below is the only control point
-     * that may activate against the whole claimed batch, and only into a
-     * SOLO one. This claimed gate parks the message so a pre-bound delivery
-     * whose activation would race the OF-BY-ONE claimed batch never freezes
-     * the human step inside it; the pre-step listener below reads the same
-     * parked ids and activates only a batch whose every session-link
-     * message belongs to the activating task. */
+    /* F2 (Task-5 review) + IMPORTANT-2 (final review): the PRE-STEP gate
+     * below is the ONLY control point that may activate a claimed delivery —
+     * it sees the whole claimed batch and activates strictly into a SOLO
+     * one. This claimed gate only ever PARKS the message; it never activates
+     * inline. An inline activation here cannot know whether the batch is
+     * mixed (the inbox claim emits per message, never exposing the rest of
+     * the batch), and activating into a mixed batch freezes its human step
+     * onto the task route — the exact hole the pre-step refusal exists to
+     * close. The binding-race case (brief 4d: binding lands between claim
+     * and the step) is covered by the same pre-step gate re-reading the
+     * durable row, and by the JIT request gate as its retry. */
     const pending = runtime.claimedPending ?? new Map<number, SessionLinkMessageId>()
     runtime.claimedPending = pending
     pending.set(payload.turn, messageId)
-    // A row already bound before the claim (queued path) may activate inline
-    // ONLY when the claimed batch holds exactly this one message — the solo
-    // case the pre-step gate enforces too. The inbox claim does not expose
-    // the rest of the batch here; the pre-step gate (which runs strictly
-    // before any request of the same turn) is the authoritative refusal
-    // point, so inline activation stays safe for pre-bound rows.
-    if (record !== undefined && findRowByBinding(resolveTasks(), messageId, record.intentId) !== undefined) {
-      pending.delete(payload.turn)
-      void activate(resolveTasks(), links, host, runtime, record.intentId, messageId, payload.turn)
-    }
   })
 
   /* Pre-step is the LAST control point before a step's request resolves, and
@@ -369,10 +474,15 @@ export function installTaskRuntime(
    * activates a batch whose every session-link message belongs to the task
    * being activated (the solo case). */
   ctx.on('agent/pre-step', async (payload, next) => {
-    const host = cap()
-    if (host === undefined || (runtime.active !== undefined && !runtime.active.closed)) return await next()
+    if (runtime.active !== undefined && !runtime.active.closed) return await next()
     const pending = runtime.claimedPending
     if (pending === undefined || pending.size === 0) return await next()
+    /* F-C1b: the claimed gate may have parked a managed message while no
+     * capability existed yet; this gate is the LAST point before the step's
+     * request resolves, so it awaits the same single-flight arming rather
+     * than letting a managed delivery run the baseline. */
+    const host = cap() ?? await armHost()
+    if (host === undefined) return await next()
     const tracked: { message: UserMessage; record: NonNullable<ReturnType<typeof hostRecordFor>> }[] = []
     for (const message of payload.messages) {
       const record = hostRecordFor(message as { source?: unknown }, host)
@@ -386,6 +496,21 @@ export function installTaskRuntime(
       // Mixed batch: re-append the tracked messages behind everything this
       // batch carries, and let the remainder claim this step on baseline.
       for (const { message } of tracked) agent.inbox.append('next-turn', message)
+      /* IMPORTANT-2 (final review): the re-appended messages leave THIS
+       * turn's batch, so they must leave THIS turn's parked claims too —
+       * otherwise the human step's first agent/request of the same turn
+       * finds the stale parked entry and activates the task into the human
+       * turn, freezing it onto the task route. They re-park honestly when
+       * the genuine next-turn claim fires. */
+      for (const { record } of tracked) {
+        const dropped = record.messageId as unknown as SessionLinkMessageId
+        for (const [turn, parked] of [...pending.entries()]) {
+          if (parked === dropped) pending.delete(turn)
+        }
+      }
+      // IMPORTANT-2: counter the host capability's own per-turn freeze this
+      // claim already bound (admission pre-claim): this turn stays human-owned.
+      runtime.mixedDeniedTurn = payload.turn
       const rest = payload.messages.filter(message => !tracked.some(entry => entry.message === message))
       const decision = await next()
       if (decision.kind === 'enter') return { ...decision, messages: rest }
@@ -444,7 +569,7 @@ export function installTaskRuntime(
     // CAS facts).
     const needsPersistOutcome = snapshot.policy.scope === 'session'
     if (!needsPersistOutcome) {
-      void projectFinishTasks(snapshot, resolveTasks(), data.reason ?? { kind: 'completed' })
+      void projectFinishTasks(snapshot, resolveTasks(), data.reason ?? { kind: 'completed' }, pumpNow)
         .catch(error => ctx.logger.warn(`task-runtime: finish projection for "${active.taskId}" failed: ${String(error)}`))
     }
     void (async () => {
@@ -455,7 +580,7 @@ export function installTaskRuntime(
           if (needsPersistOutcome) {
             snapshot.persistSkipReason = outcome.persistSkipReason ?? snapshot.persistSkipReason
             try {
-              await projectFinishTasks(snapshot, resolveTasks(), data.reason ?? { kind: 'completed' })
+              await projectFinishTasks(snapshot, resolveTasks(), data.reason ?? { kind: 'completed' }, pumpNow)
             } catch (error: unknown) {
               ctx.logger.warn(`task-runtime: finish projection for "${active.taskId}" failed: ${String(error)}`)
             }
@@ -681,6 +806,9 @@ async function projectWait(
       reason,
       events: [event],
     })
+    /* CRITICAL-2: this projection committed an outbox event; the sender
+     * must not wait for an unrelated tool call before the notification. */
+    runtime.schedulePump?.()
   } catch { /* CAS conflict: a concurrent projection already landed honestly */ }
 }
 
@@ -731,13 +859,28 @@ async function switchCandidate(
   let nextRoute: ModelRouteSelection | undefined
   let newFreezeRoute: ModelRouteSelection | undefined
   if ('use' in nextCandidate) {
+    /* `session_default` resolves the TARGET's long-term baseline AT
+     * ACTIVATION (Public Contract §1), never the frozen task route the
+     * claim's header parked into `lastUsed` (readBaseline at switch time
+     * would read the TASK'S OWN route back). The activation-time snapshot
+     * the claim recorded is the honest pre-task baseline; a COLD projection
+     * (snapshot null — e.g. a fresh spawn target) falls back to the Agent's
+     * SEEDED creation options — the SAME fallback activate() already
+     * applies — instead of falsely exhausting the attempt. */
     const baseline = host.readBaseline()
-    if (baseline.effective === null) return false
-    nextRoute = {
-      provider: baseline.effective.provider,
-      model: baseline.effective.model,
-      ...(baseline.effective.reasoningEffort === undefined ? {} : { reasoningEffort: baseline.effective.reasoningEffort }),
-    }
+    const seeded = runtime.seededOptions
+    const seededRoute = seeded !== undefined && seeded.provider !== undefined && seeded.model !== undefined
+      ? {
+        provider: seeded.provider,
+        model: seeded.model,
+        ...(seeded.reasoningEffort === undefined ? {} : { reasoningEffort: seeded.reasoningEffort }),
+      }
+      : null
+    const resolvedDefault = active.displacedBaseline === undefined
+      ? baseline.effective ?? seededRoute
+      : active.displacedBaseline ?? seededRoute
+    if (resolvedDefault === null) return false
+    nextRoute = resolvedDefault
     newFreezeRoute = nextRoute
   } else {
     nextRoute = {
@@ -766,6 +909,9 @@ async function switchCandidate(
       ...(active.lastFailureMessage === undefined ? {} : { message: active.lastFailureMessage }),
     }, [fallbackEvent])
     revision = (tasks.getRow(active.taskId) ?? row).revision
+    /* CRITICAL-2: the model_fallback_selected event just committed; the
+     * sender must not wait for an unrelated tool call before it flows. */
+    runtime.schedulePump?.()
   } catch {
     return false
   }
@@ -779,12 +925,13 @@ async function switchCandidate(
     }
   }
 
+  const previousIntentId = active.intentId
   try {
-    await host.cancelTurnIntent(active.intentId, 'route-availability switch')
+    await host.cancelTurnIntent(previousIntentId, 'route-availability switch')
   } catch {
     return false
   }
-  const hostRecordSource = host.getTurnIntent(active.intentId)
+  const hostRecordSource = host.getTurnIntent(previousIntentId)
   const messageId = hostRecordSource?.messageId ?? (active.messageId as never)
   const attempt = currentAttempt(tasks, active)
   const route = routeForHost(nextRoute, active.candidates, nextIndex, attempt)
@@ -799,6 +946,20 @@ async function switchCandidate(
   try {
     lease = await host.claimTurnIntent(fresh.intentId)
   } catch {
+    return false
+  }
+  /* IMPORTANT-4 (final review): the durable row must reference the LIVE
+   * intent, not the cancelled one — a post-restart fold would otherwise
+   * read execution.turnIntentId pointing at a cancelled host fact. Rebind
+   * in ONE atomic row write guarded on the intent being replaced; a
+   * concurrent projection that already moved the intent rows this CAS out
+   * honestly (the switch aborts after releasing the fresh claim; the
+   * turn's close projection settles). */
+  try {
+    await tasks.rebindTurnIntent(active.taskId, revision, { from: previousIntentId, to: fresh.intentId })
+  } catch {
+    lease.release()
+    await host.cancelTurnIntent(fresh.intentId, 'switch rebind lost the CAS').catch(() => {})
     return false
   }
   active.lease.release()
@@ -894,11 +1055,18 @@ async function projectFinishTasks(
   active: ActiveClaim,
   tasks: SessionLinkTaskService,
   reason: { kind: string; error?: { code?: string; message?: string } },
+  schedulePump?: () => void,
 ): Promise<void> {
   const row = tasks.getRow(active.taskId)
   if (row === undefined) return
   const attempt = row.attempts.find(candidate => candidate.attemptId === active.attemptId)
   let revision = row.revision
+  /** CRITICAL-2: every successful event-committing projection below pumps. */
+  const pumped = (committed: boolean): void => {
+    if (committed) {
+      try { schedulePump?.() } catch { /* the pump's own pass logs */ }
+    }
+  }
 
   // Plan clause 5: the turn closed with a committed response only counts as
   // finished when it DIDN'T also end through a request failure after the
@@ -930,6 +1098,7 @@ async function projectFinishTasks(
           ...(active.persistSkipReason === undefined ? {} : { reason: PERSISTENT_SELECTION_SKIPPED }),
         }],
       })
+      pumped(true)
     } catch { /* CAS conflict: state already landed */ }
     return
   }
@@ -965,6 +1134,7 @@ async function projectFinishTasks(
         ...(partial ? { executionState: 'partial' } : {}),
         events: [event],
       })
+      pumped(true)
     } catch { /* concurrently projected */ }
     return
   }
@@ -1005,5 +1175,6 @@ async function projectFinishTasks(
         resumable: !active.responseCommitted,
       }],
     })
+    pumped(true)
   } catch { /* CAS conflict: the row already settled */ }
 }

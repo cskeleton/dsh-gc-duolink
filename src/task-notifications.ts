@@ -28,9 +28,14 @@
  *    reconciles without polling.
  *
  * Notifications never trigger notifications: the delivered source is
- * `session-task-status`, which nothing in the plugin treats as a task —
- * and the chain wake budget is never reset, because the report rides the
- * ORIGINAL task's notification root (`inReplyTo`).
+ * `session-task-status`, which nothing in the plugin treats as a task.
+ * Chain semantics are honest by design: a BOUND task's events (a
+ * turn_finished/interrupted/cancelled report about an admitted delivery)
+ * ride the task's notification root as `inReplyTo` so the chain wake
+ * budget is never reset; events whose task has no durable root anymore
+ * (runtime route failures cleared the binding, precheck failures, and
+ * reconcile's repair notices) mint their OWN fresh one-message chain
+ * instead of fabricating a root identity the mailbox never recorded.
  * @module dsh-session-link/task-notifications
  */
 

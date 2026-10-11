@@ -132,6 +132,7 @@ export {
 } from './task-runtime.ts'
 export { installTaskNotifications } from './task-notifications.ts'
 export type { TaskNotificationPump } from './task-notifications.ts'
+export { ensureTaskHostLazy } from './task-host-lazy.ts'
 export type { SessionLinkTaskStatusReport, SessionLinkTaskStatusSource } from './types.ts'
 export type {
   AttachBindingInput,

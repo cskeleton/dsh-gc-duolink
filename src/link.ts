@@ -1214,7 +1214,11 @@ export class SessionLinkService extends TypertRemoteService {
     if (this.ctx.workspaceRegistry.archivedSessionIds.includes(request.callerId)) {
       throw new SessionLinkError(`session "${request.callerId}" is archived`, 'TARGET_ARCHIVED')
     }
-    const text = renderTaskStatusText(request, this.titleOfSession(request.targetId))
+    // Compute the status body and the target attribution ONCE: both the byte
+    // budget and the durable row read the same strings (a second render would
+    // also re-resolve the title).
+    const targetTitle = this.titleOfSession(request.targetId)
+    const text = renderTaskStatusText(request, targetTitle)
     if (Buffer.byteLength(text, 'utf8') > this.resolved.maxMessageBytes) {
       throw new SessionLinkError(`task-status message exceeds ${this.resolved.maxMessageBytes} bytes`, 'MESSAGE_TOO_LARGE')
     }
@@ -1241,10 +1245,10 @@ export class SessionLinkService extends TypertRemoteService {
     const record: SessionLinkMessageRecordData = {
       linkId: link.id,
       senderId: request.targetId,
-      senderTitle: this.titleOfSession(request.targetId),
+      senderTitle: targetTitle,
       targetId: request.callerId,
       ...(inReplyTo === undefined ? {} : { inReplyTo }),
-      text: renderTaskStatusText(request, this.titleOfSession(request.targetId)),
+      text,
       status: 'pending',
       wakesUsed: 0,
       chainLength,
