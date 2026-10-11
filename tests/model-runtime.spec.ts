@@ -206,7 +206,7 @@ describe('model-runtime: task route freeze (capability contract)', () => {
       .rejects.toMatchObject({ code: 'TASK_UNKNOWN' })
   })
 
-  it('surfaces HOST_CAPABILITY_UNAVAILABLE-style failure: stale revision fails the claim CAS', async () => {
+  it('a moved baseline fails the claim CAS with TASK_STALE_REVISION', async () => {
     const s = await stack(new MockAdapter([textResponse('x')]))
     const baseline0 = s.capability.readBaseline()
     const messageId = brandString<MessageId>('mail-cas')
@@ -215,7 +215,6 @@ describe('model-runtime: task route freeze (capability contract)', () => {
     s.agent.session.append('model/selection', { provider: 'mock', model: 'other-model' })
     await expect(s.capability.claimTurnIntent(record.intentId, { expectedBaseline: baseline0.revision }))
       .rejects.toMatchObject({ code: 'TASK_STALE_REVISION' })
-    void baseline0
   })
 
   it('evaluateRetry reports route-availability from adapter facts', async () => {

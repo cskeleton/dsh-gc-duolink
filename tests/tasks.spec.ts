@@ -908,6 +908,82 @@ describe('session-link tasks: crash and restart', () => {
     // Nothing about the row changed: reconciliation is a report, not a repair.
     expect(second.tasks.getRow(saved.taskId)!.revision).toBe(3)
   })
+
+  it('IMPORTANT-5: one racing row cannot abort reconcile — a stale row is retried, a doubly-stale row is skipped while the rest repair', async () => {
+    const pool = new MemoryMediaPool()
+    const first = await stack(pool)
+    const savedA = await saveSpawn(first, 'call-race-a')
+    const savedB = await saveSpawn(first, 'call-race-b')
+    // Crash both between binding commit and turn-intent commit.
+    await first.tasks.attachBinding(savedA.taskId, 1, {
+      messageId: SessionLinkMessageId('session-link-message-race-a'), sessionId: bobId, admittedAs: 'queued',
+    })
+    await first.tasks.attachBinding(savedB.taskId, 1, {
+      messageId: SessionLinkMessageId('session-link-message-race-b'), sessionId: bobId, admittedAs: 'queued',
+    })
+    await first.disposeTasks()
+
+    // Race ONE revision bump for row A by wrapping the CAS primitive: the
+    // first mutating call for task A throws the same TASK_STALE_REVISION a
+    // concurrent writer would produce. repairOne re-reads and retries —
+    // BOTH rows repair.
+    const second = await stack(pool)
+    const realUpdateA = second.tasks.update.bind(second.tasks)
+    let racedA = 0
+    ;(second.tasks as unknown as { update: typeof realUpdateA }).update = async (taskId, expectedRevision, mutator) => {
+      if (taskId === savedA.taskId && racedA === 0) {
+        racedA += 1
+        throw new SessionLinkTaskError('TASK_STALE_REVISION', `injected race on ${taskId}`)
+      }
+      return await realUpdateA(taskId, expectedRevision, mutator)
+    }
+    const reportA = await second.tasks.reconcile()
+    expect(reportA.notifiedRepairs).toContain(savedA.taskId)
+    expect(reportA.notifiedRepairs).toContain(savedB.taskId)
+    expect(racedA).toBe(1)
+    expect(second.tasks.getRow(savedA.taskId)!.reason).toBe('repair_binding_missing')
+    expect(second.tasks.getRow(savedB.taskId)!.reason).toBe('repair_binding_missing')
+    expect(second.tasks.getRow(savedA.taskId)!.outbox).toHaveLength(1)
+    expect(second.tasks.getRow(savedB.taskId)!.outbox).toHaveLength(1)
+    await second.disposeTasks()
+
+    // Doubly-racing row: both of row A's attempts lose the CAS. Row A is
+    // SKIPPED for this run (the next reconcile retries it honestly) — the
+    // rest of the scan still completes and repairs row C.
+    const pool2 = new MemoryMediaPool()
+    const third = await stack(pool2)
+    const savedC0 = await saveSpawn(third, 'call-race-c0')
+    const savedC1 = await saveSpawn(third, 'call-race-c1')
+    await third.tasks.attachBinding(savedC0.taskId, 1, {
+      messageId: SessionLinkMessageId('session-link-message-race-c0'), sessionId: bobId, admittedAs: 'queued',
+    })
+    await third.tasks.attachBinding(savedC1.taskId, 1, {
+      messageId: SessionLinkMessageId('session-link-message-race-c1'), sessionId: bobId, admittedAs: 'queued',
+    })
+    await third.disposeTasks()
+    const fourth = await stack(pool2)
+    const realUpdateC = fourth.tasks.update.bind(fourth.tasks)
+    let racedC0 = 0
+    ;(fourth.tasks as unknown as { update: typeof realUpdateC }).update = async (taskId, expectedRevision, mutator) => {
+      if (taskId === savedC0.taskId && racedC0 < 2) {
+        racedC0 += 1
+        throw new SessionLinkTaskError('TASK_STALE_REVISION', `injected persistent race on ${taskId}`)
+      }
+      return await realUpdateC(taskId, expectedRevision, mutator)
+    }
+    const reportC = await fourth.tasks.reconcile()
+    expect(racedC0).toBe(2)
+    // Row C0 skipped untouched; row C1 repaired and reported.
+    expect(reportC.notifiedRepairs).not.toContain(savedC0.taskId)
+    expect(reportC.notifiedRepairs).toContain(savedC1.taskId)
+    expect(fourth.tasks.getRow(savedC0.taskId)!.taskState).toBe('queued')
+    expect(fourth.tasks.getRow(savedC0.taskId)!.outbox).toHaveLength(0)
+    expect(fourth.tasks.getRow(savedC1.taskId)!.reason).toBe('repair_binding_missing')
+    // The skipped row repairs on the NEXT reconcile with no injected race.
+    ;(fourth.tasks as unknown as { update: typeof realUpdateC }).update = realUpdateC
+    const reportC2 = await fourth.tasks.reconcile()
+    expect(reportC2.notifiedRepairs).toContain(savedC0.taskId)
+  })
 })
 
 describe('session-link tasks: legacy row loading', () => {

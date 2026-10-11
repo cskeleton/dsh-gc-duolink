@@ -225,6 +225,15 @@ describe('normalizeModelRoutingParams candidate building', () => {
       on_model_unavailable: { fallbacks: [{ provider: 'openai', model: 'gpt-5', reasoning_effort: 'high' }] },
     })
     expect(distinct.candidates).toHaveLength(2)
+    // The dedup key is NUL-separated and collision-proof: primary
+    // {provider:'open mock', model:'a'} plus fallback {provider:'open',
+    // model:'mock a'} would collide under a visible-separator key
+    // ('open mock a' on both sides) but are honestly DISTINCT triples.
+    const noCollision = policy({
+      provider: 'open mock', model: 'a',
+      on_model_unavailable: { fallbacks: [{ provider: 'open', model: 'mock a' }] },
+    })
+    expect(noCollision.candidates).toHaveLength(2)
   })
 
   it('rejects a repeated session_default sentinel', () => {

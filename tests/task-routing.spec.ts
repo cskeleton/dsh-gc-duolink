@@ -848,3 +848,371 @@ describe('task-routing: result presentation', () => {
     expect(parsed.executionState).toBe('not_started')
   })
 })
+
+/* ------------------------------------------------------------------------
+ * Final review fix-wave (whole-branch): F-C1 cold-target honesty + later-live
+ * binding, CRITICAL-2 runtime-triggered notification pump, IMPORTANT-1
+ * single-flight capability creation, IMPORTANT-3 seeded session_default
+ * fallback on a cold projection, IMPORTANT-4 live-intent rebind on fallback,
+ * and the CATALOG_UNAVAILABLE concrete-trail preservation.
+ * ------------------------------------------------------------------------ */
+describe('task-routing: final fix-wave', () => {
+  it('F-C1a: a tracked send to a COLD target answers needs_decision — no bare execution, no model call on the baseline', async () => {
+    const adapter = new MockAdapter([textResponse('should never be served for the task')])
+    const s = await stack({ adapter })
+    const coldId = SessionId('session-cold-target')
+    await s.ctx.sessionLinks.link('cold-pair', [s.alice.id, coldId], { kind: 'human' })
+    const result = succeeded(await call(s.ctx, 'session_send_session_message', {
+      session_id: coldId,
+      message: 'tracked work for the cold target',
+      provider: 'mock',
+      model: MODEL_A,
+    }, s.alice, 'call-cold-send-1')).value as {
+      outcome: string; taskId: string; reason?: string; sessionId?: string
+    }
+    // Honest refusal: the route/capability cannot be made durable before the
+    // mailbox admission, so NOTHING is admitted and NO model serves it.
+    expect(result.outcome).toBe('needs_decision')
+    expect(result.reason).toBe('model_unavailable')
+    expect(result.sessionId).toBe(String(coldId))
+    const taskId = taskIdFor(s.alice.id, 'call-cold-send-1')
+    const row = s.ctx.sessionLinkTasks.getRow(taskId)
+    expect(row?.taskState).toBe('waiting_decision')
+    expect(row?.executionState).toBe('not_started')
+    expect(row?.reason).toBe('model_unavailable')
+    expect(row?.execution.messageId).toBeUndefined()
+    expect(row?.execution.turnIntentId).toBeUndefined()
+    expect(row?.outbox).toHaveLength(1)
+    expect(row?.outbox[0]?.kind).toBe('model_unavailable')
+    expect(row?.outbox[0]?.decisionRequired).toBe(true)
+    // The mailbox holds NO message for this task, and no model ever ran it
+    // on the deployment baseline (adapter received nothing).
+    expect(modelsOf(adapter)).toEqual([])
+    expect(mailTexts(s.bob)).toEqual([])
+    // The ONE waiting_decision outbox event is pending until the pump admits it.
+    expect(row?.outbox[0]?.status).toBe('pending')
+    // A retry decision while the target is STILL cold re-admits nothing: the
+    // decision applies (new attempt), then the re-admission's capability
+    // refusal returns the row to waiting_decision with ONE fresh event — no
+    // bare mailbox message, still no model call.
+    const decided = succeeded(await call(s.ctx, 'session_resolve_task', {
+      task_id: String(taskId),
+      expected_revision: s.ctx.sessionLinkTasks.getRow(taskId)!.revision,
+      action: 'retry',
+    }, s.alice, 'call-cold-decide-1')).value as { applied: boolean }
+    expect(decided.applied).toBe(true)
+    await vi.waitFor(() => {
+      expect(s.ctx.sessionLinkTasks.getRow(taskId)?.taskState).toBe('waiting_decision')
+    }, { timeout: 5000 })
+    const after = s.ctx.sessionLinkTasks.getRow(taskId)
+    expect(after?.execution.messageId).toBeUndefined()
+    expect(after?.attempts).toHaveLength(2)
+    // Exactly the durable chain of facts: capability refusal, the applied
+    // retry decision's own marker, and the re-admission capability refusal.
+    expect(after?.outbox.map(event => event.reason)).toEqual([
+      'model_unavailable', 'retry_decision_applied', 'model_unavailable',
+    ])
+    expect(modelsOf(adapter)).toEqual([])
+  }, 20000)
+
+  it('F-C1b: a cold target that becomes live binds through the retry decision and executes on the requested route', async () => {
+    const adapter = new MockAdapter([textResponse(`done by ${MODEL_A}`)])
+    const s = await stack({ adapter })
+    const coldId = SessionId('session-cold-late')
+    const linked = await s.ctx.sessionLinks.link('late-pair', [s.alice.id, coldId], { kind: 'human' })
+    await s.ctx.sessionLinks.setAutoWake(linked.id, [coldId])
+    const refused = succeeded(await call(s.ctx, 'session_send_session_message', {
+      session_id: coldId,
+      message: 'tracked work admitted once the target lives',
+      provider: 'mock',
+      model: MODEL_A,
+    }, s.alice, 'call-cold-send-2')).value as { outcome: string }
+    expect(refused.outcome).toBe('needs_decision')
+    const taskId = taskIdFor(s.alice.id, 'call-cold-send-2')
+    // The cold target comes alive; the plugin's agent/created path mounts its
+    // runtime and the retry's re-admission single-flights the capability onto it.
+    const later = await s.ctx.agentLoop.create(coldId, { provider: 'mock', model: BASE_MODEL })
+    expect(resolveTaskHostRef(later)).toBeUndefined()
+    const revision = s.ctx.sessionLinkTasks.getRow(taskId)?.revision
+    expect(revision).toBeDefined()
+    const decided = succeeded(await call(s.ctx, 'session_resolve_task', {
+      task_id: String(taskId),
+      expected_revision: revision,
+      action: 'retry',
+    }, s.alice, 'call-cold-decide-2')).value as { applied: boolean }
+    expect(decided.applied).toBe(true)
+    // Capability installed on the Agent BEFORE the managed claim ran.
+    await vi.waitFor(() => { expect(resolveTaskHostRef(later)).toBeDefined() })
+    await later.whenIdle()
+    await vi.waitFor(() => {
+      expect(s.ctx.sessionLinkTasks.getRow(taskId)?.taskState).toBe('turn_finished')
+    }, { timeout: 5000 })
+    const row = s.ctx.sessionLinkTasks.getRow(taskId)
+    expect(row?.execution.turnIntentId).toBeDefined()
+    expect(row?.execution.messageId).toBeDefined()
+    expect(row?.execution.routeUsed?.model).toBe(MODEL_A)
+    // The retried task executed EXACTLY once, on the requested route — never the baseline.
+    expect(modelsOf(adapter)).toEqual([MODEL_A])
+  }, 20000)
+
+  it('CRITICAL-2: turn_finished notification reaches the sender WITHOUT a manual drain or another tool call', async () => {
+    const adapter = new MockAdapter([
+      textResponse(`done by ${MODEL_A}`),
+      textResponse('alice reads the status'),
+    ])
+    const s = await stack({ adapter })
+    const granted = await s.ctx.sessionLinks.link('pair', [s.alice.id, s.bob.id], { kind: 'human' })
+    await s.ctx.sessionLinks.setAutoWake(granted.id, [s.bob.id, s.alice.id])
+    succeeded(await call(s.ctx, 'session_send_session_message', {
+      session_id: s.bob.id,
+      message: 'finish and report back',
+      provider: 'mock',
+      model: MODEL_A,
+    }, s.alice, 'call-pump-finish-1'))
+    const taskId = taskIdFor(s.alice.id, 'call-pump-finish-1')
+    await vi.waitFor(() => {
+      expect(s.ctx.sessionLinkTasks.getRow(taskId)?.taskState).toBe('turn_finished')
+    }, { timeout: 5000 })
+    // NO pump.drain(), NO further tool call: the runtime's own projection
+    // triggered the pump and the outbox event rode the REAL mailbox to alice.
+    let notified: string | undefined
+    await vi.waitFor(() => {
+      const event = s.ctx.sessionLinkTasks.getRow(taskId)?.outbox.find(entry => entry.kind === 'turn_finished')
+      expect(event?.status === 'admitted' || event?.status === 'delivered').toBe(true)
+      notified = event?.notifiedMessageId
+      expect(notified).toBeDefined()
+    }, { timeout: 5000 })
+    await vi.waitFor(() => {
+      expect(s.ctx.sessionLinks.message(notified as never)?.status).toBe('delivered')
+    }, { timeout: 5000 })
+    await s.alice.whenIdle()
+    // The sender's own session durably recorded the status report (attribution
+    // source), and the outbox reconciled admitted → delivered on its own.
+    expect(s.alice.session.snapshotEvents().some(event =>
+      event.type === 'agent/inbox/spliced'
+      && (event.data.inserted as { source?: { kind?: string; messageId?: string } }[])
+        .some(message => message.source?.kind === 'session-task-status' && message.source.messageId === notified))).toBe(true)
+  }, 20000)
+
+  it('CRITICAL-2: async candidate exhaustion at activation notifies the sender WITHOUT a manual drain or another tool call', async () => {
+    class RouteDown extends MockAdapter {
+      constructor() { super([textResponse('alice reads the failure')]) }
+      override async *stream(options: GenerateOptions) {
+        this.requests.push(options)
+        if (options.model === MODEL_A) throw new HarnessError('upstream down', 'PROVIDER_UNAVAILABLE')
+        for (const chunk of textResponse('status turn')) yield chunk
+      }
+    }
+    const adapter = new RouteDown()
+    const s = await stack({ adapter })
+    const granted = await s.ctx.sessionLinks.link('pair', [s.alice.id, s.bob.id], { kind: 'human' })
+    await s.ctx.sessionLinks.setAutoWake(granted.id, [s.bob.id, s.alice.id])
+    // Single-candidate policy: the activation-time route failure exhausts the
+    // attempt asynchronously (after a successful queue+admission).
+    succeeded(await call(s.ctx, 'session_send_session_message', {
+      session_id: s.bob.id,
+      message: 'work that fails its only route',
+      provider: 'mock',
+      model: MODEL_A,
+    }, s.alice, 'call-pump-exhaust-1'))
+    const taskId = taskIdFor(s.alice.id, 'call-pump-exhaust-1')
+    await vi.waitFor(() => {
+      expect(s.ctx.sessionLinkTasks.getRow(taskId)?.taskState).toBe('waiting_decision')
+    }, { timeout: 5000 })
+    // NO pump.drain(), NO further tool call: the runtime's projection pumped.
+    let notified: string | undefined
+    await vi.waitFor(() => {
+      const event = s.ctx.sessionLinkTasks.getRow(taskId)?.outbox.find(entry => entry.kind === 'model_unavailable')
+      expect(event?.status === 'admitted' || event?.status === 'delivered').toBe(true)
+      notified = event?.notifiedMessageId
+      expect(notified).toBeDefined()
+    }, { timeout: 5000 })
+    const report = s.ctx.sessionLinks.message(notified as never)
+    expect(report?.statusKind).toBe('task-status')
+    expect(report?.taskStatus?.kind).toBe('model_unavailable')
+    expect(report?.taskStatus?.decisionRequired).toBe(true)
+    await s.alice.whenIdle()
+  }, 20000)
+
+  it('IMPORTANT-1: two concurrent tracked sends to one target join ONE capability creation; both tasks execute on their routes', async () => {
+    // Unit-level: the same in-flight Promise serves concurrent creators and
+    // every later resolution returns the SAME instance without re-creating.
+    const probeAdapter = new MockAdapter([])
+    const probe = await stack({ adapter: probeAdapter })
+    const { ensureTaskHostLazy } = await import('../src/index.ts')
+    const [first, second] = await Promise.all([
+      ensureTaskHostLazy(probe.alice),
+      ensureTaskHostLazy(probe.alice),
+    ])
+    expect(first).toBeDefined()
+    expect(first).toBe(second)
+    const third = await ensureTaskHostLazy(probe.alice)
+    expect(third).toBe(first)
+
+    // Integration: two concurrent tracked admissions to the SAME live target.
+    const adapter = new MockAdapter([
+      textResponse(`task one on ${MODEL_A}`),
+      textResponse(`task two on ${MODEL_B}`),
+    ])
+    const s = await stack({ adapter })
+    const granted = await s.ctx.sessionLinks.link('pair', [s.alice.id, s.bob.id], { kind: 'human' })
+    await s.ctx.sessionLinks.setAutoWake(granted.id, [s.bob.id])
+    expect(resolveTaskHostRef(s.bob)).toBeUndefined()
+    const [one, two] = await Promise.all([
+      call(s.ctx, 'session_send_session_message', {
+        session_id: s.bob.id, message: 'task one', provider: 'mock', model: MODEL_A,
+      }, s.alice, 'call-race-1'),
+      call(s.ctx, 'session_send_session_message', {
+        session_id: s.bob.id, message: 'task two', provider: 'mock', model: MODEL_B,
+      }, s.alice, 'call-race-2'),
+    ])
+    expect(succeeded(one).isError).toBe(false)
+    expect(succeeded(two).isError).toBe(false)
+    const capability = resolveTaskHostRef(s.bob)
+    expect(capability).toBeDefined()
+    await s.bob.whenIdle()
+    await vi.waitFor(() => {
+      expect(s.ctx.sessionLinkTasks.getRow(taskIdFor(s.alice.id, 'call-race-1'))?.taskState).toBe('turn_finished')
+      expect(s.ctx.sessionLinkTasks.getRow(taskIdFor(s.alice.id, 'call-race-2'))?.taskState).toBe('turn_finished')
+    }, { timeout: 8000 })
+    // Both tasks ran their OWN routes in order behind each other; the shared
+    // capability never froze a route onto the wrong task.
+    expect(modelsOf(adapter)).toEqual([MODEL_A, MODEL_B])
+    // The capability that drove both turns is still the single instance.
+    expect(resolveTaskHostRef(s.bob)).toBe(capability)
+  }, 20000)
+
+  it('IMPORTANT-3: a spawned target with a COLD projection resolves the session_default fallback from the seeded baseline', async () => {
+    class FailingPrimary extends MockAdapter {
+      constructor() { super([]) }
+      override async *stream(options: GenerateOptions) {
+        this.requests.push(options)
+        if (options.model === MODEL_A) throw new HarnessError('upstream down', 'PROVIDER_UNAVAILABLE')
+        for (const chunk of textResponse(`served by ${options.model}`)) yield chunk
+      }
+    }
+    const adapter = new FailingPrimary()
+    const s = await stack({ adapter })
+    const result = succeeded(await call(s.ctx, 'session_spawn_linked_session', {
+      cwd: '/tmp/task-routing-seeded-default',
+      task: 'run with the session-default fallback',
+      provider: 'mock',
+      model: MODEL_A,
+      on_model_unavailable: { fallbacks: [{ use: 'session_default' }] },
+    }, s.alice, 'call-spawn-seeded-default')).value as { outcome: string }
+    expect(result.outcome).toBe('admitted')
+    await s.bob.whenIdle()
+    await vi.waitFor(() => {
+      expect(s.ctx.sessionLinkTasks.getRow(taskIdFor(s.alice.id, 'call-spawn-seeded-default'))?.taskState).toBe('turn_finished')
+    }, { timeout: 5000 })
+    // The fresh target carried NO durable baseline projection: the switch
+    // resolved session_default from the Agent's SEEDED options (base-model),
+    // exactly like activate()'s own snapshot fallback — no false exhaustion.
+    expect(modelsOf(adapter)).toEqual([MODEL_A, BASE_MODEL])
+    const row = s.ctx.sessionLinkTasks.getRow(taskIdFor(s.alice.id, 'call-spawn-seeded-default'))
+    expect(row?.execution.routeUsed?.model).toBe(BASE_MODEL)
+    const finished = row?.outbox.find(event => event.kind === 'turn_finished')
+    expect(finished?.actualModel?.model).toBe(BASE_MODEL)
+    // The resolved default froze onto the attempt (replay never re-samples).
+    const attempt = row?.attempts.at(-1)
+    expect(attempt?.defaultFrozenRoute?.model).toBe(BASE_MODEL)
+  }, 20000)
+
+  it('IMPORTANT-4: a fallback rebinds the durable row onto the LIVE intent; a simulated restart fold agrees', async () => {
+    class FailingOnce extends MockAdapter {
+      constructor() { super([]) }
+      override async *stream(options: GenerateOptions) {
+        this.requests.push(options)
+        if (options.model === MODEL_A) throw new HarnessError('upstream down', 'PROVIDER_UNAVAILABLE')
+        for (const chunk of textResponse(`served by ${options.model}`)) yield chunk
+      }
+    }
+    const adapter = new FailingOnce()
+    const s = await stack({ adapter })
+    succeeded(await call(s.ctx, 'session_spawn_linked_session', {
+      cwd: '/tmp/task-routing-rebind',
+      task: 'run with fallback then verify the durable intent',
+      provider: 'mock',
+      model: MODEL_A,
+      on_model_unavailable: { fallbacks: [{ provider: 'mock', model: MODEL_B }] },
+    }, s.alice, 'call-spawn-rebind'))
+    await s.bob.whenIdle()
+    const taskId = taskIdFor(s.alice.id, 'call-spawn-rebind')
+    await vi.waitFor(() => {
+      expect(s.ctx.sessionLinkTasks.getRow(taskId)?.taskState).toBe('turn_finished')
+    }, { timeout: 5000 })
+    const row = s.ctx.sessionLinkTasks.getRow(taskId)
+    expect(row?.execution.routeUsed?.model).toBe(MODEL_B)
+    const messageId = row?.execution.messageId
+    expect(messageId).toBeDefined()
+    // The durable row references the LIVE intent (the fallback's re-record),
+    // NOT the cancelled original.
+    const live = resolveTaskHostRef(s.bob)?.getTurnIntentByMessageId(messageId as never)
+    expect(live).toBeDefined()
+    expect(row?.execution.turnIntentId).toBe(live?.intentId)
+    const cancelledIntent = live?.intentId
+    // Simulated restart: fold a bare Session reconstructed from its durable
+    // log — the fold agrees the row's intent is the live one, and the
+    // durable-binding guard never mis-reads the cancelled intent as the
+    // binding.
+    const SessionMod = await import('@deepseek-ai/dsh-session')
+    const rebuiltSession = SessionMod.Session.create(s.bob.id, s.bob.session.snapshotEvents())
+    // The fold over `task/turn-intent` events is exactly what a post-restart
+    // capability rebuild reads: the LAST record for the message must be the
+    // live (fallback) intent.
+    const fold = ((): { intentId: string; status: string } | undefined => {
+      let record: { intentId: string; status: string } | undefined
+      for (const event of rebuiltSession.snapshotEvents()) {
+        if (event.type !== 'task/turn-intent') continue
+        const data = event.data as { intentId: string; messageId: string; phase: string }
+        if (data.messageId !== String(messageId)) continue
+        record = { intentId: data.intentId, status: data.phase }
+      }
+      return record
+    })()
+    expect(fold?.intentId).toBe(cancelledIntent)
+    expect(row?.execution.turnIntentId).toBe(fold?.intentId)
+    expect(fold?.status).toBe('finished')
+    // The cancelled ORIGINAL intent is in the log but is NOT what the row names.
+    const phases = rebuiltSession.snapshotEvents()
+      .filter(event => event.type === 'task/turn-intent')
+      .map(event => (event.data as { intentId: string; phase: string }))
+    const cancelled = phases.filter(entry => entry.phase === 'cancelled' && entry.intentId !== fold?.intentId)
+    expect(cancelled.length).toBeGreaterThan(0)
+    expect(row?.execution.turnIntentId !== cancelled[0]?.intentId).toBe(true)
+    // The execution binding is still complete for the row's live intent +
+    // message (assertBindingDurable's claim/wake guard governs live tasks
+    // only; a finished task verifies through isExecutionBound).
+    expect(s.ctx.sessionLinkTasks.isExecutionBound(taskId)).toBe(true)
+  }, 20000)
+
+  it('catalog poisoning keeps the concrete results collected before the poison in the needs_decision row', async () => {
+    const s = await stack({
+      modelCatalog: () => Promise.resolve({
+        default: { provider: 'mock', model: BASE_MODEL },
+        routableProviders: ['mock', 'alpha'],
+        groups: [{ id: 'alpha', name: 'Alpha', models: [{ id: 'some-model' }] }],
+        failures: [{ id: 'beta', message: 'beta provider is down' }],
+      }),
+    })
+    const result = succeeded(await call(s.ctx, 'session_send_session_message', {
+      session_id: s.bob.id,
+      message: 'multi-candidate precheck with a poisoned walk',
+      provider: 'alpha',
+      model: 'model-not-advertised',
+      on_model_unavailable: { fallbacks: [{ provider: 'beta', model: 'anything' }] },
+    }, s.alice, 'call-trail-poison')).value as { outcome: string; reason?: string }
+    expect(result.outcome).toBe('needs_decision')
+    // The aggregate is the catalog vocabulary: provider beta poisoned the walk.
+    expect(result.reason).toBe('catalog_unavailable')
+    const row = s.ctx.sessionLinkTasks.getRow(taskIdFor(s.alice.id, 'call-trail-poison'))
+    const results = row?.attempts.at(-1)?.results ?? []
+    // The concrete pre-poison result survived: alpha's missing model is NOT
+    // silently dropped in favor of an empty trail.
+    expect(results.length).toBe(2)
+    expect(results[0]?.route.provider).toBe('alpha')
+    expect(results[0]?.code).toBe('MODEL_NOT_FOUND')
+    expect(results[1]?.route.provider).toBe('beta')
+    expect(results[1]?.code).toBe('CATALOG_UNAVAILABLE')
+  })
+})

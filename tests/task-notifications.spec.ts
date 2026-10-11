@@ -21,7 +21,7 @@ import { HarnessError, ToolCallId, type GenerateOptions } from '@deepseek-ai/dsh
 import type { ToolExecutionResult, ToolExecutionSuccess } from '@deepseek-ai/dsh-tools'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { SessionId } from '@deepseek-ai/dsh-session'
-import SessionLinkService, { SessionLinkTaskService, taskIdFor } from '../src/index.ts'
+import SessionLinkService, { SessionLinkMessageId, SessionLinkTaskService, taskIdFor } from '../src/index.ts'
 import { installTaskNotifications, type TaskNotificationPump } from '../src/task-notifications.ts'
 import { MockAdapter, textResponse } from './helpers/mock-adapter.ts'
 import { bootStack, type BackendPools } from './helpers/domains.ts'
@@ -436,7 +436,6 @@ describe('task-notifications: budget and archived treatment', () => {
     // once the mailbox row has been durably delivered. Draining both pump
     // instances (the row's own pump + this suite's pump) settles it.
     for (let attempt = 0; attempt < 5 && s.ctx.sessionLinkTasks.getRow(taskId)?.outbox[0]?.status !== 'delivered'; attempt += 1) {
-      console.log(`[probe] attempt ${attempt}: mailbox=${s.ctx.sessionLinks.message(notification!)?.status}, outbox=${s.ctx.sessionLinkTasks.getRow(taskId)?.outbox[0]?.status}, rev=${s.ctx.sessionLinkTasks.getRow(taskId)?.revision}`)
       await drain(pump)
     }
     expect(s.ctx.sessionLinkTasks.getRow(taskId)?.outbox[0]?.status).toBe('delivered')
@@ -445,11 +444,12 @@ describe('task-notifications: budget and archived treatment', () => {
   it('chain-budget exhaustion is its own gate: a spent chain queues its OWN continuation while the sender\'s daily ledger still has room', async () => {
     // Chain-budget isolation (Task 7 matrix 通知链预算耗尽; Task 5 flagged it
     // shared the daily-budget path). maxAutoWakesPerChain = 1,
-    // maxAutoWakesPerMessage and the daily ledger generous. Alice→bob openers
-    // on two INDEPENDENT chains spend 2/2 of BOB's daily allowance (one wake
-    // per chain). Bob's reply hanging off chain A then has: per-message
-    // budget clean (≤2), daily ledger clean (1/2 left) — ONLY chain A's own
-    // budget is spent (single wake burned on the opener), so it MUST queue
+    // maxAutoWakesPerMessage = 2, and the daily ledger keeps its DEFAULT of
+    // 6. Alice→bob openers on two INDEPENDENT chains spend 2/6 of BOB's
+    // daily allowance (one wake per chain). Bob's reply hanging off chain A
+    // then has: per-message budget clean (≤2), daily ledger clean (2/6 used)
+    // — ONLY chain A's own budget is spent (single wake burned on the
+    // opener), so it MUST queue
     // with wakesUsed === 0. The task's notification to alice starts its own
     // fresh chain (runtime route failures clear the binding, so there is no
     // root to reply into) whose chain budget is clean; alice's daily ledger
@@ -893,5 +893,72 @@ describe('task-notifications: resolve_task', () => {
     }, s.alice, 'call-continue-decision')
     expect(partial.isError).toBe(true)
     expect(JSON.stringify(partial.content)).toContain('resumable checkpoint')
+  }, 20000)
+})
+
+describe('task-notifications: mount-time reconcile (F-C1c)', () => {
+  it('a process restart over a half-bound task surfaces the repair notice through reconcile into a real delivery — no auto-execution', async () => {
+    const adapter = new MockAdapter([textResponse('ok')])
+    const pools: BackendPools = { links: new MemoryMediaPool(), tasks: new MemoryMediaPool() }
+    const first = await bootStack(contexts, pools, { adapter })
+    await first.ctx.sessionLinks.link('pair', [first.alice.id, first.bob.id], { kind: 'human' })
+    // Seed the crash shape directly through the service: a task bound to a
+    // mailbox message whose host turn intent NEVER committed (the process
+    // died between write-ahead steps 3 and 4).
+    const tasks1 = first.ctx.sessionLinkTasks
+    const saved = await tasks1.saveTaskIntent({
+      callerId: first.alice.id,
+      request: { kind: 'send', callId: 'call-half-bound', text: 'work the crash dropped mid-bind', targetSessionId: first.bob.id },
+      policy: {
+        scope: 'task',
+        candidates: [{ provider: 'mock', model: MODEL_A }],
+        ifExhausted: 'notify_sender',
+        usesSessionDefault: false,
+      },
+      tracked: true,
+    })
+    const messageId = SessionLinkMessageId('session-link-message-half-bound')
+    await first.ctx.sessionLinks.send(first.alice, first.bob.id, {
+      targetId: first.bob.id,
+      text: 'delivered but never intent-recorded',
+      idempotencyKey: 'call-half-bound',
+      messageId,
+    })
+    await tasks1.attachBinding(saved.taskId, 1, {
+      messageId,
+      sessionId: first.bob.id,
+      admittedAs: 'queued',
+    })
+    expect(tasks1.isExecutionBound(saved.taskId)).toBe(false)
+    await first.ctx.fiber.dispose()
+    contexts.delete(first.ctx)
+
+    /* RESTART: the tool row mounts and its mount-time reconcile classifies
+     * the half-bound row: waiting_decision + EXACTLY ONE repair notice — and
+     * the mount-installed pump (no manual drain here) delivers it to alice.
+     * The task itself is NEVER auto-executed: bob serves nothing for it. */
+    const second = await bootStack(contexts, pools, { adapter })
+    const taskId = taskIdFor(second.alice.id, 'call-half-bound')
+    await vi.waitFor(() => {
+      const row = second.ctx.sessionLinkTasks.getRow(taskId)
+      expect(row?.taskState).toBe('waiting_decision')
+      expect(row?.reason).toBe('repair_binding_missing')
+      expect(row?.outbox.some(event => event.reason === 'repair_binding_missing' && event.status !== 'pending')).toBe(true)
+    }, { timeout: 8000 })
+    const row = second.ctx.sessionLinkTasks.getRow(taskId)
+    const repair = row?.outbox.find(event => event.reason === 'repair_binding_missing')
+    expect(repair).toBeDefined()
+    expect(['admitted', 'delivered']).toContain(repair?.status)
+    const notification = second.ctx.sessionLinks.message(repair!.notifiedMessageId!)
+    expect(notification?.statusKind).toBe('task-status')
+    expect(notification?.taskStatus?.kind).toBe('model_unavailable')
+    expect(notification?.taskStatus?.reason).toBe('repair_binding_missing')
+    expect(notification?.taskStatus?.decisionRequired).toBe(true)
+    expect(notification?.targetId).toBe(second.alice.id)
+    // Never executed: the adapter served no model request for the task, and
+    // the durable row still carries no turn intent.
+    expect(adapter.requests).toHaveLength(0)
+    expect(row?.execution.turnIntentId).toBeUndefined()
+    expect(second.ctx.sessionLinkTasks.isExecutionBound(taskId)).toBe(false)
   }, 20000)
 })
