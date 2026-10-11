@@ -58,6 +58,63 @@ export interface SessionLinkMessageSource {
   readonly inReplyTo?: SessionLinkMessageId
 }
 
+/** One concrete model route a task-status report names. */
+export interface SessionLinkTaskStatusRoute {
+  readonly provider: string
+  readonly model: string
+  readonly reasoningEffort?: string
+}
+
+/**
+ * Host-generated task-status attribution recorded in the RECEIVING (original
+ * sender) Session. Distinct from {@link SessionLinkMessageSource}: the
+ * delivery is a STATUS FACT the plugin/host emits about the ORIGINAL task —
+ * never the target Session speaking, never an instruction. Read-side dedupe
+ * keys on `session-task-status` + `messageId`; every existing
+ * `session-link-message` consumer keeps reading only peer mail.
+ */
+export interface SessionLinkTaskStatusSource {
+  readonly kind: 'session-task-status'
+  /** Durable identity used for deduplication at the receiving Session. */
+  readonly messageId: SessionLinkMessageId
+  /** Group under which the original task pair was admitted. */
+  readonly linkId: SessionLinkId
+  /** The ORIGINAL task this status reports. */
+  readonly taskId: SessionLinkTaskId
+  /** The Session the task ran/runs on (the REPORT's subject, never its speaker). */
+  readonly targetSessionId: SessionId
+  /** The attempt this fact belongs to. */
+  readonly attemptId: string
+}
+
+/**
+ * The trusted internal admission input of one host-generated task-status
+ * report (Task 5 of the model-routing plan). The plugin's task-notification
+ * entry forwards strictly its own durable outbox facts; no public tool and
+ * no external caller reaches this entry.
+ */
+export interface SessionLinkTaskStatusReport {
+  /** Deterministic outbox identity `taskId/revision/kind`; the mailbox's admission key. */
+  readonly eventId: string
+  readonly taskId: SessionLinkTaskId
+  readonly attemptId: string
+  readonly revision: number
+  readonly eventKind: 'model_fallback_selected' | 'model_unavailable' | 'turn_finished' | 'interrupted' | 'cancelled'
+  /** The Session the report is FOR (the notification is addressed TO it). */
+  readonly callerId: SessionId
+  /** The Session the task ran/runs on (the report's subject). */
+  readonly targetId: SessionId
+  readonly executionState?: 'not_started' | 'partial' | 'unknown'
+  readonly reason?: string
+  readonly requestedModel: SessionLinkTaskStatusRoute
+  readonly actualModel?: SessionLinkTaskStatusRoute
+  readonly attempts: number
+  readonly decisionRequired: boolean
+  readonly resumable: boolean
+  /** Chain root: the ORIGINAL task's notification root, when known. */
+  readonly inReplyTo?: SessionLinkMessageId
+}
+
 /**
  * How one link grant was authorized at creation. A `session` grant comes from
  * the spawn tool and owes the spawned member one wake for its first task.
@@ -118,6 +175,23 @@ export interface SessionLinkMessageRecord {
   readonly seq?: number
   /** Set before the message is handed to the target; such a message is never made terminal. */
   readonly inserted?: boolean
+  /** Present only on host-generated task-status reports; peer mail never carries it. */
+  readonly statusKind?: 'task-status'
+  /** Structured task facts of a task-status report. */
+  readonly taskStatus?: {
+    readonly taskId: string
+    readonly attemptId: string
+    readonly eventId: string
+    readonly revision: number
+    readonly kind: 'model_fallback_selected' | 'model_unavailable' | 'turn_finished' | 'interrupted' | 'cancelled'
+    readonly executionState?: 'not_started' | 'partial' | 'unknown'
+    readonly reason?: string
+    readonly requestedModel: SessionLinkTaskStatusRoute
+    readonly actualModel?: SessionLinkTaskStatusRoute
+    readonly attempts: number
+    readonly decisionRequired: boolean
+    readonly resumable: boolean
+  }
 }
 
 /** Per-day automatic-wake counter for one Session. */

@@ -44,6 +44,7 @@
 
 import type { Context, Events } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
+import type { UserMessage } from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-api-session-controller'
 import {
   CATALOG_UNAVAILABLE,
@@ -121,6 +122,13 @@ interface AgentRuntime {
    * onto the next no-claim request so a temporary route NEVER becomes the
    * de-facto session baseline. */
   displacedBaseline?: ModelRouteSelection | null
+  /**
+   * F2: the turn number the current (or most recent) route freeze owned.
+   * The baseline restore reads it: requests of turns started AFTER the
+   * freeze began (follow-ups queued through the frozen turn) are not
+   * pre-existing no-claim work and must not drain the parked baseline.
+   */
+  freezeTurn?: number
   /** Seeded provider/model the Agent declared at creation, used as the baseline
    * fallback when the durable projection has not yet recorded one. */
   seededOptions?: { provider?: string; model?: string; reasoningEffort?: string }
@@ -243,18 +251,21 @@ export function installTaskRuntime(
   ctx.on('agent/request', async (payload, next) => {
     // Just-in-time activation: the first request of a turn that claimed
     // session-link mail activates against the durable binding (which is
-    // established by the caller's send chain by now, brief 4d).
+    // established by the caller's send chain by now, brief 4d). The pre-step
+    // gate handles the mixed-batch refusal; this gate is strictly a JUST-IN-
+    // TIME retry for a delivery whose binding landed between the claim and
+    // the first request (the synchronous-wake race the brief allowed).
     if (runtime.active === undefined || runtime.active.closed) {
       const host = cap()
       const pending = runtime.claimedPending
       const messageId = pending?.get(payload.turn)
       if (host !== undefined && messageId !== undefined) {
-        pending!.delete(payload.turn)
         const record = host.getTurnIntentByMessageId(messageId as never)
         if (record !== undefined && (record.status === 'claimed' || record.status === 'started')) {
           // The activation needs the plugin row, which the caller's send chain
           // commits across the same microtask budget as this return waterfall;
           // retry briefly so the binding lands before the step's request.
+          pending!.delete(payload.turn)
           for (let attempt = 0; attempt < 24; attempt += 1) {
             try {
               await activate(resolveTasks(), links, host, runtime, record.intentId, messageId, payload.turn)
@@ -278,8 +289,13 @@ export function installTaskRuntime(
     }
     // No-claim request: restore a baseline displaced by a just-closed
     // non-persisted task turn so its temporary route NEVER becomes the
-    // de-facto session baseline. Restores strictly once.
+    // de-facto session baseline. F2: the restore gates on the request's
+    // turn EXISTING BEFORE the freeze — a turn started while the frozen
+    // turn ran (follow-ups queued through it) is NOT a pre-existing
+    // no-claim turn and must not drain the parked baseline.
     if (runtime.displacedBaseline !== undefined) {
+      const gatedAt = runtime.freezeTurn
+      if (gatedAt !== undefined && payload.turn > gatedAt) return resolved
       const displaced = runtime.displacedBaseline
       runtime.displacedBaseline = undefined
       if (displaced !== null
@@ -311,39 +327,80 @@ export function installTaskRuntime(
       ? messageIdOf(payload.message as { source?: unknown })
       : record.messageId as unknown as SessionLinkMessageId
     if (messageId === undefined) return
+
+    /* F2 (Task-5 review): the pre-step gate below is the only control point
+     * that may activate against the whole claimed batch, and only into a
+     * SOLO one. This claimed gate parks the message so a pre-bound delivery
+     * whose activation would race the OF-BY-ONE claimed batch never freezes
+     * the human step inside it; the pre-step listener below reads the same
+     * parked ids and activates only a batch whose every session-link
+     * message belongs to the activating task. */
     const pending = runtime.claimedPending ?? new Map<number, SessionLinkMessageId>()
     runtime.claimedPending = pending
     pending.set(payload.turn, messageId)
-    // Claim immediately only when the plugin row already exists (queued cold
-    // path); otherwise let the turn's first request gate just-in-time.
+    // A row already bound before the claim (queued path) may activate inline
+    // ONLY when the claimed batch holds exactly this one message — the solo
+    // case the pre-step gate enforces too. The inbox claim does not expose
+    // the rest of the batch here; the pre-step gate (which runs strictly
+    // before any request of the same turn) is the authoritative refusal
+    // point, so inline activation stays safe for pre-bound rows.
     if (record !== undefined && findRowByBinding(resolveTasks(), messageId, record.intentId) !== undefined) {
       pending.delete(payload.turn)
       void activate(resolveTasks(), links, host, runtime, record.intentId, messageId, payload.turn)
     }
   })
 
-  /* The wake path's durable binding lands between the inbox claim and the
-   * first request — pre-step is the LAST control point before the request
-   * resolves, and it carries the message→turn correlation payload.messages.
-   * Activate there (or through earlier first-request gate, whichever runs
-   * order-wise first). */
+  /* Pre-step is the LAST control point before a step's request resolves, and
+   * it carries the message→turn correlation payload.messages. Activation
+   * happens there against the WHOLE claimed batch, and only into a SOLO one
+   * — NEVER inside the agent/request waterfall (a session append inside that
+   * waterfall is not a legal host contract).
+   *
+   * F2 (Task-5 review): a claimed batch that contains BOTH a tracked
+   * delivery AND any message the task does not own (e.g. the human's waking
+   * message, claimed as one atomic batch) REFUSES tracked activation into
+   * the mixed turn — otherwise the whole turn (including the human step)
+   * freezes onto the task route. Instead the tracked message is re-appended
+   * durably to the NEXT-TURN queue behind the batch that carried it, and it
+   * activates at its SOLO later turn; the human step of the mixed batch
+   * runs on the session baseline. The task row stays `queued`; nothing
+   * about the refusal blocks or fails it. This pre-step listener re-checks
+   * by sender attribution, never trusts the parked ids alone, and only ever
+   * activates a batch whose every session-link message belongs to the task
+   * being activated (the solo case). */
   ctx.on('agent/pre-step', async (payload, next) => {
     const host = cap()
-    if (host === undefined) return await next()
-    if (runtime.active !== undefined && !runtime.active.closed) return await next()
+    if (host === undefined || (runtime.active !== undefined && !runtime.active.closed)) return await next()
     const pending = runtime.claimedPending
     if (pending === undefined || pending.size === 0) return await next()
+    const tracked: { message: UserMessage; record: NonNullable<ReturnType<typeof hostRecordFor>> }[] = []
     for (const message of payload.messages) {
       const record = hostRecordFor(message as { source?: unknown }, host)
-      if (record === undefined || record.status !== 'claimed') continue
+      if (record === undefined || (record.status !== 'claimed' && record.status !== 'started')) continue
       const messageId = record.messageId as unknown as SessionLinkMessageId
-      const entry = [...pending.entries()].find(([, id]) => id === messageId)
-      if (entry === undefined) continue
-      pending.delete(entry[0])
-      await activate(resolveTasks(), links, host, runtime, record.intentId, messageId, payload.turn)
-        .catch(() => { /* activation paths project via their own CAS writes */ })
-      break
+      if (![...pending.values()].includes(messageId)) continue
+      tracked.push({ message, record })
     }
+    if (tracked.length === 0) return await next()
+    if (payload.messages.length > tracked.length) {
+      // Mixed batch: re-append the tracked messages behind everything this
+      // batch carries, and let the remainder claim this step on baseline.
+      for (const { message } of tracked) agent.inbox.append('next-turn', message)
+      const rest = payload.messages.filter(message => !tracked.some(entry => entry.message === message))
+      const decision = await next()
+      if (decision.kind === 'enter') return { ...decision, messages: rest }
+      return decision
+    }
+    // Solo batch: every session-link message in it belongs to the single
+    // first task this runtime activates; activate inline at pre-step, where
+    // a session append is legal before the step's request resolves.
+    const [{ record }] = tracked
+    const messageId = record.messageId as unknown as SessionLinkMessageId
+    for (const [turn, parked] of [...pending.entries()]) {
+      if (parked === messageId) pending.delete(turn)
+    }
+    await activate(resolveTasks(), links, host, runtime, record.intentId, messageId, payload.turn)
+      .catch(() => { /* activation paths project via their own CAS writes */ })
     return await next()
   })
 
@@ -577,6 +634,9 @@ async function activate(
   try {
     tasks.assertBindingDurable(taskId)
     await tasks.requestStateChange(taskId, fresh.revision, { toState: 'running', currentRoute })
+    // F2: the freeze owns this turn; later turns are not pre-existing
+    // no-claim work for the displaced-baseline restore.
+    runtime.freezeTurn = turn
   } catch (error: unknown) {
     runtime.active = undefined
     lease.release()
@@ -656,39 +716,66 @@ async function switchCandidate(
   if (row === undefined || row.taskState !== 'running') return false
   let revision = row.revision
 
-  // Journal the CURRENT route's outcome before switching.
+  /* F1 (Task-5 review): resolve the next route FIRST so the fallback
+   * notification can name it. The CURRENT route's failure journal and the
+   * single `model_fallback_selected` outbox event ride the SAME CAS — the
+   * runtime never emits the event without the failed-route fact landing
+   * with it. One switch emits exactly one event: the revision-gated CAS
+   * succeeds once per call, an eventId collision across switches is
+   * impossible (each switch's eventId derives from its own revision), and
+   * a CAS conflict simply drops the projection instead of double-emitting.
+   * decisionRequired false — the task keeps executing its replacement
+   * route; resumable false — the switch neither reopens nor suspends
+   * anything (the task is ALREADY running its new route). turn_finished's
+   * actualModel remains the route authority for the completed turn. */
+  let nextRoute: ModelRouteSelection | undefined
+  let newFreezeRoute: ModelRouteSelection | undefined
+  if ('use' in nextCandidate) {
+    const baseline = host.readBaseline()
+    if (baseline.effective === null) return false
+    nextRoute = {
+      provider: baseline.effective.provider,
+      model: baseline.effective.model,
+      ...(baseline.effective.reasoningEffort === undefined ? {} : { reasoningEffort: baseline.effective.reasoningEffort }),
+    }
+    newFreezeRoute = nextRoute
+  } else {
+    nextRoute = {
+      provider: nextCandidate.provider,
+      model: nextCandidate.model,
+      ...(nextCandidate.reasoningEffort === undefined ? {} : { reasoningEffort: nextCandidate.reasoningEffort }),
+    }
+  }
+  const fallbackEvent: TaskEventInput = {
+    kind: 'model_fallback_selected',
+    ...(active.lastFailureCode === undefined ? {} : { reason: active.lastFailureCode }),
+    requestedModel: requestedRouteOf(active.policy),
+    actualModel: nextRoute,
+    attempts: row.attempts.find(candidate => candidate.attemptId === active.attemptId)?.results.length ?? 0,
+    decisionRequired: false,
+    resumable: false,
+  }
+
+  // Journal the CURRENT route's outcome PLUS the fallback notification, in
+  // one CAS; the freeze binds under a second CAS (its own revision).
   try {
     await tasks.appendCandidateResult(active.taskId, revision, {
       route: active.currentRoute,
       outcome: 'unavailable',
       ...(active.lastFailureCode === undefined ? {} : { code: active.lastFailureCode }),
       ...(active.lastFailureMessage === undefined ? {} : { message: active.lastFailureMessage }),
-    })
+    }, [fallbackEvent])
     revision = (tasks.getRow(active.taskId) ?? row).revision
   } catch {
     return false
   }
 
-  let nextRoute: ModelRouteSelection
-  if ('use' in nextCandidate) {
+  if (newFreezeRoute !== undefined) {
     try {
-      const baseline = host.readBaseline()
-      if (baseline.effective === null) return false
-      nextRoute = {
-        provider: baseline.effective.provider,
-        model: baseline.effective.model,
-        ...(baseline.effective.reasoningEffort === undefined ? {} : { reasoningEffort: baseline.effective.reasoningEffort }),
-      }
-      await tasks.freezeDefaultRoute(active.taskId, revision, nextRoute)
+      await tasks.freezeDefaultRoute(active.taskId, revision, newFreezeRoute)
       revision = (tasks.getRow(active.taskId) ?? row).revision
     } catch {
       return false
-    }
-  } else {
-    nextRoute = {
-      provider: nextCandidate.provider,
-      model: nextCandidate.model,
-      ...(nextCandidate.reasoningEffort === undefined ? {} : { reasoningEffort: nextCandidate.reasoningEffort }),
     }
   }
 

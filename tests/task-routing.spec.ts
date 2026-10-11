@@ -511,6 +511,17 @@ describe('task-routing: fallback boundaries', () => {
     const finished = row?.outbox.filter(event => event.kind === 'turn_finished')
     expect(finished?.[0]?.actualModel?.model).toBe(MODEL_B)
     expect(finished?.[0]?.requestedModel?.model).toBe(MODEL_A)
+    // F1: exactly ONE model_fallback_selected notification rode the same
+    // pipeline: the failed route named as requestedModel, the replacement as
+    // actualModel, decisionRequired false, and an eventId keyed by the
+    // revision its own CAS committed.
+    const fallbacks = row?.outbox.filter(event => event.kind === 'model_fallback_selected')
+    expect(fallbacks).toHaveLength(1)
+    expect(fallbacks?.[0]?.requestedModel?.model).toBe(MODEL_A)
+    expect(fallbacks?.[0]?.actualModel?.model).toBe(MODEL_B)
+    expect(fallbacks?.[0]?.decisionRequired).toBe(false)
+    expect(fallbacks?.[0]?.resumable).toBe(false)
+    expect(fallbacks?.[0]?.eventId.endsWith(`/${fallbacks?.[0]?.revision}/model_fallback_selected`)).toBe(true)
   }, 20000)
 
   it('non-retryable terminal failure (refusal class) stops the task in waiting_decision with no fallback executed', async () => {

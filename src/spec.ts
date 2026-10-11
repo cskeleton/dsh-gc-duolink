@@ -29,6 +29,13 @@ export const sessionLinkRecordSchema = z.object({
   }),
 })
 
+/** Durable shape of one concrete model route carried by a task-status report. */
+const taskStatusRouteSchema = z.strictObject({
+  provider: z.string().min(1),
+  model: z.string().min(1),
+  reasoningEffort: z.string().min(1).optional(),
+})
+
 /** Durable shape of one mailbox record at the medium boundary. */
 export const sessionLinkMessageSchema = z.object({
   linkId,
@@ -55,6 +62,37 @@ export const sessionLinkMessageSchema = z.object({
   seq: z.number().int().positive().optional(),
   /** Set before the message is handed to the target; such a message is never made terminal. */
   inserted: z.boolean().optional(),
+  /**
+   * Present only on INTERNAL host-generated task-status reports (Task 5 of
+   * the model-routing plan). Optional so every v1 row predating the marker
+   * reads as a peer message; the service never strips it once stamped.
+   */
+  statusKind: z.literal('task-status').optional(),
+  /** Structured task facts the status report carries (never an instruction). */
+  taskStatus: z.strictObject({
+    taskId: z.string().min(1),
+    attemptId: z.string().min(1),
+    eventId: z.string().min(1),
+    revision: z.number().int().nonnegative(),
+    kind: z.union([
+      z.literal('model_fallback_selected'),
+      z.literal('model_unavailable'),
+      z.literal('turn_finished'),
+      z.literal('interrupted'),
+      z.literal('cancelled'),
+    ]),
+    executionState: z.union([
+      z.literal('not_started'),
+      z.literal('partial'),
+      z.literal('unknown'),
+    ]).optional(),
+    reason: z.string().optional(),
+    requestedModel: taskStatusRouteSchema,
+    actualModel: taskStatusRouteSchema.optional(),
+    attempts: z.number().int().nonnegative(),
+    decisionRequired: z.boolean(),
+    resumable: z.boolean(),
+  }).optional(),
 })
 
 /** Inferred link record type, shared with the runtime module. */

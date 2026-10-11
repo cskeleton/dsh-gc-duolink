@@ -29,6 +29,14 @@ declare module '@deepseek-ai/dsh-llm' {
      * @persistenceAttribution
      */
     'session-link-message': import('./types.ts').SessionLinkMessageSource
+    /**
+     * Host-generated task-status attribution written by `dsh-session-link`
+     * about the ORIGINAL task, distinct from any Agent speech. Read-side
+     * de-duplication keys on this kind + messageId; no producer path treats
+     * such a message as a task or an instruction.
+     * @persistenceAttribution
+     */
+    'session-task-status': import('./types.ts').SessionLinkTaskStatusSource
   }
 }
 
@@ -122,6 +130,9 @@ export {
   precheckFailureOf,
   requestedRouteOf,
 } from './task-runtime.ts'
+export { installTaskNotifications } from './task-notifications.ts'
+export type { TaskNotificationPump } from './task-notifications.ts'
+export type { SessionLinkTaskStatusReport, SessionLinkTaskStatusSource } from './types.ts'
 export type {
   AttachBindingInput,
   CreateTaskIntentInput,

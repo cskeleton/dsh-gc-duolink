@@ -1182,11 +1182,16 @@ export class SessionLinkTaskService extends Service {
    * (MAX_CANDIDATE_ATTEMPTS = 5, counting the original request) is enforced
    * here and is reset ONLY when an explicit decision opens a new attempt —
    * never by a restart.
+   *
+   * `events` (optional) rides the SAME row write when the runtime wants the
+   * journal entry to obligate a notification — used for the automatic
+   * model_fallback_selected outbox event the switch decision commits.
    */
   async appendCandidateResult(
     taskId: SessionLinkTaskId,
     expectedRevision: number,
     result: { route: ModelRouteSelection; outcome: 'selected' | 'unavailable' | 'failed'; code?: string; message?: string },
+    events?: readonly TaskEventInput[],
   ): Promise<SessionLinkTaskRecordData> {
     return await this.update(taskId, expectedRevision, row => {
       const index = row.attempts.findIndex(candidate => candidate.attemptId === row.currentAttemptId)
@@ -1198,6 +1203,7 @@ export class SessionLinkTaskService extends Service {
           + 'candidate budget; the budget resets only through an explicit resolve_task decision',
         )
       }
+      const now = this.clock()
       const attempts = row.attempts.slice()
       attempts[index] = {
         ...attempt,
@@ -1208,7 +1214,15 @@ export class SessionLinkTaskService extends Service {
           ...(result.message === undefined ? {} : { message: result.message }),
         }],
       }
-      return { ...row, attempts, revision: row.revision + 1, updatedAt: this.clock() }
+      const nextRevision = row.revision + 1
+      const outbox = (events ?? []).map(input => this.buildEvent(taskId, nextRevision, input, now))
+      return {
+        ...row,
+        attempts,
+        outbox: [...row.outbox, ...outbox],
+        revision: nextRevision,
+        updatedAt: now,
+      }
     })
   }
 

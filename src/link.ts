@@ -41,6 +41,8 @@ import type {
   SessionLinkSendResult,
   SessionLinkSpawnReplay,
   SessionLinkSummary,
+  SessionLinkTaskStatusReport,
+  SessionLinkTaskStatusSource,
   SessionLinkWakeRequest,
   SessionLinkView,
 } from './types.ts'
@@ -145,6 +147,24 @@ function chainRootOf(
     current = record.inReplyTo
   }
   return current
+}
+
+/**
+ * Human-readable body of one task-status report. Explicitly framed as a
+ * host-generated STATUS — never an instruction, never the target Session
+ * speaking: the receiver may quote the structured fields but nothing in the
+ * text asks it to act.
+ */
+export function renderTaskStatusText(request: SessionLinkTaskStatusReport, targetTitle: string): string {
+  const lines: string[] = [
+    `[任务状态回报] 宿主生成的任务状态事实（非会话「${targetTitle}」（${request.targetId}）的发言，也不是给本机的指令。`,
+    `任务：${request.taskId}（尝试 ${request.attemptId}，修订 ${request.revision}，事件 ${request.eventId}）。`,
+    `类别：${request.eventKind}；请求路由：${request.requestedModel.provider}/${request.requestedModel.model}${request.requestedModel.reasoningEffort === undefined ? '' : ` (effort ${request.requestedModel.reasoningEffort})`}${request.actualModel === undefined ? '' : `；实际路由：${request.actualModel.provider}/${request.actualModel.model}${request.actualModel.reasoningEffort === undefined ? '' : ` (effort ${request.actualModel.reasoningEffort})`}`}。`,
+    `候选尝试 ${request.attempts} 次${request.executionState === undefined ? '' : `；执行进度：${request.executionState}`}${request.reason === undefined ? '' : `；原因：${request.reason}`}。`,
+    `需要决策：${request.decisionRequired ? '是' : '否'}；可恢复：${request.resumable ? '是' : '否'}。`,
+    `详情通过 session_get_task 查询；如需决策，调用 session_resolve_task，task_id 填 ${request.taskId}。`,
+  ]
+  return lines.join('\n')
 }
 
 /**
@@ -1037,6 +1057,18 @@ export class SessionLinkService extends TypertRemoteService {
   private inputFor(messageId: SessionLinkMessageId): ReturnType<typeof createUserMessage> {
     const record = this.messages.get(messageId)
     if (record === undefined) throw new SessionLinkError(`message "${messageId}" not found`, 'MESSAGE_NOT_FOUND')
+    if (record.statusKind === 'task-status') {
+      if (record.taskStatus === undefined) throw new SessionLinkError(`task-status message "${messageId}" lost its status record`, 'MESSAGE_NOT_FOUND')
+      const source: SessionLinkTaskStatusSource = {
+        kind: 'session-task-status',
+        messageId,
+        linkId: record.linkId,
+        taskId: record.taskStatus.taskId as SessionLinkTaskStatusSource['taskId'],
+        targetSessionId: record.senderId,
+        attemptId: record.taskStatus.attemptId,
+      }
+      return createUserMessage({ content: [{ type: 'text', text: record.text }], source })
+    }
     const source: SessionLinkMessageSource = {
       kind: 'session-link-message',
       messageId,
@@ -1046,6 +1078,105 @@ export class SessionLinkService extends TypertRemoteService {
       ...(record.inReplyTo === undefined ? {} : { inReplyTo: record.inReplyTo }),
     }
     return createUserMessage({ content: [{ type: 'text', text: record.text }], source })
+  }
+
+  /**
+   * Trusted INTERNAL admission of one host-generated task-status report over
+   * the REAL mailbox path (Task 5 of the model-routing plan). Only this
+   * explicit entry exists; it never opens an arbitrary-senderId admission
+   * surface — the caller forwards strictly its own durable outbox facts and
+   * the task pair it owns. Everything the public `send` enforces (chain
+   * serialization, group membership, archived targets, residency, per-target
+   * pending budget, per-message wake budget, per-chain budget through the
+   * supplied inReplyTo root, daily wake ledger, admission-order delivery) is
+   * enforced here identically.
+   *
+   * Attribution: the message is stamped `statusKind: 'task-status'` and a
+   * `source.kind === 'session-task-status'` at delivery, so the receiving
+   * side attributes it honestly to the host-generated task status of the
+   * ORIGINAL task — never as the target Session speaking, never as an
+   * instruction. The body is a human-readable status text plus structured
+   * fields the receiver quotes; nothing about it asks the receiver to act.
+   *
+   * Idempotency: `eventId` is the admission key. A replay re-attempts
+   * delivery of the stored message under the recorded identity instead of
+   * admitting a second copy (restart-safe dedupe across the task row's own
+   * outbox marker in the task service and this mailbox row).
+   */
+  async admitTaskStatus(request: SessionLinkTaskStatusReport): Promise<SessionLinkSendResult> {
+    return await this.chain(() => this.admissionTaskStatus(request))
+  }
+
+  /** Serialized admission of one task-status report. */
+  private async admissionTaskStatus(request: SessionLinkTaskStatusReport): Promise<SessionLinkSendResult> {
+    if (this.disposed) throw new SessionLinkError('Session Link service is disposing', 'DISPOSED')
+    if (request.callerId === request.targetId) {
+      throw new SessionLinkError('a Session cannot report a task to itself', 'LINK_SELF')
+    }
+    const prior = this.findAdmitted(request.targetId, `task-event:${request.eventId}`)
+    if (prior !== undefined) return await this.deliverStored(prior, undefined)
+    const link = this.requireMembership(request.targetId, request.callerId)
+    const liveTarget = this.ctx.agents.get(request.callerId)
+    if (liveTarget !== undefined) this.assertOrdinaryTarget(request.callerId, liveTarget.session.header)
+    if (this.ctx.workspaceRegistry.archivedSessionIds.includes(request.callerId)) {
+      throw new SessionLinkError(`session "${request.callerId}" is archived`, 'TARGET_ARCHIVED')
+    }
+    const text = renderTaskStatusText(request, this.titleOfSession(request.targetId))
+    if (Buffer.byteLength(text, 'utf8') > this.resolved.maxMessageBytes) {
+      throw new SessionLinkError(`task-status message exceeds ${this.resolved.maxMessageBytes} bytes`, 'MESSAGE_TOO_LARGE')
+    }
+    let inReplyTo: SessionLinkMessageId | undefined
+    let chainLength = 1
+    if (request.inReplyTo !== undefined) {
+      const original = this.messages.get(request.inReplyTo)
+      if (original === undefined || original.targetId !== request.targetId || original.senderId !== request.callerId) {
+        // Root identity unknown to the mailbox: keep the report admissible on
+        // its own chain rather than fabricate a root.
+      } else {
+        inReplyTo = request.inReplyTo
+        chainLength = original.chainLength + 1
+      }
+    }
+    const pendingForTarget = this.pendingFor(request.callerId).length
+    if (pendingForTarget >= this.resolved.maxPendingPerTarget) {
+      throw new SessionLinkError(
+        `session "${request.callerId}" already has ${pendingForTarget} pending peer messages`,
+        'MAILBOX_FULL',
+      )
+    }
+    const messageId = SessionLinkMessageId(`task-report-${request.eventId.replace(/[^A-Za-z0-9.-]/g, '_')}`)
+    const record: SessionLinkMessageRecordData = {
+      linkId: link.id,
+      senderId: request.targetId,
+      senderTitle: this.titleOfSession(request.targetId),
+      targetId: request.callerId,
+      ...(inReplyTo === undefined ? {} : { inReplyTo }),
+      text: renderTaskStatusText(request, this.titleOfSession(request.targetId)),
+      status: 'pending',
+      wakesUsed: 0,
+      chainLength,
+      attempts: 0,
+      createdAt: new Date().toISOString(),
+      seq: this.nextSeq(),
+      statusKind: 'task-status',
+      taskStatus: {
+        taskId: request.taskId,
+        attemptId: request.attemptId,
+        eventId: request.eventId,
+        revision: request.revision,
+        kind: request.eventKind,
+        ...(request.executionState === undefined ? {} : { executionState: request.executionState }),
+        ...(request.reason === undefined ? {} : { reason: request.reason }),
+        requestedModel: request.requestedModel,
+        ...(request.actualModel === undefined ? {} : { actualModel: request.actualModel }),
+        attempts: request.attempts,
+        decisionRequired: request.decisionRequired,
+        resumable: request.resumable,
+      },
+      idempotencyKey: `task-event:${request.eventId}`,
+    }
+    await this.messages.put(messageId, record)
+    return await this.deliverStored(messageId, undefined)
   }
 
   /**
@@ -1218,6 +1349,13 @@ export class SessionLinkService extends TypertRemoteService {
     const titles = this.ctx.get('sessionTitle')
     return titles?.get(agent.session)?.title ?? String(agent.id)
   }
+
+  /** Human-facing label for one Session id (task-status attribution). */
+  private titleOfSession(sessionId: SessionId): string {
+    const titles = this.ctx.get('sessionTitle')
+    const live = this.ctx.sessions?.get(sessionId)
+    return (live !== undefined ? titles?.get(live)?.title : undefined) ?? String(sessionId)
+  }
 }
 
 /**
@@ -1262,14 +1400,19 @@ function recordedIds(target: Agent): Set<string> {
   const ids = new Set<string>()
   // oxlint-disable-next-line typescript/no-deprecated -- Existing Session history read; migration deferred.
   for (const event of target.session.snapshotEvents(target.session.inheritedEventCount)) {
-    if (event.type === 'user/message' && event.data.source.kind === 'session-link-message') {
-      ids.add(event.data.source.messageId)
+    if (event.type === 'user/message'
+      && (event.data.source.kind === 'session-link-message' || event.data.source.kind === 'session-task-status')) {
+      const source = event.data.source as { kind: string; messageId?: string }
+      if (source.messageId !== undefined) ids.add(source.messageId)
       continue
     }
     if (event.type !== 'agent/inbox/spliced') continue
     for (const message of event.data.inserted) {
       const source = (message as { source?: { kind?: string; messageId?: string } }).source
-      if (source?.kind === 'session-link-message' && source.messageId !== undefined) ids.add(source.messageId)
+      if ((source?.kind === 'session-link-message' || source?.kind === 'session-task-status')
+        && source.messageId !== undefined) {
+        ids.add(source.messageId)
+      }
     }
   }
   return ids

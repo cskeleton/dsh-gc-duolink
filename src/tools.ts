@@ -19,7 +19,7 @@ import type { MessageId } from '@deepseek-ai/dsh-llm/brand'
 import type { SessionId } from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-api-session-controller'
 import type {} from '@deepseek-ai/dsh-session-title'
-import { SessionLinkError, SessionLinkMessageId } from './index.ts'
+import { SessionLinkError, SessionLinkMessageId, SessionLinkTaskId } from './index.ts'
 import type { SessionLinkId, SessionLinkSendResult } from './index.ts'
 import type {} from './index.ts'
 import { resolveTaskHost } from './host-capability.ts'
@@ -34,6 +34,8 @@ import {
   SessionListModelsParamsError,
 } from './model-policy.ts'
 import type { ModelCatalogLike, ModelRouteSelection, ModelRoutingPolicy } from './model-policy.ts'
+import { installTaskNotifications } from './task-notifications.ts'
+import type { TaskNotificationPump } from './task-notifications.ts'
 import { installTaskRuntime, precheckFailureOf, requestedRouteOf } from './task-runtime.ts'
 import { taskIdFor } from './tasks.ts'
 import type { CreateTaskIntentInput, SavedTaskIntent, TaskEventInput } from './tasks.ts'
@@ -93,6 +95,135 @@ const routeOutputSchema = {
     model: { type: 'string', required: true },
     reasoningEffort: { type: 'string' },
   },
+} as const
+
+/** The outbox-status vocabulary session_get_task reports (task row's own lifecycle). */
+const taskOutboxStatusProperties = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    eventId: { type: 'string', required: true },
+    kind: {
+      type: 'string',
+      required: true,
+      enum: ['model_fallback_selected', 'model_unavailable', 'turn_finished', 'interrupted', 'cancelled'],
+    },
+    revision: { type: 'number', required: true },
+    status: {
+      type: 'string',
+      required: true,
+      enum: ['pending', 'admitted', 'delivered', 'blocked'],
+      description: 'admitted = the notification reached the mailbox; delivered = the peer Session durably recorded it; NEVER claimed from "in outbox".',
+    },
+    requestedModel: routeOutputSchema,
+    actualModel: routeOutputSchema,
+    executionState: { type: 'string', enum: ['not_started', 'partial', 'unknown'] },
+    reason: { type: 'string' },
+    attemptId: { type: 'string' },
+    attempts: { type: 'number' },
+    decisionRequired: { type: 'boolean', required: true },
+    resumable: { type: 'boolean', required: true },
+    notifiedMessageId: { type: 'string' },
+    blockedReason: { type: 'string', description: 'The notificationBlocked refusal reason (unlinked/archived); present only while blocked.' },
+  },
+} as const
+
+/** Attempt-history wire shape: immutable per-candidate results, append-only. */
+const taskAttemptProperties = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    attemptId: { type: 'string', required: true },
+    ordinal: { type: 'number', required: true },
+    kind: { type: 'string', required: true, enum: ['original', 'retry', 'continue'] },
+    results: {
+      type: 'array',
+      required: true,
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          route: { ...routeOutputSchema, required: true },
+          outcome: { type: 'string', required: true, enum: ['selected', 'unavailable', 'failed'] },
+          code: { type: 'string' },
+          message: { type: 'string' },
+        },
+      },
+    },
+    defaultFrozenRoute: routeOutputSchema,
+  },
+} as const
+
+/** session_get_task output shape (Public Contract §2 read model). */
+const getTaskOutputProperties = {
+  taskId: { type: 'string', required: true },
+  taskState: { type: 'string', required: true },
+  revision: { type: 'number', required: true },
+  expectedRevision: { type: 'number', required: true },
+  executionState: { type: 'string', enum: ['not_started', 'partial', 'unknown'] },
+  reason: { type: 'string' },
+  callerId: { type: 'string', required: true },
+  targetSessionId: { type: 'string' },
+  execution: {
+    type: 'object',
+    required: true,
+    additionalProperties: false,
+    properties: {
+      messageId: { type: 'string' },
+      sessionId: { type: 'string' },
+      linkId: { type: 'string' },
+      turnIntentId: { type: 'string' },
+      currentlyExecuting: { type: 'boolean' },
+    },
+  },
+  requestedModel: routeOutputSchema,
+  currentRoute: routeOutputSchema,
+  routeUsed: routeOutputSchema,
+  attempts: { type: 'array', required: true, items: taskAttemptProperties },
+  currentAttemptId: { type: 'string', required: true },
+  latestIssue: {
+    type: 'object',
+    additionalProperties: false,
+    properties: { code: { type: 'string' }, message: { type: 'string' } },
+  },
+  outbox: { type: 'array', required: true, items: taskOutboxStatusProperties },
+  decisions: {
+    type: 'array',
+    required: true,
+    items: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        callId: { type: 'string', required: true },
+        action: { type: 'string', required: true, enum: ['retry', 'continue', 'cancel'] },
+        attemptId: { type: 'string' },
+        outcome: { type: 'string', required: true, enum: ['applied', 'stale', 'rejected'] },
+        appliedRevision: { type: 'number', required: true },
+        appliedAt: { type: 'string', required: true },
+      },
+    },
+  },
+  createdAt: { type: 'string', required: true },
+  updatedAt: { type: 'string', required: true },
+} as const
+
+/** session_resolve_task success output: the updated task view plus the decision outcome. */
+const resolveTaskOutputProperties = {
+  applied: { type: 'boolean', required: true },
+  decision: {
+    type: 'object',
+    required: true,
+    additionalProperties: false,
+    properties: {
+      action: { type: 'string', required: true, enum: ['retry', 'continue', 'cancel'] },
+      outcome: { type: 'string', required: true, enum: ['applied', 'stale', 'rejected'] },
+      attemptId: { type: 'string' },
+      appliedRevision: { type: 'number', required: true },
+    },
+  },
+  task: { type: 'object', required: true, additionalProperties: false, properties: getTaskOutputProperties },
+  stale: { type: 'boolean', description: 'True when expected_revision was stale: nothing mutated; the current view is returned for the caller to re-read.' },
+  attemptId: { type: 'string' },
 } as const
 
 /** Model-routing input fields appended to both tracked tools (Public Contract §1). */
@@ -278,13 +409,29 @@ const listModelsOutputProperties = {
   },
 } as const
 
+/** The outbox pump this row owns; trigger points call its `schedule()`. */
+let pump: TaskNotificationPump | undefined
+
+/** Trigger the task-notification pump after any mutation that may leave pending outbox work. */
+function pumpSchedule(): void {
+  pump?.schedule()
+}
+
 /**
- * Register the four Session Link tools in each eligible top-level Agent's scope.
+ * Register the Session Link tools in each eligible top-level Agent's scope.
  * @param ctx - host context carrying the tool registry, link service, Session Controller, and title service.
  * @param config - presets whose top-level Agents receive the tools.
  */
 export function apply(ctx: Context, config: Config = {}): void {
-  const tools = definitions(ctx)
+  // Task 5: the event-driven outbox pump. Installed BEFORE the first tool
+  // registration so every tracked admission and runtime projection below can
+  // schedule a pass; its own initial pass re-delivers pending work a prior
+  // process left behind.
+  pump = installTaskNotifications(ctx, {
+    tasks: () => taskServiceOf(ctx),
+    links: () => ctx.sessionLinks,
+  })
+  const tools = definitions(ctx, pumpSchedule)
   mountPerPresetAgent(ctx, resolvePresets(config), 'session-link-tools', ['tools'], (scoped) => {
     for (const tool of tools) scoped.tools.register(tool)
   })
@@ -310,8 +457,8 @@ export function apply(ctx: Context, config: Config = {}): void {
   }
 }
 
-/** The four tool definitions, bound to the row context's services. */
-function definitions(ctx: Context): ToolDefinition[] {
+/** The tool definitions, bound to the row context's services; every tracked mutation schedules a pump pass. */
+function definitions(ctx: Context, pumpSchedule: () => void): ToolDefinition[] {
   return [defineTool({
     name: 'session_list_links',
     description:
@@ -449,7 +596,7 @@ function definitions(ctx: Context): ToolDefinition[] {
         callId: String(exec.callId),
         policy,
         signal: exec.signal,
-      })
+      }, pumpSchedule)
     },
     presentCall: args => ({ card: 'generic', title: `Message session ${args.session_id}`, kind: 'other' }),
   }), defineTool({
@@ -583,7 +730,7 @@ function definitions(ctx: Context): ToolDefinition[] {
           callKey,
           policy,
           signal: exec.signal,
-        })
+        }, pumpSchedule)
       }
       // Earlier attempts of this call decide before anything is created or linked.
       const prior = ctx.sessionLinks.spawnReplay(caller.id, callKey)
@@ -704,6 +851,94 @@ function definitions(ctx: Context): ToolDefinition[] {
       }
     },
     presentCall: () => ({ card: 'generic', title: 'List available models', kind: 'other' }),
+  }), defineTool({
+    name: 'session_get_task',
+    description:
+      'Read the durable state of one tracked session_link task this Session sent or is the target of. '
+      + 'Returns the task state, CAS revision token session_resolve_task requires, the execution binding '
+      + '(message/turn-intent), the requested route and the route the task ran/is running on, the per-candidate '
+      + 'attempt history, the latest issue, the outbox notification lifecycle (pending/admitted/delivered/blocked — '
+      + 'admitted only claims the notification reached the mailbox, NEVER that this Session saw it), and the '
+      + 'recorded decision outcomes. Read-only: no decision, no wake, no side effects. '
+      + 'Both original parties keep read access after unlink; no third Session ever reads a task.',
+    parameters: {
+      task_id: {
+        type: 'string',
+        required: true,
+        description: 'The task identity session_spawn_linked_session / session_send_session_message returned.',
+      },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: getTaskOutputProperties,
+      },
+      render: (_args, value) => [{
+        type: 'text',
+        text: `task ${value.taskId}: ${value.taskState} (revision ${value.revision})`
+          + `${value.routeUsed === undefined ? '' : `, ran on ${value.routeUsed.provider}/${value.routeUsed.model}`}`
+          + `, outbox ${value.outbox.map(event => `${event.kind}:${event.status}`).join(', ') || 'empty'}`,
+      }],
+    },
+    async execute(args, exec) {
+      const caller = requireCaller(ctx, exec)
+      const tasks = taskServiceOf(ctx)
+      const view = tasks.getTask(caller.id, SessionLinkTaskId(args.task_id))
+      return getTaskWire(ctx, tasks, view)
+    },
+    presentCall: args => ({ card: 'generic', title: `Read task ${args.task_id}`, kind: 'other' }),
+  }), defineTool({
+    name: 'session_resolve_task',
+    description:
+      'Take exactly ONE safe decision on a tracked task this Session originally sent, after reading it with '
+      + 'session_get_task: retry (not_started only: reopens the ORIGINAL flow with the original task identity, '
+      + 'possibly with a new model policy), continue (partial only, and only when the host exposes a resumable '
+      + 'checkpoint — otherwise TASK_NOT_RESUMABLE; never silently becomes a from-scratch retry), or cancel '
+      + '(closes a paused/queued/interrupted task; a RUNNING task answers TASK_RUNNING and stays under the '
+      + 'target\'s own cancel controls). expected_revision must equal the task\'s current revision; a stale '
+      + 'token returns the current state with a stale indicator and mutates nothing. The tool callId is the '
+      + 'decision idempotency key: replaying the same call returns the recorded outcome, never re-applies it.',
+    parameters: {
+      task_id: {
+        type: 'string',
+        required: true,
+        description: 'The task identity session_get_task returned.',
+      },
+      expected_revision: {
+        type: 'number',
+        required: true,
+        description: 'The exact revision session_get_task returned; a mismatch performs nothing.',
+      },
+      action: {
+        type: 'string',
+        required: true,
+        enum: ['retry', 'continue', 'cancel'],
+        description: 'retry: not_started tasks re-open the original flow. continue: host-resumable partial only. cancel: close a paused/queued task.',
+      },
+      provider: { type: 'string', description: 'New primary route provider for retry/continue; omitted keeps the original policy.' },
+      model: { type: 'string', description: 'New primary route model; MUST pair with provider.' },
+      reasoning_effort: { type: 'string', description: 'Effort for the new primary route only.' },
+      on_model_unavailable: ROUTING_PARAMETERS.on_model_unavailable,
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: resolveTaskOutputProperties,
+      },
+      render: (_args, value) => [{
+        type: 'text',
+        text: value.stale === true
+          ? `task ${value.task.taskId}: decision STALE at revision ${value.task.revision}; re-read with session_get_task before resolving`
+          : `task ${value.task.taskId}: ${value.decision.action} ${value.decision.outcome} (revision ${value.task.revision})`,
+      }],
+    },
+    async execute(args, exec) {
+      const caller = requireCaller(ctx, exec)
+      return await resolveTaskWire(ctx, caller, String(exec.callId), args, pumpSchedule)
+    },
+    presentCall: args => ({ card: 'generic', title: `Resolve task ${args.task_id} (${args.action})`, kind: 'other' }),
   })]
 }
 
@@ -867,15 +1102,17 @@ async function requireTaskHost(ctx: Context, caller: Agent): Promise<void> {
   }
 }
 
-/** Save-or-replay the durable intent: replays return the stored row as-is. */
+/** Save-or-replay the durable intent: replays return the stored row as-is; a NON-replayed save may leave pending outbox work (sync precheck failure) and schedules a pump pass. */
 async function saveIntent(
   ctx: Context,
   input: Parameters<Context['sessionLinkTasks']['saveTaskIntent']>[0],
+  pumpSchedule: () => void,
 ): Promise<{ replayed: boolean; saved: SavedTaskIntent }> {
   const tasks = taskServiceOf(ctx)
   const taskId = taskIdFor(input.callerId, input.request.callId)
   const before = tasks.getRow(taskId)
   const saved = await tasks.saveTaskIntent(input)
+  if (before === undefined) pumpSchedule()
   return { replayed: before !== undefined, saved }
 }
 
@@ -891,6 +1128,7 @@ async function trackedSend(
     policy: ModelRoutingPolicy
     signal?: AbortSignal
   },
+  pumpSchedule: () => void,
 ): Promise<TrackedWire> {
   const tasks = taskServiceOf(ctx)
 
@@ -905,7 +1143,7 @@ async function trackedSend(
       request: { kind: 'send', callId: request.callId, text: request.text, targetSessionId: targetId },
       policy: request.policy,
       tracked: true,
-    })
+    }, pumpSchedule)
     if (existing.taskState === 'waiting_decision') return needsDecisionResult(existing)
     if (existing.execution.messageId !== undefined) {
       const message = ctx.sessionLinks.message(existing.execution.messageId)
@@ -938,7 +1176,7 @@ async function trackedSend(
         ? { reason: 'catalog_unavailable', results: [] as { route: ModelRouteSelection; code: string; message?: string }[] }
         : precheckFailureOf(request.policy, precheckError instanceof PrecheckExhausted ? precheckError.checks : []),
     }),
-  })
+  }, pumpSchedule)
   const row = saved.row
   if (precheckError !== undefined) {
     return needsDecisionResult(row, (stored) => stored.targetSessionId === undefined
@@ -1014,6 +1252,7 @@ async function trackedSpawn(
     policy: ModelRoutingPolicy
     signal?: AbortSignal
   },
+  pumpSchedule: () => void,
 ): Promise<TrackedWire> {
   const tasks = taskServiceOf(ctx)
 
@@ -1040,7 +1279,7 @@ async function trackedSpawn(
       },
       policy: request.policy,
       tracked: true,
-    })
+    }, pumpSchedule)
     if (existing.taskState === 'waiting_decision') return needsDecisionResult(existing)
     if (existing.execution.messageId !== undefined) {
       const message = ctx.sessionLinks.message(existing.execution.messageId)
@@ -1084,7 +1323,7 @@ async function trackedSpawn(
         ? { reason: 'catalog_unavailable', results: [] as { route: ModelRouteSelection; code: string; message?: string }[] }
         : precheckFailureOf(request.policy, precheckError instanceof PrecheckExhausted ? precheckError.checks : []),
     }),
-  })
+  }, pumpSchedule)
   const row = saved.row
   if (precheckError !== undefined) return needsDecisionResult(row)
   const taskId = taskIdFor(caller.id, request.callKey)
@@ -1226,4 +1465,373 @@ function ownerOfScope(ctx: Context, scoped: Context): Agent | undefined {
 function mintTaskMessageId(callerId: SessionId, callId: string): ReturnType<typeof SessionLinkMessageId> {
   const hex = createHash('sha256').update(`task-msg\0${callerId}\0${callId}`).digest('hex')
   return SessionLinkMessageId(`session-link-message-${hex.slice(0, 32)}`)
+}
+
+/* --------------------------------------------------------------------------
+ * session_get_task / session_resolve_task wire projections
+ * ------------------------------------------------------------------------ */
+
+interface TaskWireRoute { provider: string; model: string; reasoningEffort?: string }
+
+/** Project one stored route into the wire's exact optional-field shape. */
+function routeWire(route: ModelRouteSelection | undefined): TaskWireRoute | undefined {
+  if (route === undefined) return undefined
+  return {
+    provider: route.provider,
+    model: route.model,
+    ...(route.reasoningEffort === undefined ? {} : { reasoningEffort: route.reasoningEffort }),
+  }
+}
+
+/** The session_get_task wire projection: read-only view of one stored task row. */
+function getTaskWire(
+  ctx: Context,
+  tasks: Context['sessionLinkTasks'],
+  view: ReturnType<Context['sessionLinkTasks']['getTask']>,
+) {
+  const row = tasks.getRow(view.taskId)
+  const outbox = row?.outbox.map(event => ({
+    eventId: event.eventId,
+    kind: event.kind,
+    revision: event.revision,
+    status: event.status,
+    ...(event.requestedModel === undefined ? {} : { requestedModel: routeWire(event.requestedModel) }),
+    ...(event.actualModel === undefined ? {} : { actualModel: routeWire(event.actualModel) }),
+    ...(event.executionState === undefined ? {} : { executionState: event.executionState }),
+    ...(event.reason === undefined ? {} : { reason: event.reason }),
+    ...(event.attemptId === undefined ? {} : { attemptId: event.attemptId }),
+    ...(event.attempts === undefined ? {} : { attempts: event.attempts }),
+    decisionRequired: event.decisionRequired,
+    resumable: event.resumable,
+    ...(event.notifiedMessageId === undefined ? {} : { notifiedMessageId: String(event.notifiedMessageId) }),
+    ...(event.blockedReason === undefined ? {} : { blockedReason: event.blockedReason }),
+  })) ?? []
+  const decisions = row?.decisions.map(decision => ({
+    callId: decision.callId,
+    action: decision.action,
+    ...(decision.attemptId === undefined ? {} : { attemptId: decision.attemptId }),
+    outcome: decision.outcome,
+    appliedRevision: decision.appliedRevision,
+    appliedAt: decision.appliedAt,
+  })) ?? []
+  void ctx
+  return {
+    taskId: String(view.taskId),
+    taskState: view.taskState,
+    revision: view.revision,
+    expectedRevision: view.expectedRevision,
+    ...(view.executionState === undefined ? {} : { executionState: view.executionState }),
+    ...(view.reason === undefined ? {} : { reason: view.reason }),
+    callerId: String(view.callerId),
+    ...(view.targetSessionId === undefined ? {} : { targetSessionId: String(view.targetSessionId) }),
+    execution: {
+      ...(view.boundMessageId === undefined ? {} : { messageId: String(view.boundMessageId) }),
+      ...(row?.execution.sessionId === undefined ? {} : { sessionId: String(row.execution.sessionId) }),
+      ...(view.boundLinkId === undefined ? {} : { linkId: String(view.boundLinkId) }),
+      ...(row?.execution.turnIntentId === undefined ? {} : { turnIntentId: row.execution.turnIntentId }),
+      ...(row?.execution.currentlyExecuting === undefined ? {} : { currentlyExecuting: row.execution.currentlyExecuting }),
+    },
+    ...(routeWire(row === undefined ? undefined : requestedRouteOf(row.policy)) === undefined
+      ? {}
+      : { requestedModel: routeWire(requestedRouteOf(row!.policy)) }),
+    ...(view.currentRoute === undefined ? {} : { currentRoute: routeWire(view.currentRoute) }),
+    ...(view.routeUsed === undefined ? {} : { routeUsed: routeWire(view.routeUsed) }),
+    attempts: view.attempts.map(attempt => ({
+      attemptId: attempt.attemptId,
+      ordinal: attempt.ordinal,
+      kind: attempt.kind,
+      ...(attempt.defaultFrozenRoute === undefined ? {} : { defaultFrozenRoute: routeWire(attempt.defaultFrozenRoute) }),
+      results: attempt.results.map(result => ({
+        route: { provider: result.route.provider, model: result.route.model, ...(result.route.reasoningEffort === undefined ? {} : { reasoningEffort: result.route.reasoningEffort }) },
+        outcome: result.outcome,
+        ...(result.code === undefined ? {} : { code: result.code }),
+        ...(result.message === undefined ? {} : { message: result.message }),
+      })),
+    })),
+    currentAttemptId: view.currentAttemptId,
+    ...(view.latestIssue === undefined ? {} : { latestIssue: view.latestIssue }),
+    outbox,
+    decisions,
+    createdAt: view.createdAt,
+    updatedAt: view.updatedAt,
+  }
+}
+
+/**
+ * The session_resolve_task wire driver: validate an optional replacement
+ * policy through Task 2's parser (same strictness as the tracked tools),
+ * call resolveTask with the tool callId as the decision idempotency key, and
+ * re-admit an applied retry through the SAME tracked admission machinery.
+ */
+async function resolveTaskWire(
+  ctx: Context,
+  caller: Agent,
+  decisionCallId: string,
+  args: {
+    task_id: string
+    expected_revision: number
+    action: 'retry' | 'continue' | 'cancel'
+    provider?: string
+    model?: string
+    reasoning_effort?: string
+    on_model_unavailable?: unknown
+  },
+  pumpSchedule: () => void,
+) {
+  const tasks = taskServiceOf(ctx)
+  const taskId = SessionLinkTaskId(args.task_id)
+
+  // Replacement policy (retry/continue only): runs the SAME Task 2 parse +
+  // normalize strictness as the original tracked call; absent params keep
+  // the original policy snapshot.
+  let policy: ModelRoutingPolicy | undefined
+  if (args.action !== 'cancel'
+    && (args.provider !== undefined || args.model !== undefined || args.reasoning_effort !== undefined
+      || args.on_model_unavailable !== undefined)) {
+    const routing = parseModelRoutingParams({
+      ...(args.provider === undefined ? {} : { provider: args.provider }),
+      ...(args.model === undefined ? {} : { model: args.model }),
+      ...(args.reasoning_effort === undefined ? {} : { reasoning_effort: args.reasoning_effort }),
+      ...(args.on_model_unavailable === undefined ? {} : { on_model_unavailable: args.on_model_unavailable }),
+    })
+    if (!routing.present || routing.params === undefined) {
+      throw new Error('MODEL_PARAMS_INVALID: a replacement policy needs at least provider+model or on_model_unavailable')
+    }
+    policy = normalizeModelRoutingParams(routing.params)
+  }
+
+  const row = tasks.getRow(taskId)
+  if (row === undefined) {
+    throw new SessionLinkError(`task "${taskId}" not found`, 'MESSAGE_NOT_FOUND')
+  }
+  // Sender-only access guard: identical not-found shape third parties see.
+  if (row.callerId !== caller.id) {
+    throw new SessionLinkError('only the original sender Session may resolve a task', 'LINK_CALLER_NOT_MEMBER')
+  }
+
+  // continue: only the sender; the service enforces waiting_decision+partial
+  // + a host-confirmed resumable checkpoint. today's host capability reports
+  // EVERY turn intent non-resumable (pause/resume fail closed honestly — Task
+  // 1); a future capability revision may flip this to true. The wire layer
+  // surfaces the honest refusal as the clean TASK_NOT_RESUMABLE error before
+  // any mutation, NEVER converting it to a silent from-scratch retry.
+  let hostResumable: boolean | undefined
+  if (args.action === 'continue') {
+    hostResumable = false
+    if (row.taskState === 'waiting_decision' && row.executionState === 'partial') {
+      throw new SessionLinkError(
+        `task "${taskId}" host does not expose a resumable checkpoint; continue is refused honestly — start a new remediation task instead of replaying unknown effects`,
+        'TASK_NOT_RESUMABLE' as never,
+      )
+    }
+  }
+
+  /* A stale expected revision is a durably-recorded decision; the caller is
+   * expected to re-read through session_get_task and retry with the task's
+   * current revision (the outbox pump's marker CAS may have advanced it
+   * between a get_task and this resolve). The wire driver NEVER re-reads
+   * and promotes a caller's stale token — that would defeat the CAS guard
+   * every other tool consumer relies on. */
+  const resolved = await tasks.resolveTask({
+    callerId: caller.id,
+    taskId,
+    decisionCallId,
+    expectedRevision: args.expected_revision,
+    action: args.action,
+    ...(policy === undefined ? {} : { policy }),
+    ...(hostResumable === undefined ? {} : { hostResumable }),
+    targetArchived: row.targetSessionId === undefined
+      ? undefined
+      : ctx.workspaceRegistry !== undefined && ctx.workspaceRegistry.archivedSessionIds.includes(row.targetSessionId),
+  })
+
+  // The decision COMMITTED: any applied retry/continue may immediately
+  // re-admit; any applied/stale outcome may leave outbox work. A stale or
+  // rejected outcome mutates nothing beyond the durable record.
+  pumpSchedule()
+
+  if (resolved.outcome === 'stale') {
+    return {
+      applied: false,
+      decision: {
+        action: resolved.decision.action,
+        outcome: 'stale' as const,
+        ...(resolved.decision.attemptId === undefined ? {} : { attemptId: resolved.decision.attemptId }),
+        appliedRevision: resolved.decision.appliedRevision,
+      },
+      task: getTaskWire(ctx, tasks, tasks.getTask(caller.id, taskId)),
+      stale: true,
+    }
+  }
+  if (resolved.outcome !== 'applied') {
+    return {
+      applied: false,
+      decision: {
+        action: resolved.decision.action,
+        outcome: resolved.decision.outcome,
+        ...(resolved.decision.attemptId === undefined ? {} : { attemptId: resolved.decision.attemptId }),
+        appliedRevision: resolved.decision.appliedRevision,
+      },
+      task: getTaskWire(ctx, tasks, tasks.getTask(caller.id, taskId)),
+    }
+  }
+
+  /* Applied retry: re-admit the ORIGINAL flow through the SAME tracked
+   * machinery the original call used — one deterministic messageId (same
+   * task identity semantics), a fresh candidate precheck only against the
+   * (possibly new) policy, and NO new Session/text. The task row's
+   * `preparing` state guarantees resolveTask's own precondition that the
+   * task never executed; the ORIGINAL delivery was either never admitted
+   * (precheck failure) or never claimed (mailbox alone may still hold it
+   * pending) — tracked re-admission re-attaches the binding under the same
+   * deterministic message identity the original task owns, so the mailbox
+   * never holds a duplicate. */
+  if (args.action === 'retry') {
+    await reAdmitRetriedTask(ctx, caller, taskId, pumpSchedule).catch((error: unknown) => {
+      // A pump pass that raced the decision may have flipped another outbox
+      // marker past the revision the decision committed at; re-read and
+      // re-admit ONCE at the live revision — the SAME deterministic
+      // messageId + idempotency key still binds this exact flow.
+      if (error instanceof Error && 'code' in error && (error as { code?: string }).code === 'TASK_STALE_REVISION') {
+        return reAdmitRetriedTask(ctx, caller, taskId, pumpSchedule)
+      }
+      throw error
+    })
+  }
+
+  return {
+    applied: true,
+    attemptId: resolved.decision.attemptId ?? resolved.row.currentAttemptId,
+    decision: {
+      action: resolved.decision.action,
+      outcome: 'applied' as const,
+      ...(resolved.decision.attemptId === undefined ? {} : { attemptId: resolved.decision.attemptId }),
+      appliedRevision: resolved.decision.appliedRevision,
+    },
+    task: getTaskWire(ctx, tasks, tasks.getTask(caller.id, taskId)),
+  }
+}
+
+/**
+ * Re-admit a successfully retried task through the tracked mailbox path:
+ * fresh candidate precheck against the task's CURRENT policy snapshot,
+ * re-record the host turn intent on the SAME deterministic messageId, and
+ * re-send through the mailbox under the ORIGINAL idempotency key. The task
+ * identity the re-admission names is the ORIGINAL task's — retry keeps the
+ * original taskId, spawn callKey, and message semantics by design.
+ */
+async function reAdmitRetriedTask(
+  ctx: Context,
+  caller: Agent,
+  taskId: SessionLinkTaskId,
+  pumpSchedule: () => void,
+): Promise<void> {
+  const tasks = taskServiceOf(ctx)
+  const row = tasks.getRow(taskId)
+  if (row === undefined || row.taskState !== 'preparing') return
+  const targetId = row.targetSessionId ?? row.spawn?.targetSessionId
+  if (targetId === undefined) return
+
+  // Apply the DECIDED policy snapshot (resolveTask already swapped it in).
+  const policy = row.policy
+  let selected: ModelRouteSelection
+  let precheckError: ModelRoutingError | undefined
+  try {
+    selected = await runPrecheck(ctx, policy)
+  } catch (error: unknown) {
+    if (!(error instanceof ModelRoutingError)) throw error
+    precheckError = error
+    selected = requestedRouteOf(policy)
+  }
+  if (precheckError !== undefined) {
+    // Fresh precheck failure on the new policy: project waiting_decision with
+    // a fresh model_unavailable event; the pump will deliver ONCE (the
+    // original precheck-failure event was already delivered exactly once).
+    const live = tasks.getRow(taskId)
+    if (live !== undefined && live.taskState === 'preparing') {
+      try {
+        await tasks.requestStateChange(taskId, live.revision, {
+          toState: 'waiting_decision',
+          executionState: 'not_started',
+          reason: precheckError.code === CATALOG_UNAVAILABLE ? 'catalog_unavailable' : 'model_unavailable',
+          events: [precheckFailureOf(policy, precheckError instanceof PrecheckExhausted ? precheckError.checks : []).results.length === 0
+            ? { kind: 'model_unavailable', executionState: 'not_started', reason: 'catalog_unavailable', decisionRequired: true, resumable: true }
+            : { kind: 'model_unavailable', executionState: 'not_started', reason: 'model_unavailable', decisionRequired: true, resumable: true }],
+        })
+      } catch { /* concurrent transition */ }
+      pumpSchedule()
+    }
+    return
+  }
+
+  // Spawn-kind tasks re-create the SAME derived Session; the ledger's claim
+  // keeps the original group. Send-kind tasks use the existing pair.
+  const messageId = mintTaskMessageId(caller.id, row.callId)
+  const host = row.kind === 'spawn' && row.spawn !== undefined
+    ? await hostForTarget(ctx, targetId as never)
+    : await hostForTarget(ctx, targetId as never)
+  let intentId: string | undefined
+  if (host !== undefined) {
+    const intent = host.recordTurnIntent({
+      taskId,
+      attemptId: row.currentAttemptId,
+      messageId: messageId as unknown as MessageId,
+      route: { selection: selected },
+      persistOnSuccess: policy.scope === 'session',
+    })
+    await host.claimTurnIntent(intent.intentId).catch(() => { /* the gate claims it at activation */ })
+    intentId = intent.intentId
+  }
+  const linkId = row.execution.linkId ?? ctx.sessionLinks.list(caller.id).find(link => link.memberIds.includes(targetId))?.id
+  /* The decision and the outbox pump both moved the revision since the read
+   * at function entry: attachBinding must run against the LIVE revision. A
+   * stale CAS here is safe to retry ONCE against the fresh row — the same
+   * deterministic messageId and idempotency key still bind this exact flow,
+   * and a second binding attempt would throw the LINK_ALREADY_LINKED abort
+   * below before any duplicate could commit. */
+  let revision = (tasks.getRow(taskId) ?? row).revision
+  let bound = tasks.getRow(taskId) ?? row
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      bound = await tasks.attachBinding(taskId, revision, {
+        messageId,
+        sessionId: targetId,
+        ...(linkId === undefined ? {} : { linkId }),
+        admittedAs: 'queued',
+      })
+      break
+    } catch (error: unknown) {
+      if (error instanceof Error && 'code' in error && (error as { code?: string }).code === 'TASK_STALE_REVISION') {
+        const fresh = tasks.getRow(taskId)
+        if (fresh === undefined) throw error
+        revision = fresh.revision
+        bound = fresh
+        continue
+      }
+      // The ONE legitimate abort shapes: resolveTask's own state guarantee
+      // already proved the flow is safe to re-admit; a binding conflict
+      // means the original delivery still exists and awaits the task's own
+      // turn — never admit a duplicate.
+      if (error instanceof SessionLinkError && error.code === 'LINK_ALREADY_LINKED') return
+      throw error
+    }
+  }
+  if (host !== undefined && intentId !== undefined) {
+    await tasks.recordTurnIntent(taskId, bound.revision, { turnIntentId: intentId, messageId })
+  }
+  const sent = await ctx.sessionLinks.send(caller, targetId as never, {
+    targetId: targetId as never,
+    text: row.originalRequest.summary.textExcerpt ?? '',
+    idempotencyKey: row.callId,
+    messageId,
+  })
+  const after = tasks.getRow(taskId)
+  if (after !== undefined && sent.status === 'accepted' && after.execution.turnIntentId !== undefined) {
+    await tasks.attachBinding(taskId, after.revision, {
+      messageId: sent.messageId,
+      sessionId: targetId,
+      admittedAs: 'accepted',
+    }).catch(() => after)
+  }
+  pumpSchedule()
 }
