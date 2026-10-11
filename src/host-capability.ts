@@ -30,6 +30,9 @@ export type TaskHostErrorCode =
 /** Error string the tools layer returns on a host without the capability. */
 export const HOST_CAPABILITY_UNAVAILABLE: TaskHostErrorCode = 'HOST_CAPABILITY_UNAVAILABLE'
 
+/** Error string for an expected-revision CAS conflict (shared with the task service). */
+export const TASK_STALE_REVISION: TaskHostErrorCode = 'TASK_STALE_REVISION'
+
 /** One model route the host understands (provider/model/optional effort). */
 export interface HostModelSelection {
   readonly provider: string

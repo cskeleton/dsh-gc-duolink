@@ -14,6 +14,9 @@ export type SessionLinkId = Branded<'SessionLinkId'>
 /** Identifies one durable mailbox message. */
 export type SessionLinkMessageId = Branded<'SessionLinkMessageId'>
 
+/** Identifies one tracked task row (`task:<callerSessionId>:<firstCallId>`). */
+export type SessionLinkTaskId = Branded<'SessionLinkTaskId'>
+
 /**
  * Brand a Session Link id.
  * @param value - group identifier minted by the service.
@@ -30,6 +33,16 @@ export function SessionLinkId(value: string): SessionLinkId {
  */
 export function SessionLinkMessageId(value: string): SessionLinkMessageId {
   return value as SessionLinkMessageId
+}
+
+/**
+ * Brand a tracked task id. The service derives the value stably from the
+ * caller Session and the first call id; it never accepts one from input.
+ * @param value - task identifier minted by the service.
+ * @returns the same string with its compile-time brand.
+ */
+export function SessionLinkTaskId(value: string): SessionLinkTaskId {
+  return value as SessionLinkTaskId
 }
 
 /** Stable sender attribution recorded in the target Session, never accepted from tool input. */

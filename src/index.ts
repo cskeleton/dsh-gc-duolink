@@ -32,6 +32,13 @@ declare module '@deepseek-ai/dsh-llm' {
   }
 }
 
+declare module '@deepseek-ai/cordis' {
+  interface Context {
+    /** Durable tracked-task intents, transitions, outbox, and decision idempotency. */
+    sessionLinkTasks: import('./tasks.ts').SessionLinkTaskService
+  }
+}
+
 export { SessionLinkService, frameSessionLinkText } from './link.ts'
 export type { SessionLinkLimits, SessionLinkOptions } from './link.ts'
 export {
@@ -87,10 +94,51 @@ export type {
   SessionModelListProvider,
   SessionModelListView,
 } from './model-policy.ts'
+export { sessionLinkTaskDomainSpec, sessionLinkTaskSchema, TASK_DIGEST_MAX_TEXT } from './task-spec.ts'
+export type {
+  SessionLinkTaskAttempt,
+  SessionLinkTaskDecisionRecord,
+  SessionLinkTaskExecutionProjection,
+  SessionLinkTaskOutboxEvent,
+  SessionLinkTaskRecordData,
+} from './task-spec.ts'
+export {
+  candidatesEqual,
+  requestDigest,
+  SessionLinkTaskError,
+  SessionLinkTaskService,
+  TASK_BINDING_INCOMPLETE,
+  TASK_NOT_CONTINUABLE,
+  TASK_NOT_RETRYABLE,
+  TASK_RUNNING,
+  TASK_TERMINAL,
+  TASK_WRITE_FAILED,
+  TaskInvariantError,
+  taskIdFor,
+} from './tasks.ts'
+export type {
+  AttachBindingInput,
+  CreateTaskIntentInput,
+  OriginalRequestInput,
+  ReconcileReport,
+  ReconcileResult,
+  SavedTaskIntent,
+  SessionLinkTaskServiceOptions,
+  TaskChange,
+  TaskErrorCode,
+  TaskEventInput,
+  TaskExecutionState,
+  TaskLinksProbe,
+  TaskOutboxKind,
+  TaskSpawnIntentInput,
+  TaskState,
+  TaskView,
+} from './tasks.ts'
 export {
   SessionLinkError,
   SessionLinkId,
   SessionLinkMessageId,
+  SessionLinkTaskId,
 } from './types.ts'
 export type {
   Config,
