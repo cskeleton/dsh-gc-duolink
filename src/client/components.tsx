@@ -7,16 +7,17 @@ import { createPortal } from 'react-dom'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
 import type { HostObservable, InjectFace, SnapshotSelectorHook, TranslateNS } from '@deepseek-ai/dsh-client-ui-slots'
 import type { UseSidebarRightTabInfo } from '@deepseek-ai/dsh-client-ui-sidebar-right/client'
-import type { SessionLinkId } from '../types.ts'
-import { LinkBusyError, type LinkSnapshot } from './state.ts'
+import type { SessionLinkId, SessionLinkTaskViewEntry } from '../types.ts'
+import { LinkBusyError, type LinkSnapshot, type TaskSnapshot } from './state.ts'
 import { linkCandidates, peerRows, sessionTitle, type PeerRow } from './selectors.ts'
 import { NS } from './locales.ts'
 import { Styles } from './styles.tsx'
 
 /** Shared read and mutations; every action is granted and checked by the Host. */
 export interface LinkInjected {
-  readonly hooks: { readonly links: HostObservable<LinkSnapshot> }
+  readonly hooks: { readonly links: HostObservable<LinkSnapshot>; readonly tasks: HostObservable<TaskSnapshot> }
   readonly refresh: () => Promise<boolean>
+  readonly refreshTasks: () => Promise<boolean>
   readonly link: (peerId: SessionId, autoWake: boolean, autoWakeCaller: boolean) => Promise<void>
   readonly setWake: (linkId: SessionLinkId, memberId: SessionId, on: boolean) => Promise<void>
   readonly unlink: (linkId: SessionLinkId) => Promise<void>
@@ -146,6 +147,112 @@ function LinkPicker({ sessionId, snapshot, link, t, onLinked, autoFocus = false 
   </div>
 }
 
+/** One outbox line; `pending`/`admitted` never claim execution. Localize via the four known keys. */
+function taskOutboxLine(view: SessionLinkTaskViewEntry, t: LinkProps['t']): string {
+  const last = view.outbox.at(-1)
+  if (last === undefined) return ''
+  const statusKey = last.status === 'delivered' ? 'outbox.delivered'
+    : last.status === 'admitted' ? 'outbox.admitted'
+    : last.status === 'blocked' ? 'outbox.blocked' : 'outbox.pending'
+  return `${last.kind} · ${t(statusKey)}`
+}
+
+/**
+ * The route, scope, and honesty labels one task entry needs: temporary-vs-
+ * persistent and requested-vs-actual stay distinguishable; a skipped persist
+ * never shows the persistent label it did not earn.
+ */
+export function TaskRouteFacts({ entry, t }: {
+  readonly entry: SessionLinkTaskViewEntry
+  readonly t: LinkProps['t']
+}): ReactNode {
+  const actual = entry.routeUsed
+  const requested = entry.requestedModel
+  const requestedText = `${requested.provider}/${requested.model}${requested.reasoningEffort === undefined ? '' : ` (effort ${requested.reasoningEffort})`}`
+  const actualText = actual === undefined ? undefined
+    : `${actual.provider}/${actual.model}${actual.reasoningEffort === undefined ? '' : ` (effort ${actual.reasoningEffort})`}`
+  const persistent = entry.scope === 'session' && entry.routePersisted
+  const skipped = entry.scope === 'session' && !entry.routePersisted
+    && entry.reason !== undefined && entry.reason.includes('persistent_selection_skipped')
+  return <>
+    <span className={`slp-task-badge${persistent ? ' slp-task-badge-info' : ''}`}>
+      {t(entry.scope === 'session' ? 'task.card.scope.session' : 'task.card.scope.task')}
+    </span>
+    {persistent ? <span className="slp-task-badge slp-task-badge-success">{t('task.persisted')}</span> : null}
+    {skipped ? <span className="slp-task-badge slp-task-badge-warn">{t('task.persist.skipped')}</span> : null}
+    <span className="slp-task-line"><b>{t('task.card.requested')}</b>{requestedText}</span>
+    {actualText === undefined || actualText === requestedText ? null
+      : <span className="slp-task-line"><b>{t('task.card.selected')}</b>{actualText}</span>}
+  </>
+}
+
+/** The read-only task projection section, placed after the groups in the panel. */
+function TaskPanelSection({ sessionId, tasks, refreshTasks, openSession, t }: {
+  readonly sessionId: SessionId
+  readonly tasks: TaskSnapshot
+  readonly refreshTasks: () => Promise<boolean>
+  readonly openSession: LinkInjected['openSession']
+  readonly t: LinkProps['t']
+}): ReactNode {
+  const visible = tasks.view === undefined
+    ? []
+    : tasks.view.tasks.filter(entry =>
+      entry.taskId.startsWith(`task:${sessionId}:`) || entry.targetSessionId === sessionId)
+  if (tasks.status === 'error') {
+    return <section className="slp-panel-section" aria-label={t('panel.tasks.title')}>
+      <header className="slp-panel-section-head"><span>{t('panel.tasks.title')}</span>
+        <button type="button" className="slp-text-button" onClick={() => { void refreshTasks() }}>{t('panel.retry')}</button></header>
+      {tasks.view === undefined ? null
+        : <div className="slp-task-list">{visible.map(entry => <TaskPanelRow key={entry.taskId} entry={entry} sessionId={sessionId} t={t} openSession={openSession} />)}</div>}
+      <div role="alert" className="slp-notice">{t('panel.error')}{tasks.error ? `: ${tasks.error}` : ''}</div>
+    </section>
+  }
+  return <section className="slp-panel-section" data-session-link-tasks="" aria-label={t('panel.tasks.title')}>
+    <header className="slp-panel-section-head"><span>{t('panel.tasks.title')}</span></header>
+    {tasks.view === undefined
+      ? <div className="slp-state" role="status">{t('panel.loading')}</div>
+      : visible.length === 0
+        ? <div className="slp-state">{t('panel.tasks.empty')}</div>
+        : <div className="slp-task-list">{visible.map(entry => <TaskPanelRow key={entry.taskId} entry={entry} sessionId={sessionId} t={t} openSession={openSession} />)}</div>}
+    <p className="slp-footnote">{t('panel.tasks.hint')}</p>
+  </section>
+}
+
+/** One read-only task row in the panel; the Host project decides the honest labels. */
+function TaskPanelRow({ entry, sessionId, t, openSession }: {
+  readonly entry: SessionLinkTaskViewEntry
+  readonly sessionId: SessionId
+  readonly t: LinkProps['t']
+  readonly openSession: LinkInjected['openSession']
+}): ReactNode {
+  const isSender = entry.taskId.startsWith(`task:${sessionId}:`)
+  return <div className="slp-task-card" data-session-link-task="">
+    <div className="slp-task-card-heading">
+      <span className="slp-task-kind">{isSender ? t('task.card.send') : t('task.card.spawn')}</span>
+      <span className="slp-task-title">{entry.taskId}</span>
+      <span className={`slp-task-badge${entry.taskState === 'waiting_decision' ? ' slp-task-badge-warn' : ''}`}>{entry.taskState}</span>
+      {entry.currentlyExecuting ? <span className="slp-task-badge slp-task-badge-info">running</span> : null}
+    </div>
+    <div className="slp-task-line">
+      <TaskRouteFacts entry={entry} t={t} />
+      {entry.executionState === undefined ? null : <span className="slp-task-meta">{entry.executionState}</span>}
+      {entry.reason === undefined ? null : <span className="slp-task-meta">{entry.reason}</span>}
+    </div>
+    {/* A needs_decision task without a Session shows no session jump — the row
+        is honest about what it can and cannot open. */}
+    {entry.targetSessionId === undefined
+      ? <div className="slp-task-note">{t('task.card.nojump')}</div>
+      : <div className="slp-task-line">
+        <span className="slp-task-meta">{t('panel.tasks.target', { title: String(entry.targetSessionId).replace(/^session-/, '').slice(0, 8) })}</span>
+        <button type="button" className="slp-text-button" onClick={() => { openSession(entry.targetSessionId!) }}>{t('peer.open')}</button>
+      </div>}
+    {entry.outbox.length === 0 ? null
+      : <div className="slp-task-line"><span className="slp-task-meta">{taskOutboxLine(entry, t)}</span>
+        {entry.outbox.at(-1)?.blockedReason === undefined ? null
+          : <span className="slp-task-meta">{t('outbox.blockedReason', { reason: entry.outbox.at(-1)!.blockedReason! })}</span>}</div>}
+  </div>
+}
+
 function Peer({ row, snapshot, busy, setWake, openSession, t }: {
   readonly row: PeerRow
   readonly snapshot: LinkSnapshot
@@ -245,8 +352,9 @@ export function HeaderAction(props: LinkProps & {
 }
 
 /** Management actions always bind to this explicit owner, not the visible conversation. */
-export function LinkTab({ sessionId, useLinks, refresh, setWake, link, unlink, openSession, t }: LinkProps): ReactNode {
+export function LinkTab({ sessionId, useLinks, useTasks, refresh, refreshTasks, setWake, link, unlink, openSession, t }: LinkProps): ReactNode {
   const snapshot = useLinks(value => value)
+  const tasks = useTasks(value => value)
   const view = snapshot.view
   const { busy, error, run } = useOperation(sessionId)
   const [pickerOpen, setPickerOpen] = useState(false)
@@ -285,6 +393,7 @@ export function LinkTab({ sessionId, useLinks, refresh, setWake, link, unlink, o
           onClick={() => { setPickerOpen(value => !value) }}>{t('add.title')}</button>
         {pickerOpen ? <LinkPicker key={sessionId} sessionId={sessionId} snapshot={snapshot} link={link} t={t} onLinked={() => { setPickerOpen(false) }} /> : null}
       </div>
+      <TaskPanelSection sessionId={sessionId} tasks={tasks} refreshTasks={refreshTasks} openSession={openSession} t={t} />
       <div className="slp-footnote">{t('wake.budget.hint')}</div><div className="slp-footnote">{t('tab.command.hint')}</div>
     </>}
     {error === null ? null : <div role="alert" className="slp-notice">{error}</div>}

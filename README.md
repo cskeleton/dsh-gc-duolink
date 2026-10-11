@@ -6,7 +6,7 @@
 
 打开普通会话，点击头栏「互联」展开快速选择器：搜索已有会话、选中候选、分别确认两个方向的自动唤醒，再点「建立互联」。仅选择候选不会建链。「管理互联」打开右侧面板，可打开对方会话、独立设置去程／回程唤醒或确认解除互联。Escape、关闭按钮和点击外部可关闭选择器。
 
-会话列表使用**右侧 hover 链条按钮**和 `… → 会话互联…` 菜单，不占左侧运行状态位。链条强调色只表示已互联，悬浮提示显示互联数量，与唤醒开关无关。点击列表入口管理的是被点击的会话，右栏明确显示「正在管理：…」，不会切换主对话或激活所有列表会话；当前需有会话主视图来承载右栏。头栏、右栏、列表和轨迹卡共用一份宿主查询。列表按钮的 hover、键盘与触屏表现由宿主 action strip 控制，未修改宿主 DOM。
+会话列表使用**右侧 hover 链条按钮**和 `… → 会话互联…` 菜单，不占左侧运行状态位。链条强调色只表示已互联，悬浮提示显示互联数量，与唤醒开关无关。点击列表入口管理的是被点击的会话，右栏明确显示「正在管理：…」，不会切换主对话或激活所有列表会话；当前需有会话主视图来承载右栏。头栏、右栏、列表和轨迹卡共用一份宿主查询。列表按钮的 hover、键盘与触屏表现由宿主 action strip 控制，未修改宿主 DOM。右侧面板下方新增只读「任务状态」区：列出本会话发起或接收的 tracked 任务及其状态、请求路由与实际路由、本次／持续标签与回报投递进度；轮询失败保留已读数据并显示重试入口。使用该区的会话不授予决策能力，决策仍走 `session_get_task`／`session_resolve_task`。tracked 工具调用在轨迹中额外渲染一张任务卡：已受理卡区分请求路由与选用路由并标注「受理仅代表投递成功」；等待决策卡在没有创建会话时不显示虚假会话跳转；回合结束卡只在持久化真正提交时显示「已持久化」标签（被跳过时显示「未持久化：人类选择已变更」）。宿主生成的任务状态消息以独立徽标（宿主任务状态）呈现，不归为目标 Agent 的发言。
 
 建链时宿主同时校验发起方和对方：两者都必须存在、是普通顶层会话且未归档。同一对会话已在某个组中时，建链在串行队列内原子拒绝，并发请求只会成功一个。切换自动唤醒同样在串行队列内完成读取、修改和写入，不同窗口同时修改不同成员的开关不会互相覆盖。UI 在一次写入完成前忽略后续点击，头栏、面板和卡片共用一个写入闸门。
 
@@ -34,13 +34,24 @@
 /session-link revoke <link-id>
 ```
 
-模型工具为 `session_list_links`、`session_send_session_message`、`session_cancel_session_message` 和 `session_spawn_linked_session`。发送工具的 `in_reply_to` 支持回复。
+模型工具为 `session_list_links`、`session_send_session_message`、`session_cancel_session_message` 和 `session_spawn_linked_session`，以及任务级模型路由的 `session_list_models`、`session_get_task` 与 `session_resolve_task`。发送工具的 `in_reply_to` 支持回复。
 
 工具和 `/session-link` 命令按 preset 挂载到顶层 Agent 的 `agent.ctx`，不进入全局工具层。**省略 `presets` 时**自动包含 `standard`、`ptc`、`cordis` 和宿主当前有效默认 preset；有效默认由公开 `agentPresets.defaultId` 读取（SDK 语义为 `selectedDefault.get() ?? config.default`）。因此默认选中 `coding` 等自定义 preset 时可直接使用，其他自定义 preset 不自动扫描。
 
 **显式 `presets` 是精确白名单**，不会自动追加默认项；`presets: []` 禁用该行挂载。`minimal` 无论是否默认或显式列出均排除，子代理也始终排除。执行时仍拒绝子代理和归档会话。Agent 创建、preset 切换、初始存量扫描和插件卸载遵循宿主生命周期；每次资格检查读最新默认值，但 SDK 没有独立的 default-changed 事件，仅改变默认选择不会主动重挂已存量的 Agent。没有 `agentPresets` 服务的组合（如 headless）只有自动模式回退到全部顶层 Agent；显式名单因无法匹配 preset 不挂载。preset 行不是 Loader group，插件不改写其 `config.plugins` 或磁盘 profile。
 
 `session_spawn_linked_session` 先创建会话并立即建链，再设置标题、投递初始任务。spawn 建的组欠新会话一次唤醒：发给它的首条消息会唤醒它（仍受每日唤醒预算约束，预算用尽时为 `queued`，这次唤醒继续保留给下一条消息）；一旦有消息送达或用掉过唤醒，这笔欠账结清。这一状态从邮箱记录推导，不新增存储字段。`auto_awake` 决定后续消息能否唤醒新会话（默认 false）；新增可选 `wake_caller` 决定对方发消息／回复能否唤醒创建方，省略时跟随 `auto_awake`。因此新 spawn 的 `auto_awake: true` 默认同时授予回程唤醒，显式 `wake_caller: false` 可保持单向；`auto_awake: false, wake_caller: true` 也可独立设置。所有方向仍受既有预算限制，首任务特例不会给创建方额外授权。改名失败只记日志，会话仍保持互联并收到任务；任务已保存但暂时没能投递时，工具返回 `queued`，不报错，用同一调用重放会继续投递。只有任务没保存或在送达前被取消时工具才报错，并给出已互联的会话 ID，此时用 `session_send_session_message` 重发不会产生重复任务，且仍会唤醒新会话。同一 tool call 重放时，工具先查这次调用的记录，再决定是否创建或建链：任务已保存过（包括 0.3.0、0.3.1 留下的记录）就复用原会话、原组和原消息，不再创建会话或建链，并对仍在等待的这条任务再尝试投递一次；已送达、已取消、已失败或已撤销的任务不会重新执行；已建组但任务未投递就复用原会话和原组补投任务；原组已被人工解除时报错，既不重新建链也不重发任务。存储域每次只原子写一条记录，没有跨表事务，所以调用记录先于互联组提交（标记为意图），解除互联时先在调用记录上标记已解除、再删除组。任何一步写入失败留下的状态只会被读成“尚未建组”（重放时按记录的组 ID 补建）或“已解除”（不再重建），不会出现“有组、无记录”。调用记录保存在 `session_link` 域 ledgers 行的 `spawns` 字段中（旧行读作空，域版本仍为 1）。新 spawn 意图中的可选 `autoWakeSessionIds` 固化首次授权，故障重放只能恢复这份集合，不能采用改变后的参数扩权；旧未完成意图没有此字段时保守补建为无后续唤醒授权，首任务欠账仍有效。已经存在的组、旧消息重放、人工关闭的开关不迁移、不补授权、不恢复。首次创建时会话 ID 由调用会话和 call ID 推导，崩溃后重放会认领同一个会话。会话控制器没有删除接口，建链本身失败时错误信息给出空会话 ID，交给人工处理。插件本身没有额外人工审批流程，调用仍受 profile 已配置的工具策略约束。UI 与命令添加的组记为 human grant；spawn 组记为调用会话的 session grant。
+
+## 任务级模型路由（tracked task）
+
+给 `session_spawn_linked_session` 或 `session_send_session_message` 传 `provider` + `model` 即进入 tracked-task 路径（两参数必须成对，不允许孤立的 `reasoning_effort`；`model_scope` 与 `on_model_unavailable` 也要求同时给出主模型）。全部省略时保持旧的未跟踪形状与行为。catalog 与路由合法性由 `session_list_models` 查询。
+
+- **任务边界**：任务的执行边界是"这条任务消息在目标会话上的那一个完整 turn"（turn 内多步、工具调用全部计入），**不是之后的新 turn**。turn 结束后目标会话回到自己的基线；任务之后的后续消息是新的任务，不继承本次临时路由。
+- **路由范围**：`model_scope: task`（默认）只绑定这一个任务 turn；结束时把被临时冻结的基线恢复到下一个无任务请求，临时路由绝不变成会话事实上的基线。`model_scope: session` 把"本任务实际成功使用的最终 route"持久化为目标的长期基线——提交点与成功 route 的执行事实绑定，且必须 CAS：任务期间人工改过选择则不覆盖，回报 `persistent_selection_skipped: human_selection_changed`。失败或中断的任务永不持久化。
+- **fallback 顺序与耗尽**：`on_model_unavailable.fallbacks` 按用户给定顺序逐候选尝试（主模型 + 最多 4 个 fallback，每个候选必须在 route 或 effort 上不同；`{use:"session_default"}` 在首次 activation 时解析为目标当前基线并冻结到本次 attempt，重放不重新采样）。候选用尽不会静默乱试：任务进入 `waiting_decision`，并通过宿主生成的任务状态回报通知发起方（默认策略 `notify_sender`），由发起方用 `session_get_task` / `session_resolve_task` 做一次明确决策（retry / continue / cancel）。只有归一化的路由不可用类错误才允许自动换模型；安全/内容拒绝、用户取消、工具错误、存储失败都不是换模型的理由；已产生响应或副作用后停止自动 fallback。
+- **通知**：任务状态回报默认投递到发起会话的邮箱（来源标记为 `session-task-status`，正文明确标注是宿主生成的任务状态事实，不是目标 Agent 的发言，也不是给本机的指令），共享唤醒预算与去重；**投递不保证唤醒**——预算/授权不足时通知保持 queued，等发起方下一轮活动时送达；解除互联后不再跨会话投递，事件保留为 blocked 供双方查询。面板与卡片只读展示这些状态；决策永远走工具，UI 不替用户决策。
+- **partial 不重跑**：已落盘的外部效果绝不回放。`continue` 只接受宿主确认有可恢复 checkpoint 的 partial 任务；当前宿主不暴露这种 checkpoint，`continue` 一律返回 `TASK_NOT_RESUMABLE`，发起方应另建补救任务而不是从头重放未知效果。`retry` 只接受确定尚无成功模型响应的 `not_started` 任务。
+- **宿主能力**：tracked 路径要求宿主暴露 task-host capability v1。缺失时传路由参数会以 `HOST_CAPABILITY_UNAVAILABLE` 明确拒绝（不创建任务、不伪造 queued/accepted），而旧的四个工具（list_links / send / cancel / spawn 不带路由参数）在该宿主上照常工作。
 
 ## 安装
 

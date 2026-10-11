@@ -773,3 +773,78 @@ function resolveTaskHostRef(agent: Agent): ReturnType<typeof import('../src/host
     return undefined
   }
 }
+
+/* Task 6: tool-result presentation — the legacy first-segment stays byte-
+ * identical, and the tracked-task sidecar carries the card facts. */
+describe('task-routing: result presentation', () => {
+  it('tracked spawn admitted keeps the legacy first segment byte-identical and appends the task sidecar', async () => {
+    const adapter = new MockAdapter([textResponse(`done by ${MODEL_A}`)])
+    const s = await stack({ adapter })
+    const result = succeeded(await call(s.ctx, 'session_spawn_linked_session', {
+      cwd: '/tmp/task-routing-render-A',
+      task: 'review the report',
+      title: 'reviewer',
+      provider: 'mock',
+      model: MODEL_A,
+    }, s.alice, 'call-render-A'))
+    const blocks = result.content.filter(block => block.type === 'text')
+    expect(blocks.length).toBe(2)
+    // The FIRST segment is exactly the Task-4 tracked shape the client card
+    // patterns replay; today and before Task 6 it is byte-identical.
+    expect(blocks[0]!.text).toBe(
+      `task task:${s.alice.id}:call-render-A admitted: session ${s.bob.id} linked (${blocks[0]!.text!.match(/linked \((\S+)\)/)?.[1]})`
+      + `; task message ${(result.value as { messageId: string }).messageId} accepted`
+      + ` (requested mock/${MODEL_A}, selected mock/${MODEL_A})`,
+    )
+    // The sidecar carries the machine-readable card facts AFTER the legacy text.
+    expect(blocks[1]!.text).toContain('session-link/task-result')
+    const jsonStart = blocks[1]!.text!.indexOf('{')
+    const parsed = JSON.parse(blocks[1]!.text!.slice(jsonStart)) as Record<string, unknown>
+    expect(parsed.type).toBe('session-link/task-result')
+    expect(parsed.outcome).toBe('admitted')
+    expect(parsed.taskId).toBe(`task:${s.alice.id}:call-render-A`)
+    expect(parsed.scope).toBe('task')
+    expect(parsed.sessionId).toBe(s.bob.id)
+    expect(parsed.requestedModel).toEqual({ provider: 'mock', model: MODEL_A })
+    expect(parsed.selectedModel).toEqual({ provider: 'mock', model: MODEL_A })
+    await s.bob.whenIdle()
+  })
+
+  it('legacy spawn/send first segments stay byte-identical and carry NO sidecar', async () => {
+    const s = await stack()
+    const spawned = succeeded(await call(s.ctx, 'session_spawn_linked_session', {
+      cwd: '/tmp/task-routing-render-legacy', task: 'legacy task',
+    }, s.alice, 'call-render-legacy'))
+    const blocks = spawned.content.filter(block => block.type === 'text')
+    expect(blocks).toHaveLength(1)
+    expect(blocks[0]!.text).toMatch(/^session \S+ created and linked \(\S+\); task message \S+ (queued|accepted)$/)
+    await s.bob.whenIdle()
+    const sent = succeeded(await call(s.ctx, 'session_send_session_message', {
+      session_id: s.bob.id, message: 'legacy ping',
+    }, s.alice, 'call-render-legacy-send'))
+    const sentBlocks = sent.content.filter(block => block.type === 'text')
+    expect(sentBlocks).toHaveLength(1)
+    expect(sentBlocks[0]!.text).toMatch(/^message \S+ (accepted by|queued for) session \S+( \(durable; awaits the peer's next turn\))?$/)
+    await s.bob.whenIdle()
+  })
+
+  it('spawn precheck failure renders needs_decision with no sessionId in the sidecar (no fake session jump)', async () => {
+    const s = await stack()
+    const result = succeeded(await call(s.ctx, 'session_spawn_linked_session', {
+      cwd: '/tmp/task-routing-render-fail',
+      task: 'will not start',
+      provider: 'mock', model: 'model-absent',
+    }, s.alice, 'call-render-fail'))
+    const blocks = result.content.filter(block => block.type === 'text')
+    expect(blocks).toHaveLength(2)
+    expect(blocks[0]!.text).toContain('needs a decision')
+    expect(blocks[0]!.text).toContain('no Session was created and nothing was sent')
+    const jsonStart = blocks[1]!.text!.indexOf('{')
+    const parsed = JSON.parse(blocks[1]!.text!.slice(jsonStart)) as Record<string, unknown>
+    expect(parsed.outcome).toBe('needs_decision')
+    expect(parsed.sessionId).toBeUndefined()
+    expect(parsed.linkId).toBeUndefined()
+    expect(parsed.taskState).toBe('waiting_decision')
+    expect(parsed.executionState).toBe('not_started')
+  })
+})

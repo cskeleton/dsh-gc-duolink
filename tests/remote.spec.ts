@@ -7,6 +7,7 @@ import { SessionId } from '@deepseek-ai/dsh-session'
 import Storage from '@deepseek-ai/dsh-storage'
 import { DomainFacility } from '@deepseek-ai/dsh-storage-domain'
 import SessionLinkService from '../src/index.ts'
+import { SessionLinkTaskService } from '../src/tasks.ts'
 import { MemoryMediaPool, MemoryStorageBackend } from './helpers/memory-backend.ts'
 
 const contexts = new Set<Context>()
@@ -78,6 +79,44 @@ async function stack(): Promise<Stack> {
   const alice = await ctx.agentLoop.create(SessionId('session-alice'), { provider: 'mock', model: 'mock' })
   const bob = await ctx.agentLoop.create(SessionId('session-bob'), { provider: 'mock', model: 'mock' })
   return { ctx, links: ctx.sessionLinks, alice, bob, listCalls, archived }
+}
+
+/** Mount the durable task service onto an existing link-service stack (same domain). */
+async function ctx2TaskService(ctx: Context): Promise<{
+  saveSpawn(callId: string): Promise<{ taskId: string; row: { taskState: string } }>
+  saveSend(callId: string): Promise<{ taskId: string; row: { taskState: string } }>
+}> {
+  await ctx.plugin(SessionLinkTaskService, {})
+  const tasks = ctx.sessionLinkTasks
+  const policy = {
+    scope: 'task' as const,
+    candidates: [{ provider: 'deepseek-account', model: 'deepseek-chat' }],
+    ifExhausted: 'notify_sender' as const,
+    usesSessionDefault: false,
+  }
+  return {
+    async saveSpawn(callId: string) {
+      const saved = await tasks.saveTaskIntent({
+        callerId: SessionId('session-alice'),
+        request: {
+          kind: 'spawn', callId, text: 'do the thing',
+          spawn: { cwd: '/repo', autoAwake: true, targetSessionId: SessionId('session-bob') },
+        },
+        policy,
+        tracked: true,
+      })
+      return { taskId: String(saved.taskId), row: { taskState: saved.row.taskState } }
+    },
+    async saveSend(callId: string) {
+      const saved = await tasks.saveTaskIntent({
+        callerId: SessionId('session-alice'),
+        request: { kind: 'send', callId, text: 'ping', targetSessionId: SessionId('session-bob') },
+        policy,
+        tracked: true,
+      })
+      return { taskId: String(saved.taskId), row: { taskState: saved.row.taskState } }
+    },
+  }
 }
 
 describe('dsh-session-link remote surface', () => {
@@ -236,5 +275,38 @@ describe('dsh-session-link remote surface', () => {
     await expect(s.links.setAutoWakeFrom({ callerId: s.alice.id, linkId: 'x', peerId: s.bob.id, on: 1 } as never))
       .rejects.toThrow()
     expect(s.links.list()).toEqual([])
+  })
+
+  it('taskView projects the caller- and target-visible tasks with honest persist labels', async () => {
+    const s = await stack()
+    const taskStack = await ctx2TaskService(s.ctx)
+    const saved = await taskStack.saveSpawn('call-view-1')
+    expect(saved.taskId).toBe(`task:${s.alice.id}:call-view-1`)
+    const sent = await taskStack.saveSend('call-view-2')
+    expect(sent.taskId).toBe(`task:${s.alice.id}:call-view-2`)
+    const empty = await s.links.taskView({ sessionId: SessionId('session-carol') })
+    expect(empty.tasks).toEqual([])
+    const view = await s.links.taskView({ sessionId: s.alice.id })
+    expect(view.pollIntervalMs).toBe(30000)
+    expect(view.tasks).toHaveLength(2)
+    const entry = view.tasks.find(item => item.taskId === `task:${s.alice.id}:call-view-1`)!
+    expect(entry.taskState).toBe('preparing')
+    expect(entry.scope).toBe('task')
+    expect(entry.routePersisted).toBe(false)
+    expect(entry.currentlyExecuting).toBe(false)
+    expect(entry.requestedModel).toEqual({ provider: 'deepseek-account', model: 'deepseek-chat' })
+    // The target sees the send that names it; a stranger does not.
+    const bobView = await s.links.taskView({ sessionId: s.bob.id })
+    expect(bobView.tasks).toHaveLength(1)
+    expect(bobView.tasks[0]!.taskId).toBe(`task:${s.alice.id}:call-view-2`)
+    // Malformed requests validate before reading state.
+    await expect(s.links.taskView({ sessionId: 7 } as never)).rejects.toThrow()
+    await expect(s.links.taskView({ sessionId: s.alice.id, extra: true } as never)).rejects.toThrow()
+  })
+
+  it('taskView reads as empty when the task service is not mounted', async () => {
+    const s = await stack()
+    const view = await s.links.taskView({ sessionId: s.alice.id })
+    expect(view).toEqual({ pollIntervalMs: 30000, tasks: [] })
   })
 })

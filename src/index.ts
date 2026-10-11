@@ -171,6 +171,11 @@ export type {
   SessionLinkSpawnReplay,
   SessionLinkSummary,
   SessionLinkSessionView,
+  SessionLinkTaskOutboxView,
+  SessionLinkTaskRouteView,
+  SessionLinkTaskViewEntry,
+  SessionLinkTaskViewRequest,
+  SessionLinkTaskViewResponse,
   SessionLinkView,
   SessionLinkWakeRequest,
 } from './types.ts'

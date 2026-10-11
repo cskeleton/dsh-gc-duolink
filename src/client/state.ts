@@ -1,6 +1,6 @@
 /** Shared, disposable Host queries for every Session Link surface. */
 import type { HostObservable } from '@deepseek-ai/dsh-client-ui-slots'
-import type { SessionLinkView } from '../types.ts'
+import type { SessionLinkTaskViewResponse, SessionLinkView } from '../types.ts'
 
 /** A write refused because another Session Link write from this client is still in flight. */
 export class LinkBusyError extends Error {
@@ -96,6 +96,120 @@ export function createLinkSource(deps: LinkSourceDependencies): LinkSource {
       } catch (error) {
         if (disposed) return false
         if (current !== epoch) return latest ?? false
+        publish({
+          view: snapshot.view,
+          status: 'error',
+          error: error instanceof Error ? error.message : String(error),
+        })
+        return false
+      } finally {
+        if (current === epoch) {
+          request = undefined
+          schedule()
+        }
+      }
+    }
+    latest = read()
+    return latest
+  }
+  const suspend = (): void => {
+    epoch++
+    stopTimer()
+    request?.abort()
+    request = undefined
+    latest = undefined
+    unsubscribeReset?.()
+    unsubscribeReset = undefined
+  }
+
+  return {
+    getSnapshot: () => snapshot,
+    subscribe(listener) {
+      if (disposed) return () => {}
+      listeners.add(listener)
+      if (listeners.size === 1) {
+        unsubscribeReset = deps.subscribeReset(() => { void refresh() })
+        void refresh()
+      }
+      return () => {
+        listeners.delete(listener)
+        if (listeners.size === 0) suspend()
+      }
+    },
+    refresh,
+    dispose() {
+      disposed = true
+      suspend()
+      listeners.clear()
+    },
+  }
+}
+
+/** Last authoritative task read and its current transport state. */
+export interface TaskSnapshot {
+  readonly view: SessionLinkTaskViewResponse | undefined
+  readonly status: 'loading' | 'ready' | 'error'
+  readonly error?: string
+}
+
+/** Transport and connection lifecycle for the read-only task projection. */
+export interface TaskSourceDependencies {
+  readonly load: (signal: AbortSignal) => Promise<SessionLinkTaskViewResponse>
+  readonly subscribeReset: (listener: () => void) => () => void
+}
+
+/**
+ * Poll the read-only task projection with the Host's own interval, sharing
+ * the link source's last-known pattern: a failed poll keeps whatever it
+ * already had, only flips the transport status, and never wipes rows.
+ * @param deps - Host query and reset subscription.
+ * @returns observable read state, explicit refresh, and teardown.
+ */
+export function createTaskSource(deps: TaskSourceDependencies): HostObservable<TaskSnapshot> & {
+  refresh(): Promise<boolean>
+  dispose(): void
+} {
+  let snapshot: TaskSnapshot = { view: undefined, status: 'loading' }
+  const listeners = new Set<() => void>()
+  let epoch = 0
+  let disposed = false
+  let timer: ReturnType<typeof setTimeout> | undefined
+  let unsubscribeReset: (() => void) | undefined
+  let request: AbortController | undefined
+  let latest: Promise<boolean> | undefined
+
+  const publish = (next: TaskSnapshot): void => {
+    snapshot = next
+    for (const listener of listeners) listener()
+  }
+  const stopTimer = (): void => {
+    if (timer !== undefined) clearTimeout(timer)
+    timer = undefined
+  }
+  const schedule = (): void => {
+    stopTimer()
+    if (disposed || listeners.size === 0 || snapshot.view === undefined) return
+    timer = setTimeout(() => { void refresh() }, snapshot.view.pollIntervalMs)
+  }
+  const refresh = (): Promise<boolean> => {
+    if (disposed) return Promise.resolve(false)
+    stopTimer()
+    request?.abort()
+    const controller = new AbortController()
+    request = controller
+    const current = ++epoch
+    publish({ view: snapshot.view, status: 'loading' })
+    const read = async (): Promise<boolean> => {
+      try {
+        const view = await deps.load(controller.signal)
+        if (disposed) return false
+        if (current !== epoch) return latest ?? false
+        publish({ view, status: 'ready' })
+        return true
+      } catch (error) {
+        if (disposed) return false
+        if (current !== epoch) return latest ?? false
+        // Last-known-on-failure: keep the rows and surface only the transport state.
         publish({
           view: snapshot.view,
           status: 'error',

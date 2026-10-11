@@ -50,6 +50,97 @@ export type Config = PresetScopeConfig
 /** Loader-visible row schema. */
 export const Config = PresetScopeConfig
 
+/**
+ * Read one tracked task row at render time so the result can carry the task's
+ * scope and state labels. Absent the task service (untracked legacy paths) the
+ * extra context is omitted, never invented.
+ * @returns the policy scope of the tracked task, or undefined when unavailable.
+ */
+function scopeOfTask(ctx: Context, taskId: string | undefined): 'task' | 'session' | undefined {
+  if (taskId === undefined) return undefined
+  try {
+    return taskServiceOf(ctx).getRow(SessionLinkTaskId(taskId))?.policy.scope
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * The structured sidecar block appended AFTER the byte-identical first text
+ * segment: the tracked-task identity, state/scope/route labels, and the
+ * inspect/decision pointers. JSON keeps the transcript readable on every
+ * host level; the client renders a dedicated card from these fields.
+ * NEVER becomes the first block (legacy replay of the first segment).
+ */
+function taskResultSidecar(
+  ctx: Context,
+  tool: 'session_spawn_linked_session' | 'session_send_session_message',
+  value: Record<string, unknown>,
+): { type: 'text'; text: string }[] {
+  if (!('outcome' in value)) return []
+  const outcome = value.outcome as 'admitted' | 'needs_decision'
+  const taskId = value.taskId as string
+  const sessionId = 'sessionId' in value ? value.sessionId as string | undefined : undefined
+  const linkId = 'linkId' in value ? value.linkId as string | undefined : undefined
+  const scope = scopeOfTask(ctx, taskId)
+  /* The wire shape omits requestedModel on a needs_decision path (no route was
+   * ever authorized); read it and scope from the stored task policy instead —
+   * never invented, read straight from the durable row. */
+  let requested = 'requestedModel' in value && value.requestedModel !== undefined && value.requestedModel !== null
+    ? value.requestedModel as { provider: string; model: string; reasoningEffort?: string }
+    : undefined
+  if (requested === undefined) {
+    try {
+      const row = taskServiceOf(ctx).getRow(SessionLinkTaskId(taskId))
+      if (row !== undefined) requested = requestedRouteOf(row.policy)
+    } catch { /* the sidecar stays partial rather than blocking the result */ }
+  }
+  const requestedText = requested === undefined
+    ? undefined
+    : `${requested.provider}/${requested.model}${requested.reasoningEffort === undefined ? '' : ` (effort ${requested.reasoningEffort})`}`
+  const selected = 'selectedModel' in value
+    ? value.selectedModel as { provider: string; model: string; reasoningEffort?: string } | undefined
+    : undefined
+  const scopeText = scope === undefined ? '' : ` · scope ${scope === 'session' ? 'session (persistent)' : 'task (this turn only)'}`
+  const routeLine = requestedText === undefined
+    ? ''
+    : ` · requested ${requestedText}${selected === undefined ? '' : ` → selected ${selected.provider}/${selected.model}${selected.reasoningEffort === undefined ? '' : ` (effort ${selected.reasoningEffort})`}`}`
+  return [{
+    type: 'text' as const,
+    text: [
+      '---',
+      'Tracked-task status (host facts; admission is never execution success). Machine-readable JSON follows.',
+      `Task: ${taskId} · state ${value.taskState as string}${outcome === 'needs_decision' ? ` (${value.executionState as string})` : ''}${scopeText}${routeLine}`,
+      outcome === 'needs_decision'
+        ? `Waiting for a decision: every authorized candidate failed the catalog precheck (reason: ${value.reason as string}). `
+          + (sessionId === undefined
+            ? 'No Session was created and nothing was admitted for this task; '
+            : 'The bound Session shows above; ')
+          + 'read session_get_task and take exactly one decision with session_resolve_task.'
+        : `Delivery accepted (${value.status as string}); acceptance is delivery only, not task success. Inspect with session_get_task; the task state or route facts may still move.`,
+      JSON.stringify({
+        type: 'session-link/task-result',
+        version: 1,
+        tool,
+        outcome,
+        taskId,
+        taskRevision: value.taskRevision,
+        ...(value.messageId === undefined ? {} : { messageId: value.messageId }),
+        ...(value.status === undefined ? {} : { status: value.status }),
+        ...(sessionId === undefined ? {} : { sessionId }),
+        ...(linkId === undefined ? {} : { linkId }),
+        taskState: value.taskState,
+        ...(scope === undefined ? {} : { scope }),
+        ...(outcome === 'needs_decision'
+          ? { executionState: value.executionState, reason: value.reason, attempts: value.attempts }
+          : {}),
+        ...(requested === undefined ? {} : { requestedModel: requested }),
+        ...(selected === undefined ? {} : { selectedModel: selected }),
+      }),
+    ].join('\n'),
+  }]
+}
+
 /** Require the exact live top-level calling Agent. */
 function requireCaller(ctx: Context, exec: { agent?: Agent }): Agent {
   const agent = exec.agent
@@ -537,7 +628,24 @@ function definitions(ctx: Context, pumpSchedule: () => void): ToolDefinition[] {
       + 'Delivery never interrupts the peer mid-turn: it runs as the peer\'s own '
       + 'next turn. A peer with an auto-wake grant may be woken; otherwise the '
       + 'message waits durably for the peer\'s next turn. Returns durable acceptance, '
-      + 'not the peer\'s answer — do not assume the task ran or completed.',
+      + 'not the peer\'s answer — do not assume the task ran or completed. '
+      + 'MODEL ROUTING (optional, tracked-task path): provider + model MUST be '
+      + 'supplied as a pair (never guessed; an exact model requires its provider); '
+      + 'reasoning_effort applies to THIS route only and never transfers across '
+      + 'candidates. model_scope defaults to task (this delivery\'s full target '
+      + 'turn, every step included); session persists ONLY the route that actually '
+      + 'succeeded as the target\'s long-term baseline (a mid-task human selection '
+      + 'change always wins and is reported; a failed or interrupted task never '
+      + 'persists anything). on_model_unavailable orders fallback candidates (at '
+      + 'most 4; each must differ in route or effort; {use:"session_default"} '
+      + 'resolves the TARGET\'s current baseline at activation, never this '
+      + 'Session\'s and never re-sampled on replay); exhausting every candidate '
+      + 'surfaces waiting_decision + a notification instead of a wrong silent '
+      + 'retry, and the caller then decides exactly once (session_get_task / '
+      + 'session_resolve_task). Tracking without these parameters keeps the '
+      + 'untracked legacy shape; an old host without the task capability refuses '
+      + 'tracked parameters with HOST_CAPABILITY_UNAVAILABLE while the other '
+      + 'tools keep working.',
     parameters: {
       session_id: {
         type: 'string',
@@ -563,17 +671,20 @@ function definitions(ctx: Context, pumpSchedule: () => void): ToolDefinition[] {
           { type: 'object', additionalProperties: false, properties: needsDecisionProperties },
         ],
       },
-      render: (args, value) => [{
-        type: 'text',
-        text: 'outcome' in value
-          ? value.outcome === 'admitted'
-            ? `task ${value.taskId} admitted: message ${value.messageId} ${value.status} for session ${args.session_id}`
-              + ` (requested ${value.requestedModel.provider}/${value.requestedModel.model}${value.selectedModel === undefined ? '' : `, selected ${value.selectedModel.provider}/${value.selectedModel.model}`})`
-            : `task ${value.taskId} needs a decision (${value.reason}); no routing admitted`
-          : value.status === 'accepted'
-            ? `message ${value.messageId} accepted by session ${args.session_id}`
-            : `message ${value.messageId} queued for session ${args.session_id} (durable; awaits the peer's next turn)`,
-      }],
+      render: (args, value) => [
+        {
+          type: 'text',
+          text: 'outcome' in value
+            ? value.outcome === 'admitted'
+              ? `task ${value.taskId} admitted: message ${value.messageId} ${value.status} for session ${args.session_id}`
+                + ` (requested ${value.requestedModel.provider}/${value.requestedModel.model}${value.selectedModel === undefined ? '' : `, selected ${value.selectedModel.provider}/${value.selectedModel.model}`})`
+              : `task ${value.taskId} needs a decision (${value.reason}); no routing admitted`
+            : value.status === 'accepted'
+              ? `message ${value.messageId} accepted by session ${args.session_id}`
+              : `message ${value.messageId} queued for session ${args.session_id} (durable; awaits the peer's next turn)`,
+        },
+        ...taskResultSidecar(ctx, 'session_send_session_message', value as Record<string, unknown>),
+      ],
     },
     async execute(args, exec) {
       const caller = requireCaller(ctx, exec)
@@ -655,7 +766,18 @@ function definitions(ctx: Context, pumpSchedule: () => void): ToolDefinition[] {
       + 'wake_caller decides whether its replies may wake this Session, defaulting to auto_awake. '
       + 'Both wake directions remain subject to daily, per-message, and reply-chain budgets. '
       + 'Replaying a call never expands an existing group\'s grants or re-enables a human-disabled flag. '
-      + 'Returns the new Session id for session_list_links / session_send_session_message.',
+      + 'MODEL ROUTING (optional, tracked-task path): provider + model MUST be supplied as a '
+      + 'pair (never guessed); reasoning_effort applies to THIS route only and never transfers. '
+      + 'model_scope defaults to task (the spawned first task\'s full target turn only); session '
+      + 'persists ONLY the route that actually succeeded as the new Session\'s long-term '
+      + 'baseline. on_model_unavailable orders at most 4 fallback candidates (each must differ '
+      + 'in route or effort; {use:"session_default"} resolves the TARGET\'s baseline at '
+      + 'activation, then freezes onto the attempt). Exhaustion surfaces waiting_decision plus '
+      + 'a notification instead of a wrong silent retry; the caller decides with '
+      + 'session_get_task / session_resolve_task. An old host without the task capability '
+      + 'refuses tracked parameters with HOST_CAPABILITY_UNAVAILABLE while the other three '
+      + 'tools keep working. Returns the new Session id for session_list_links / '
+      + 'session_send_session_message.',
     parameters: {
       cwd: {
         type: 'string',
@@ -698,15 +820,18 @@ function definitions(ctx: Context, pumpSchedule: () => void): ToolDefinition[] {
           { type: 'object', additionalProperties: false, properties: needsDecisionProperties },
         ],
       },
-      render: (_args, value) => [{
-        type: 'text',
-        text: 'outcome' in value
-          ? value.outcome === 'admitted'
-            ? `task ${value.taskId} admitted: session ${value.sessionId ?? ''} linked (${value.linkId ?? ''}); task message ${value.messageId} ${value.status}`
-              + ` (requested ${value.requestedModel.provider}/${value.requestedModel.model}${value.selectedModel === undefined ? '' : `, selected ${value.selectedModel.provider}/${value.selectedModel.model}`})`
-            : `task ${value.taskId} needs a decision (${value.reason}); no Session was created and nothing was sent`
-          : `session ${value.sessionId} created and linked (${value.linkId}); task message ${value.messageId} ${value.status}`,
-      }],
+      render: (_args, value) => [
+        {
+          type: 'text',
+          text: 'outcome' in value
+            ? value.outcome === 'admitted'
+              ? `task ${value.taskId} admitted: session ${value.sessionId ?? ''} linked (${value.linkId ?? ''}); task message ${value.messageId} ${value.status}`
+                + ` (requested ${value.requestedModel.provider}/${value.requestedModel.model}${value.selectedModel === undefined ? '' : `, selected ${value.selectedModel.provider}/${value.selectedModel.model}`})`
+              : `task ${value.taskId} needs a decision (${value.reason}); no Session was created and nothing was sent`
+            : `session ${value.sessionId} created and linked (${value.linkId}); task message ${value.messageId} ${value.status}`,
+        },
+        ...taskResultSidecar(ctx, 'session_spawn_linked_session', value as Record<string, unknown>),
+      ],
     },
     async execute(args, exec) {
       const caller = requireCaller(ctx, exec)

@@ -43,15 +43,21 @@ import type {
   SessionLinkSummary,
   SessionLinkTaskStatusReport,
   SessionLinkTaskStatusSource,
+  SessionLinkTaskViewEntry,
+  SessionLinkTaskViewRequest,
+  SessionLinkTaskViewResponse,
   SessionLinkWakeRequest,
   SessionLinkView,
 } from './types.ts'
+import type { SessionLinkTaskRecordData } from './task-spec.ts'
+import { requestedRouteOf } from './task-runtime.ts'
 
 const wireSessionId = wire.string().min(1).transform(value => brandString<SessionId>(value))
 const wireLinkId = wire.string().min(1).transform(value => SessionLinkId(value))
 const addRequestSchema = wire.strictObject({ callerId: wireSessionId, peerId: wireSessionId, autoWake: wire.boolean(), autoWakeCaller: wire.boolean().optional() })
 const revokeRequestSchema = wire.strictObject({ callerId: wireSessionId, linkId: wireLinkId })
 const wakeRequestSchema = wire.strictObject({ callerId: wireSessionId, linkId: wireLinkId, peerId: wireSessionId, on: wire.boolean() })
+const taskViewRequestSchema = wire.strictObject({ sessionId: wireSessionId })
 
 /** Fully resolved deployment limits. */
 export interface SessionLinkLimits {
@@ -165,6 +171,63 @@ export function renderTaskStatusText(request: SessionLinkTaskStatusReport, targe
     `详情通过 session_get_task 查询；如需决策，调用 session_resolve_task，task_id 填 ${request.taskId}。`,
   ]
   return lines.join('\n')
+}
+
+/**
+ * Project one stored task row into the panel's read-only entry. The route
+ * label stays honest: `persisted` is claimed only when `routeUsed` committed
+ * (a turn that fell back before finishing shows the route it actually ran);
+ * a session-scope task whose persist was skipped carries the skip reason and
+ * `routePersisted: false`. Outbox events keep their own delivery lifecycle;
+ * `pending`/`admitted` make no execution claim.
+ * @param row - one stored task row the caller may read.
+ * @returns the panel's projection line.
+ */
+function taskEntryOf(row: SessionLinkTaskRecordData): SessionLinkTaskViewEntry {
+  const requested = requestedRouteOf(row.policy)
+  const routeWire = (route: { provider: string; model: string; reasoningEffort?: string } | undefined) =>
+    route === undefined ? undefined : {
+      provider: route.provider,
+      model: route.model,
+      ...(route.reasoningEffort === undefined ? {} : { reasoningEffort: route.reasoningEffort }),
+    }
+  return {
+    taskId: `task:${row.callerId}:${row.callId}`,
+    taskState: row.taskState,
+    revision: row.revision,
+    ...(row.executionState === undefined ? {} : { executionState: row.executionState }),
+    ...(row.reason === undefined ? {} : { reason: row.reason }),
+    ...(row.targetSessionId === undefined ? {} : { targetSessionId: row.targetSessionId }),
+    requestedModel: {
+      provider: requested.provider,
+      model: requested.model,
+      ...(requested.reasoningEffort === undefined ? {} : { reasoningEffort: requested.reasoningEffort }),
+    },
+    ...(routeWire(row.execution.currentRoute) === undefined ? {} : { currentRoute: routeWire(row.execution.currentRoute) }),
+    ...(routeWire(row.execution.routeUsed) === undefined ? {} : { routeUsed: routeWire(row.execution.routeUsed) }),
+    scope: row.policy.scope,
+    // Only a committed turn-finished route may claim persistence; a partial or
+    // waiting decision never shows a baseline label it did not earn.
+    routePersisted: row.taskState === 'turn_finished' && row.execution.routeUsed !== undefined,
+    currentlyExecuting: row.execution.currentlyExecuting === true,
+    ...(row.attempts.at(-1)?.results.at(-1) === undefined ? {} : {
+      latestIssue: {
+        ...(row.attempts.at(-1)!.results.at(-1)!.code === undefined ? {} : { code: row.attempts.at(-1)!.results.at(-1)!.code }),
+        ...(row.attempts.at(-1)!.results.at(-1)!.message === undefined ? {} : { message: row.attempts.at(-1)!.results.at(-1)!.message }),
+      },
+    }),
+    outbox: row.outbox.map(event => ({
+      eventId: event.eventId,
+      kind: event.kind,
+      status: event.status,
+      ...(routeWire(event.requestedModel) === undefined ? {} : { requestedModel: routeWire(event.requestedModel) }),
+      ...(routeWire(event.actualModel) === undefined ? {} : { actualModel: routeWire(event.actualModel) }),
+      decisionRequired: event.decisionRequired,
+      resumable: event.resumable,
+      ...(event.blockedReason === undefined ? {} : { blockedReason: event.blockedReason }),
+    })),
+    updatedAt: row.updatedAt,
+  }
 }
 
 /**
@@ -565,6 +628,36 @@ export class SessionLinkService extends TypertRemoteService {
   async setAutoWakeFrom(request: SessionLinkWakeRequest): Promise<void> {
     request = wakeRequestSchema.parse(request)
     await this.setMemberAutoWake(request.linkId, request.peerId, request.on, request.callerId)
+  }
+
+  /**
+   * Remote: the read-only task projection the human panel polls. Lists every
+   * durable tracked task the managing Session may read (its own tasks + those
+   * targeting it), newest first, with the route/outbox facts the cards
+   * already carry. Read-only: no wake, no decision, no outbox scan beyond
+   * the task rows' own stored events. The task service is optional in stacks
+   * without the tracked layer; its absence yields an empty projection, never
+   * an error the panel would have to special-case.
+   * @param request - the managing Session identity; callers only ever see
+   *   tasks whose caller or target matches it.
+   * @returns the projection and the configured poll interval.
+   */
+  @Remote('taskView')
+  async taskView(request: SessionLinkTaskViewRequest): Promise<SessionLinkTaskViewResponse> {
+    request = taskViewRequestSchema.parse(request)
+    let service: Context['sessionLinkTasks'] | undefined
+    try {
+      service = this.ctx.sessionLinkTasks
+    } catch {
+      service = undefined
+    }
+    if (service === undefined) return { pollIntervalMs: this.uiPollIntervalMs, tasks: [] }
+    const entries = service.listRows()
+      .filter(row => row.callerId === request.sessionId
+        || (row.targetSessionId !== undefined && row.targetSessionId === request.sessionId))
+      .map(row => taskEntryOf(row))
+      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt) || left.taskId.localeCompare(right.taskId))
+    return { pollIntervalMs: this.uiPollIntervalMs, tasks: entries }
   }
 
   /**

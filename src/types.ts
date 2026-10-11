@@ -220,11 +220,69 @@ export interface SessionLinkSessionView {
   readonly blank: boolean
 }
 
+/** One concrete route the plugin's task projection names (camelCase wire fields). */
+export interface SessionLinkTaskRouteView {
+  readonly provider: string
+  readonly model: string
+  readonly reasoningEffort?: string
+}
+
+/** Outbox event line the `sessionLinks/taskView` Remote reports (task row lifecycle). */
+export interface SessionLinkTaskOutboxView {
+  readonly eventId: string
+  readonly kind: 'model_fallback_selected' | 'model_unavailable' | 'turn_finished' | 'interrupted' | 'cancelled'
+  readonly status: 'pending' | 'admitted' | 'delivered' | 'blocked'
+  readonly requestedModel?: SessionLinkTaskRouteView
+  readonly actualModel?: SessionLinkTaskRouteView
+  readonly decisionRequired: boolean
+  readonly resumable: boolean
+  readonly blockedReason?: string
+}
+
+/**
+ * Read-only task line the human panel shows. Task state against one durable
+ * tracked-task intent: state, scope, requested vs actual route (a persistent
+ * label appears only once the baseline persist actually committed), the
+ * target Session, the latest attempt issue, and the outbox lifecycle.
+ * `pending`/`admitted` never claim execution; `currentlyExecuting` comes
+ * straight from the durable runtime projection.
+ */
+export interface SessionLinkTaskViewEntry {
+  readonly taskId: string
+  readonly taskState: string
+  readonly revision: number
+  readonly executionState?: 'not_started' | 'partial' | 'unknown'
+  readonly reason?: string
+  readonly targetSessionId?: SessionId
+  readonly requestedModel: SessionLinkTaskRouteView
+  readonly currentRoute?: SessionLinkTaskRouteView
+  readonly routeUsed?: SessionLinkTaskRouteView
+  readonly scope: 'task' | 'session'
+  /** True only when the session-baseline persist committed; a skipped persist stays honest (see `reason`). */
+  readonly routePersisted: boolean
+  readonly currentlyExecuting: boolean
+  readonly latestIssue?: { readonly code?: string; readonly message?: string }
+  readonly outbox: readonly SessionLinkTaskOutboxView[]
+  readonly updatedAt: string
+}
+
 /** Current full catalogs; deleted groups disappear from the next poll. */
 export interface SessionLinkView {
   readonly pollIntervalMs: number
   readonly links: readonly SessionLinkSummary[]
   readonly sessions: readonly SessionLinkSessionView[]
+}
+
+/** Request accepted by the `sessionLinks/taskView` Remote. */
+export interface SessionLinkTaskViewRequest {
+  /** Managing Session; only tasks whose callerId or targetSessionId is this may appear. */
+  readonly sessionId: SessionId
+}
+
+/** Read-only task projection for the human panel; never a wake, never a decision. */
+export interface SessionLinkTaskViewResponse {
+  readonly pollIntervalMs: number
+  readonly tasks: readonly SessionLinkTaskViewEntry[]
 }
 
 /**
