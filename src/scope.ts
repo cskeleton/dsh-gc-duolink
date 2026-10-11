@@ -16,25 +16,30 @@ import { subagentOwned } from './link.ts'
 /** Row configuration shared by the tool and command rows. */
 export interface PresetScopeConfig {
   /**
-   * Agent preset ids whose top-level Agents receive the contribution. In a
-   * composition without `agentPresets`, every top-level Agent receives it.
-   * @default ['standard', 'ptc', 'cordis']
+   * Exact preset allowlist when specified (an empty list enables none).
+   * When omitted, standard/ptc/cordis and the registry's effective default
+   * receive the contribution. `minimal` is always excluded. Without the
+   * registry, only automatic mode falls back to every top-level Agent.
    */
   readonly presets?: string[]
 }
 
-/** Schemastery row configuration; the default matches the presets that carried the original rows. */
+/** Preserve omission through Loader validation so explicit lists remain exact. */
 export const PresetScopeConfig: z<PresetScopeConfig> = z.object({
-  presets: z.array(z.string()).default(['standard', 'ptc', 'cordis']),
+  // Schemastery arrays implicitly default to []; clear it so omission differs
+  // from an explicitly empty allowlist even after Loader resolves this schema.
+  presets: z.array(z.string()).extra('default', undefined),
 })
 
+const STANDARD_PRESETS: readonly string[] = ['standard', 'ptc', 'cordis']
+
 /**
- * Resolve one row's preset list, applying the schema default.
+ * Resolve one row's preset list without freezing the registry's current default.
  * @param config - row configuration as mounted, or omitted by programmatic callers.
- * @returns the preset ids whose top-level Agents receive the contribution.
+ * @returns an exact allowlist, or undefined for automatic preset selection.
  */
-export function resolvePresets(config: PresetScopeConfig = {}): readonly string[] {
-  return PresetScopeConfig(config).presets ?? []
+export function resolvePresets(config: PresetScopeConfig = {}): readonly string[] | undefined {
+  return PresetScopeConfig(config).presets
 }
 
 /**
@@ -51,7 +56,7 @@ export function resolvePresets(config: PresetScopeConfig = {}): readonly string[
  */
 export function mountPerPresetAgent(
   ctx: Context,
-  presets: readonly string[],
+  presets: readonly string[] | undefined,
   label: string,
   inject: readonly string[],
   contribute: (scoped: Context) => void,
@@ -61,9 +66,13 @@ export function mountPerPresetAgent(
     if (ctx.agents.get(agent.id) !== agent) return false
     if (subagentOwned(ctx, agent.id, agent.session.header)) return false
     const registry = ctx.get('agentPresets')
-    if (registry === undefined) return true
+    if (registry === undefined) return presets === undefined
     const preset = registry.composedPreset(agent.ctx)
-    return preset !== undefined && presets.includes(preset)
+    if (preset === undefined || preset === 'minimal') return false
+    if (presets !== undefined) return presets.includes(preset)
+    // SDK defaultId resolves selectedDefault.get() ?? config.default. Read it
+    // on each evaluation rather than snapshotting the default at plugin mount.
+    return STANDARD_PRESETS.includes(preset) || preset === registry.defaultId
   }
   /** Mount or withdraw for one Agent; resolves once a new mount settles, never rejecting. */
   const sync = async (agent: Agent | undefined): Promise<undefined> => {

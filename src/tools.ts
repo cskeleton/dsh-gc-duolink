@@ -268,7 +268,10 @@ function definitions(ctx: Context): ToolDefinition[] {
       + 'human approval; the profile\'s existing tool policies still apply. '
       + 'The initial task starts the new Session right away unless the daily '
       + 'auto-wake budget is spent, in which case it waits durably (status queued). '
-      + 'auto_awake only decides whether LATER peer messages may wake it. '
+      + 'auto_awake decides whether LATER peer messages may wake the new Session; '
+      + 'wake_caller decides whether its replies may wake this Session, defaulting to auto_awake. '
+      + 'Both wake directions remain subject to daily, per-message, and reply-chain budgets. '
+      + 'Replaying a call never expands an existing group\'s grants or re-enables a human-disabled flag. '
       + 'Returns the new Session id for session_list_links / session_send_session_message.',
     parameters: {
       cwd: {
@@ -287,7 +290,11 @@ function definitions(ctx: Context): ToolDefinition[] {
       },
       auto_awake: {
         type: 'boolean',
-        description: 'Whether later peer messages may wake this new Session automatically (subject to budgets). Defaults to false: later messages wait for its next turn. The initial task wakes it either way.',
+        description: 'Whether later peer messages may wake this new Session automatically (subject to budgets). Defaults to false: later messages wait for its next turn. The initial task wakes it either way. When true, wake_caller also defaults to true.',
+      },
+      wake_caller: {
+        type: 'boolean',
+        description: 'Whether replies from the new Session may wake this calling Session, subject to wake budgets. Defaults to auto_awake; set false to opt out of return-direction wake. Only grants a new group; replay never changes existing authorization.',
       },
     },
     output: {
@@ -328,7 +335,7 @@ function definitions(ctx: Context): ToolDefinition[] {
       let linkId: SessionLinkId
       try {
         linkId = prior?.task === undefined
-          ? await ctx.sessionLinks.claimSpawnLink(caller.id, sessionId, callKey, title, args.auto_awake === true)
+          ? await ctx.sessionLinks.claimSpawnLink(caller.id, sessionId, callKey, title, args.auto_awake === true, args.wake_caller ?? (args.auto_awake === true))
           : prior.linkId
       } catch (error: unknown) {
         if (error instanceof SessionLinkError && error.code === 'LINK_REVOKED') {

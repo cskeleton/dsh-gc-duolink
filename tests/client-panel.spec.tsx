@@ -6,7 +6,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { SnapshotSelectorHook, TranslateNS } from '@deepseek-ai/dsh-client-ui-slots'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
 import { SessionLinkId, type SessionLinkSessionView, type SessionLinkView } from '../src/types.ts'
-import { HeaderAction, LinkTab, LinkMark, type LinkProps } from '../src/client/components.tsx'
+import {
+  HeaderAction, LinkTab, RowLinkAction, RowLinkMenu, ManagedLinkTab, panelOwner,
+  type LinkProps,
+} from '../src/client/components.tsx'
+import type { UseSidebarRightTabInfo } from '@deepseek-ai/dsh-client-ui-sidebar-right/client'
 import { createLinkSource, LinkBusyError, type LinkSource, type LinkSnapshot } from '../src/client/state.ts'
 import { en, type NS } from '../src/client/locales.ts'
 
@@ -40,15 +44,15 @@ function fixture(extraSessions: SessionLinkSessionView[] = []) {
   }
   const source = createLinkSource({ load: async () => view, subscribeReset: () => () => {} })
   sources.push(source)
-  const link = vi.fn(async (peerId: SessionId, autoWake: boolean) => {
+  const link = vi.fn(async (peerId: SessionId, autoWake: boolean, autoWakeCaller: boolean) => {
     view = { ...view, links: [...view.links, {
-      id: SessionLinkId('link-added'), name: 'Added', memberIds: [SELF, peerId], autoWakeSessionIds: autoWake ? [peerId] : [], revision: 1,
+      id: SessionLinkId('link-added'), name: 'Added', memberIds: [SELF, peerId], autoWakeSessionIds: [...(autoWake ? [peerId] : []), ...(autoWakeCaller ? [SELF] : [])], revision: 1,
     }] }
     await source.refresh()
   })
   const setWake = vi.fn(async (linkId: SessionLinkId, peerId: SessionId, on: boolean) => {
     view = { ...view, links: view.links.map(group => group.id !== linkId ? group : {
-      ...group, autoWakeSessionIds: on ? [peerId] : [], revision: group.revision + 1,
+      ...group, autoWakeSessionIds: on ? [...new Set([...group.autoWakeSessionIds, peerId])] : group.autoWakeSessionIds.filter(id => id !== peerId), revision: group.revision + 1,
     }) }
     await source.refresh()
   })
@@ -90,13 +94,15 @@ describe('link management panel', () => {
     render(<LinkTab {...f.props} />)
     await settle()
     fireEvent.click(screen.getByRole('button', { name: 'Link a session' }))
-    expect(screen.queryByRole('button', { name: /Archived|Subagent|Blank|Self|Peer/ })).toBeNull()
+    for (const title of ['Archived', 'Subagent', 'Blank', 'Self', 'Peer']) {
+      expect(screen.queryByRole('button', { name: title })).toBeNull()
+    }
     fireEvent.change(screen.getByRole('textbox', { name: 'Search title or ID' }), { target: { value: 'Candidate' } })
     fireEvent.click(screen.getByRole('button', { name: /Candidate/ }))
-    fireEvent.click(screen.getByRole('switch', { name: 'Auto wake' }))
+    fireEvent.click(screen.getByRole('switch', { name: 'My messages → wake peer' }))
     fireEvent.click(screen.getByRole('button', { name: 'Link', exact: true }))
     await settle()
-    expect(f.link).toHaveBeenCalledWith(CANDIDATE, false)
+    expect(f.link).toHaveBeenCalledWith(CANDIDATE, false, true)
     expect(screen.getByText('Added')).toBeTruthy()
     expect(screen.queryByRole('textbox')).toBeNull()
   })
@@ -105,10 +111,10 @@ describe('link management panel', () => {
     const f = fixture()
     render(<LinkTab {...f.props} />)
     await settle()
-    fireEvent.click(screen.getByRole('switch', { name: 'Auto wake · Peer' }))
+    fireEvent.click(screen.getByRole('switch', { name: 'My messages → wake peer · Peer' }))
     await settle()
     expect(f.setWake).toHaveBeenCalledWith(LINK, PEER, false)
-    expect(screen.getByRole('switch', { name: 'Auto wake · Peer' }).getAttribute('aria-checked')).toBe('false')
+    expect(screen.getByRole('switch', { name: 'My messages → wake peer · Peer' }).getAttribute('aria-checked')).toBe('false')
     fireEvent.click(screen.getByRole('button', { name: 'Unlink', exact: true }))
     expect(f.unlink).not.toHaveBeenCalled()
     fireEvent.click(screen.getByRole('button', { name: 'Confirm unlink' }))
@@ -123,13 +129,13 @@ describe('link management panel', () => {
     const setWake = vi.fn(() => pending.promise)
     render(<LinkTab {...f.props} setWake={setWake} />)
     await settle()
-    const toggle = screen.getByRole('switch', { name: 'Auto wake · Peer' })
+    const toggle = screen.getByRole('switch', { name: 'My messages → wake peer · Peer' })
     fireEvent.click(toggle)
     fireEvent.click(toggle)
     fireEvent.click(toggle)
     expect(setWake).toHaveBeenCalledOnce()
     await act(async () => { pending.resolve(); await pending.promise })
-    fireEvent.click(screen.getByRole('switch', { name: 'Auto wake · Peer' }))
+    fireEvent.click(screen.getByRole('switch', { name: 'My messages → wake peer · Peer' }))
     expect(setWake).toHaveBeenCalledTimes(2)
   })
 
@@ -162,31 +168,103 @@ describe('link management panel', () => {
   })
 })
 
-describe('header and idle row mark', () => {
-  it('opens the summary by focus and dismisses with Escape or outside click', async () => {
+describe('quick header and right-side row entry', () => {
+  const useSession = <Value,>(select: (state: { openState: string }) => Value): Value => select({ openState: 'open' })
+  it('opens only on click; dismisses with Escape or outside pointer and restores focus', async () => {
     const f = fixture()
-    const useSession = <Value,>(select: (state: { openState: string }) => Value): Value => select({ openState: 'open' })
     render(<HeaderAction {...f.props} useSession={useSession} />)
     await settle()
     const action = screen.getByRole('button', { name: '1 linked session(s)' })
     fireEvent.focus(action)
-    expect(screen.getByRole('group', { name: 'Session links' })).toBeTruthy()
-    fireEvent.keyDown(document, { key: 'Escape' })
-    expect(screen.queryByRole('group')).toBeNull()
     fireEvent.pointerEnter(action)
-    expect(screen.getByRole('group')).toBeTruthy()
-    fireEvent.pointerDown(document.body)
-    expect(screen.queryByRole('group')).toBeNull()
+    expect(screen.queryByRole('dialog')).toBeNull()
     fireEvent.click(action)
+    expect(screen.getByRole('dialog', { name: 'Quick link' })).toBeTruthy()
+    fireEvent.keyDown(document, { key: 'Escape' })
+    expect(screen.queryByRole('dialog')).toBeNull()
+    expect(document.activeElement).toBe(action)
+    fireEvent.click(action)
+    fireEvent.pointerDown(document.body)
+    expect(screen.queryByRole('dialog')).toBeNull()
+    fireEvent.click(action)
+    fireEvent.click(screen.getByRole('button', { name: 'Manage links' }))
     expect(f.props.openPanel).toHaveBeenCalledOnce()
+    expect(screen.queryByRole('dialog')).toBeNull()
   })
 
-  it('shares the authoritative wake value with a row mark', async () => {
+  it('requires explicit confirmation and sends independent default-on wake choices', async () => {
     const f = fixture()
-    render(<LinkMark sessionId={PEER} useLinks={f.props.useLinks} t={t} />)
+    render(<HeaderAction {...f.props} useSession={useSession} />)
     await settle()
-    expect(screen.getByTitle('Linked, auto wake on')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: '1 linked session(s)' }))
+    fireEvent.click(screen.getByRole('button', { name: /Candidate/ }))
+    expect(f.link).not.toHaveBeenCalled()
+    fireEvent.click(screen.getByRole('switch', { name: 'Peer messages → wake me' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Link', exact: true }))
+    await settle()
+    expect(f.link).toHaveBeenCalledWith(CANDIDATE, true, false)
+    expect(screen.queryByRole('dialog')).toBeNull()
+    expect(screen.getByRole('button', { name: '2 linked session(s)' })).toBeTruthy()
+  })
+
+  it('does not equate linked status with wake and manages the clicked row identity', async () => {
+    const f = fixture()
+    const openPanelFor = vi.fn()
+    render(<RowLinkAction sessionId={PEER} useLinks={f.props.useLinks} openPanelFor={openPanelFor} t={t} />)
+    await settle()
+    expect(screen.getByTitle('1 linked session(s) · Manage links')).toBeTruthy()
     await act(async () => { await f.setWake(LINK, PEER, false) })
-    expect(screen.getByTitle('Linked, auto wake off')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: '1 linked session(s) · Manage links' }))
+    expect(openPanelFor).toHaveBeenCalledWith(PEER)
+    expect(screen.getByRole('button').className).toContain('slp-row-linked')
+  })
+
+  it('offers an unlinked row and joins the formal menu with dismissal', async () => {
+    const f = fixture()
+    const openPanelFor = vi.fn()
+    const close = vi.fn()
+    render(<RowLinkMenu sessionId={CANDIDATE} useLinks={f.props.useLinks} openPanelFor={openPanelFor}
+      useMenuOpenState={() => [true, close]} t={t} />)
+    await settle()
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Session links…' }))
+    expect(openPanelFor).toHaveBeenCalledWith(CANDIDATE)
+    expect(close).toHaveBeenCalledWith(false)
+  })
+})
+
+describe('explicit management owner', () => {
+  it('binds wake operations to the row owner while the main session stays unchanged', async () => {
+    const f = fixture()
+    const peerWake = vi.fn(async () => {})
+    const useTabInfo = (() => ({ tab: { navigation: { params: { sessionId: PEER } } } })) as UseSidebarRightTabInfo
+    const actionsFor = vi.fn(() => ({ ...f.props, setWake: peerWake }))
+    render(<ManagedLinkTab {...f.props} useTabInfo={useTabInfo} actionsFor={actionsFor} />)
+    await settle()
+    expect(screen.getByText('Managing: Peer')).toBeTruthy()
+    fireEvent.click(screen.getByRole('switch', { name: 'Peer messages → wake me' }))
+    await settle()
+    expect(peerWake).toHaveBeenCalledWith(LINK, PEER, false)
+    expect(actionsFor).toHaveBeenCalledWith(PEER)
+    expect(f.setWake).not.toHaveBeenCalled()
+    expect(f.props.openSession).not.toHaveBeenCalled()
+  })
+
+  it('falls back for old parameterless tabs and rejects malformed owner params', () => {
+    for (const params of [undefined, null, {}, { sessionId: 7 }, { sessionId: '' }]) {
+      expect(panelOwner(SELF, params)).toBe(SELF)
+    }
+    expect(panelOwner(SELF, { sessionId: PEER })).toBe(PEER)
+  })
+
+  it('warns on disabled return wake and changes self without removing peer authorization', async () => {
+    const f = fixture()
+    render(<LinkTab {...f.props} />)
+    await settle()
+    expect(screen.getByText(/Return wake is off/)).toBeTruthy()
+    fireEvent.click(screen.getByRole('switch', { name: 'Peer messages → wake me' }))
+    await settle()
+    expect(f.setWake).toHaveBeenCalledWith(LINK, SELF, true)
+    expect(screen.queryByText(/Return wake is off/)).toBeNull()
+    expect(screen.getByRole('switch', { name: 'My messages → wake peer · Peer' }).getAttribute('aria-checked')).toBe('true')
   })
 })

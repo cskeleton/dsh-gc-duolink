@@ -7,7 +7,7 @@ import { sessionTitle } from './selectors.ts'
 import { selectLinkedSpawns, type SessionLinkTurnOwner } from './turn.ts'
 
 /** Settled spawned Sessions and the current wake flags read from the Host. */
-export function TurnCard({ turn, seq, useLinks, openPanel, t }: LinkProps & SessionLinkTurnOwner): ReactNode {
+export function TurnCard({ sessionId, turn, seq, useLinks, openPanel, t }: LinkProps & SessionLinkTurnOwner): ReactNode {
   const view = useLinks(snapshot => snapshot.view)
   const created = selectLinkedSpawns({ turn, seq })?.created ?? []
   if (created.length === 0) return null
@@ -16,7 +16,10 @@ export function TurnCard({ turn, seq, useLinks, openPanel, t }: LinkProps & Sess
     const wake = group === undefined ? null : group.autoWakeSessionIds.includes(spawn.sessionId)
     return <div key={spawn.callId} className="slp-card" data-session-link-created="">
       <LinkIcon /><span className="slp-card-title">{t('card.linked', { title: sessionTitle(view, spawn.sessionId) })}</span>
-      {wake === null ? null : <span className="slp-card-wake">{t(wake ? 'card.wake.on' : 'card.wake.off')}</span>}
+      {wake === null ? null : <>
+        <span className="slp-card-wake">{t(wake ? 'card.wake.on' : 'card.wake.off')}</span>
+        <span className="slp-card-wake">{t(group?.autoWakeSessionIds.includes(sessionId) ? 'card.wake.self.on' : 'card.wake.self.off')}</span>
+      </>}
       <button type="button" className="slp-text-button" onClick={openPanel}>{t('card.open')}</button>
     </div>
   })}</>

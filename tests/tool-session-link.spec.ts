@@ -251,8 +251,61 @@ describe('dsh-tool-session-link', () => {
     }, s.alice)).value as { messageId: string; status: string }
     expect(result.status).toBe('accepted')
     expect(s.bob.session.snapshotEvents().some(event => event.type === 'turn/start')).toBe(true)
-    expect(s.ctx.sessionLinks.list(s.alice.id)[0]!.autoWakeSessionIds).toContain(s.bob.id)
+    expect(s.ctx.sessionLinks.list(s.alice.id)[0]!.autoWakeSessionIds).toEqual([s.bob.id, s.alice.id])
     expect(mailOf(s, result.messageId)?.wakesUsed).toBe(1)
+    await s.bob.whenIdle()
+    const reply = succeeded(await call(s.ctx, 'session_send_session_message', {
+      session_id: s.alice.id, message: 'finished', in_reply_to: result.messageId,
+    }, s.bob)).value as { messageId: string; status: string }
+    expect(reply.status).toBe('accepted')
+    expect(mailOf(s, reply.messageId)?.wakesUsed).toBe(1)
+    expect(s.alice.session.snapshotEvents().some(event => event.type === 'turn/start')).toBe(true)
+  })
+
+  it.each([
+    [true, false, true, false],
+    [false, true, false, true],
+    [false, undefined, false, false],
+  ])('spawn supports independent auto_awake=%s wake_caller=%s', async (autoAwake, wakeCaller, peer, caller) => {
+    const s = await stack()
+    succeeded(await call(s.ctx, 'session_spawn_linked_session', {
+      cwd: '/tmp/tool-session-link-spawn-test', task: 'work', auto_awake: autoAwake,
+      ...(wakeCaller === undefined ? {} : { wake_caller: wakeCaller }),
+    }, s.alice))
+    expect(s.ctx.sessionLinks.list()[0]!.autoWakeSessionIds).toEqual([
+      ...(peer ? [s.bob.id] : []), ...(caller ? [s.alice.id] : []),
+    ])
+  })
+
+  it.each([
+    { name: 'caller opt-out', wakeCaller: false, limits: {} },
+    { name: 'reply-chain budget', wakeCaller: true, limits: { maxAutoWakesPerChain: 1 } },
+  ])('return messages stay queued under $name without waking the idle caller', async ({ wakeCaller, limits }) => {
+    const s = await stack({ links: limits })
+    const task = succeeded(await call(s.ctx, 'session_spawn_linked_session', {
+      cwd: '/tmp/tool-session-link-spawn-test', task: 'work', auto_awake: true, wake_caller: wakeCaller,
+    }, s.alice)).value as { messageId: string; status: string }
+    expect(task.status).toBe('accepted')
+    await s.bob.whenIdle()
+    const reply = succeeded(await call(s.ctx, 'session_send_session_message', {
+      session_id: s.alice.id, message: 'reply', in_reply_to: task.messageId,
+    }, s.bob)).value as { messageId: string; status: string }
+    expect(reply.status).toBe('queued')
+    expect(mailOf(s, reply.messageId)?.wakesUsed).toBe(0)
+    expect(s.alice.status).toBe('idle')
+    expect(s.alice.session.snapshotEvents().some(event => event.type === 'turn/start')).toBe(false)
+  })
+
+  it('spawn replay never widens an old group or restores a human-disabled return wake', async () => {
+    const s = await stack()
+    const args = { cwd: '/tmp/tool-session-link-spawn-test', task: 'work', auto_awake: true }
+    const first = succeeded(await call(s.ctx, 'session_spawn_linked_session', args, s.alice, 'return-replay')).value as { linkId: string }
+    await s.bob.whenIdle()
+    await s.ctx.sessionLinks.setMemberAutoWake(SessionLinkId(first.linkId), s.alice.id, false, s.alice.id)
+    const prior = s.ctx.sessionLinks.list()[0]
+    succeeded(await call(s.ctx, 'session_spawn_linked_session', { ...args, wake_caller: true }, s.alice, 'return-replay'))
+    expect(s.ctx.sessionLinks.list()[0]).toEqual(prior)
+    expect(s.creates).toHaveLength(1)
   })
 
   it('replaying a spawn call adopts its Session, group, and task instead of creating new ones', async () => {

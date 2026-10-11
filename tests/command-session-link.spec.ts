@@ -293,8 +293,8 @@ describe('dsh-command-session-link', () => {
 
   it('honors a configured preset list', async () => {
     const { ctx, agent } = await harness({
-      presets: { 'session-alice': 'minimal', 'session-bob': 'standard' },
-      config: { presets: ['minimal'] },
+      presets: { 'session-alice': 'custom', 'session-bob': 'standard' },
+      config: { presets: ['custom'] },
     })
     expect(await hasCommand(ctx, agent)).toBe(true)
     expect(await hasCommand(ctx, ctx.agents.get(SessionId('session-bob'))!)).toBe(false)

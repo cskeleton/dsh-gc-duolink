@@ -5,7 +5,7 @@ import { once } from 'node:events'
 import { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
-import { dirname, join, resolve } from 'node:path'
+import { basename, dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
 
@@ -18,7 +18,7 @@ const temp = await mkdtemp(join(tmpdir(), 'dsh-session-link-installed-'))
 const home = join(temp, 'home')
 const workspace = join(temp, 'workspace')
 const profile = 'session-link-smoke'
-const env = { ...process.env, DSH_HOME: home, DSH_TELEMETRY_DISABLED: '1' }
+const env = { ...process.env, DSH_HOME: home, DSH_TELEMETRY_DISABLED: '1', npm_config_cache: join(temp, 'npm-cache') }
 const artifactDir = resolve(process.env.SMOKE_ARTIFACT_DIR ?? join(pluginDir, 'output', 'playwright'))
 const alphaId = 'session-link-smoke-alpha'
 const betaId = 'session-link-smoke-beta'
@@ -29,6 +29,19 @@ let browser
 let page
 let output = ''
 const failures = []
+
+/** Refuse cleanup outside the exact isolated home or named generated artifacts. */
+async function removeGenerated(path, options) {
+  const target = resolve(path)
+  if (target === resolve(temp)) {
+    assert.equal(await realpath(dirname(target)), await realpath(tmpdir()))
+    assert.ok(basename(target).startsWith('dsh-session-link-installed-'))
+  } else {
+    assert.equal(dirname(target), artifactDir)
+    assert.ok(['installed-smoke-result.json', 'installed-session-link-failure.png'].includes(basename(target)))
+  }
+  await rm(target, options)
+}
 
 function sanitized(text) {
   return text.replace(/https?:\/\/[^\s)]+/g, '[URL]').replace(/\u001b\[[0-9;]*m/g, '')
@@ -75,6 +88,7 @@ async function seedSessions() {
           { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } },
         ].map((event, seq) => ({ ...event, seq, time: at + seq }))
         await handle.append(events)
+        if (id === betaId) betaReadThroughSeq = events.at(-1).seq
       } finally {
         await handle.close()
       }
@@ -167,10 +181,10 @@ async function selectSession(title) {
 try {
   await mkdir(workspace, { recursive: true })
   await mkdir(artifactDir, { recursive: true })
-  await rm(join(artifactDir, 'installed-smoke-result.json'), { force: true })
+  await removeGenerated(join(artifactDir, 'installed-smoke-result.json'), { force: true })
   const { stdout: version } = await command(['--version'])
   await command(['--profile', profile, '--from-default-profile', 'web', '--dump-config'])
-  const { stdout: packed } = await runFile('npm', ['pack', '--json', '--pack-destination', temp], { cwd: pluginDir, timeout: 60_000 })
+  const { stdout: packed } = await runFile('npm', ['pack', '--json', '--pack-destination', temp], { cwd: pluginDir, env, timeout: 60_000 })
   const packageTarball = join(temp, JSON.parse(packed)[0].filename)
   await command(['plugin', '--profile', profile, 'add', '--ignore-scripts', '--config.auto-install-peers=false', packageTarball])
   const profileDir = join(home, 'profiles', profile)
@@ -256,7 +270,7 @@ try {
   assert.deepEqual(failures, [], 'plugin-free browser emitted no unhandled JavaScript errors')
   const summary = JSON.stringify({ result: 'PASS', dshVersion: version.trim(), installation: 'packed tarball', modelCalls: 0, toolsScopedToListedPresets: true, explicitSessionIdAdopted: true, invalidPluginConfigCoreUsable: true, pluginAbsentSessionsReadable: true, artifactDir })
   await writeFile(join(artifactDir, 'installed-smoke-result.json'), `${summary}\n`)
-  await rm(join(artifactDir, 'installed-session-link-failure.png'), { force: true })
+  await removeGenerated(join(artifactDir, 'installed-session-link-failure.png'), { force: true })
   console.log(summary)
 } catch (error) {
   if (page !== undefined) {
@@ -270,7 +284,7 @@ try {
 } finally {
   await browser?.close()
   await stopServer()
-  await rm(temp, { recursive: true, force: true })
+  await removeGenerated(temp, { recursive: true, force: true })
 }
 
 async function runScenario({ page, rpc, requireRpc, eventually, selectSession, alphaId, betaId, artifactDir }) {
@@ -284,24 +298,48 @@ async function runScenario({ page, rpc, requireRpc, eventually, selectSession, a
   const header = page.locator('[data-session-link-action]')
   await header.waitFor({ timeout: 15_000 })
   await header.click()
-  const panel = page.locator('[data-session-link-panel]')
-  await panel.waitFor({ timeout: 15_000 })
-  await panel.getByRole('button', { name: 'Link a session', exact: true }).click()
-  await panel.getByRole('textbox', { name: 'Search title or ID' }).fill('Link beta')
-  await panel.getByRole('button', { name: /Link beta/ }).click()
-  const initialWake = panel.getByRole('switch', { name: 'Auto wake', exact: true })
+  const quick = page.getByRole('dialog', { name: 'Quick link', exact: true })
+  await quick.waitFor({ timeout: 15_000 })
+  await quick.getByRole('textbox', { name: 'Search title or ID' }).fill('Link beta')
+  await quick.getByRole('button', { name: /Link beta/ }).click()
+  assert.equal((await requireRpc('sessionLinks/view')).links.length, 0, 'selecting a candidate is not confirmation')
+  const initialWake = quick.getByRole('switch', { name: 'My messages → wake peer', exact: true })
   assert.equal(await initialWake.getAttribute('aria-checked'), 'true', 'new peer wake default is explicit')
+  assert.equal(await quick.getByRole('switch', { name: 'Peer messages → wake me', exact: true }).getAttribute('aria-checked'), 'true')
   await initialWake.click()
-  await panel.getByRole('button', { name: 'Link', exact: true }).click()
+  await quick.getByRole('button', { name: 'Link', exact: true }).click()
   let link
   await eventually(async () => {
     const view = await requireRpc('sessionLinks/view')
     link = view.links.find(group => group.memberIds.includes(alphaId) && group.memberIds.includes(betaId))
     return link !== undefined
   }, 'UI add writes one durable link')
-  assert.deepEqual(link.autoWakeSessionIds, [], 'unchecked wake is stored')
-  await eventually(async () => await page.locator('[data-session-link-mark]').count() === 2, 'both linked sidebar rows acquire marks')
-  const peerWake = panel.getByRole('switch', { name: 'Auto wake · Link beta', exact: true })
+  assert.deepEqual(link.autoWakeSessionIds, [alphaId], 'unchecked peer wake preserves independently checked caller wake')
+  await eventually(async () => await quick.count() === 0, 'successful quick link dismisses the picker')
+  await eventually(async () => await page.locator('[data-session-link-row-action].slp-row-linked').count() === 2, 'both linked sidebar right actions show membership')
+  assert.equal(await page.locator('[data-session-link-mark]').count(), 0, 'plugin does not decorate the left execution dot')
+  // Rename above materializes Host title/workspace projections and attaches beta.
+  // Compare the existing Agent baseline; this is not evidence of cold resume.
+  await eventually(async () => output.includes(`SESSION_LINK_AGENT ${betaId} `), 'seeded beta projection is materialized')
+  const beforeAgents = (output.match(/SESSION_LINK_AGENT /g) ?? []).length
+  // Manage beta from the list without switching the foreground conversation.
+  const betaRow = page.getByRole('treeitem').filter({ hasText: 'Link beta' }).last()
+  await betaRow.hover()
+  await betaRow.locator('[data-session-link-row-action]').click()
+  const panel = page.locator('[data-session-link-panel]')
+  await panel.waitFor({ timeout: 15_000 })
+  assert.equal(await panel.getAttribute('data-session-link-owner'), betaId)
+  assert.ok(await page.getByText('Link alpha.', { exact: true }).isVisible(), 'row management leaves the conversation on alpha')
+  await panel.getByRole('switch', { name: 'Peer messages → wake me', exact: true }).click()
+  await eventually(async () => (await requireRpc('sessionLinks/view')).links[0]?.autoWakeSessionIds.includes(betaId), 'row-owner mutation grants beta, not the mounted alpha')
+  assert.equal((output.match(/SESSION_LINK_AGENT /g) ?? []).length, beforeAgents, 'row management creates no additional Agents')
+  const alphaRow = page.getByRole('treeitem').filter({ hasText: 'Link alpha' }).last()
+  await alphaRow.hover()
+  await alphaRow.locator('[data-session-link-row-action]').click()
+  await eventually(async () => await panel.getAttribute('data-session-link-owner') === alphaId, 'row params update an existing management tab')
+  const peerWake = panel.getByRole('switch', { name: 'My messages → wake peer · Link beta', exact: true })
+  await peerWake.click()
+  await eventually(async () => await peerWake.getAttribute('aria-checked') === 'false', 'independent peer toggle off')
   await peerWake.click()
   await eventually(async () => (await requireRpc('sessionLinks/view')).links.find(group => group.id === link.id)?.autoWakeSessionIds.includes(betaId), 'UI wake writes the peer flag')
   await requireRpc('sessionLinks/setAutoWakeFrom', { callerId: alphaId, linkId: link.id, peerId: betaId, on: false })
@@ -339,12 +377,13 @@ async function runScenario({ page, rpc, requireRpc, eventually, selectSession, a
   await page.reload({ waitUntil: 'load' })
   await selectSession('Link alpha')
   await page.locator('[data-session-link-action]').click()
+  await page.getByRole('dialog', { name: 'Quick link', exact: true }).getByRole('button', { name: 'Manage links', exact: true }).click()
   await panel.waitFor({ timeout: 15_000 })
   assert.ok((await panel.textContent()).includes('Link beta'), 'link survives browser reload')
   await panel.getByRole('button', { name: 'Unlink', exact: true }).click()
   await panel.getByRole('button', { name: 'Confirm unlink', exact: true }).click()
   await eventually(async () => (await requireRpc('sessionLinks/view')).links.length === 0, 'UI revoke removes the durable group')
-  await eventually(async () => await page.locator('[data-session-link-mark]').count() === 0, 'revoke clears both row marks')
+  await eventually(async () => await page.locator('[data-session-link-row-action].slp-row-linked').count() === 0, 'revoke clears membership color without removing quick-link actions')
   const selfLink = await rpc('sessionLinks/linkFrom', { callerId: alphaId, peerId: alphaId, autoWake: false })
   assert.equal(selfLink.ok, false, 'the Host rejects a self link over the real wire')
 }

@@ -47,7 +47,7 @@ import type {
 
 const wireSessionId = wire.string().min(1).transform(value => brandString<SessionId>(value))
 const wireLinkId = wire.string().min(1).transform(value => SessionLinkId(value))
-const addRequestSchema = wire.strictObject({ callerId: wireSessionId, peerId: wireSessionId, autoWake: wire.boolean() })
+const addRequestSchema = wire.strictObject({ callerId: wireSessionId, peerId: wireSessionId, autoWake: wire.boolean(), autoWakeCaller: wire.boolean().optional() })
 const revokeRequestSchema = wire.strictObject({ callerId: wireSessionId, linkId: wireLinkId })
 const wakeRequestSchema = wire.strictObject({ callerId: wireSessionId, linkId: wireLinkId, peerId: wireSessionId, on: wire.boolean() })
 
@@ -490,7 +490,13 @@ export class SessionLinkService extends TypertRemoteService {
       `互联-${tail}`,
       [request.callerId, request.peerId],
       { kind: 'human' },
-      { autoWakeSessionIds: request.autoWake ? [request.peerId] : [], requireNewPair: true },
+      {
+        autoWakeSessionIds: [
+          ...(request.autoWake ? [request.peerId] : []),
+          ...(request.autoWakeCaller === true ? [request.callerId] : []),
+        ],
+        requireNewPair: true,
+      },
     )
     return { linkId: id }
   }
@@ -531,16 +537,13 @@ export class SessionLinkService extends TypertRemoteService {
   }
 
   /**
-   * Remote: toggle one peer's auto-wake flag inside one group the caller's
-   * Session belongs to, without touching the other members' flags.
-   * @param request - caller Session, group, peer member, and the new flag.
+   * Human Remote: toggle one member's auto-wake flag inside one group the
+   * caller belongs to, including the caller itself, without touching other flags.
+   * @param request - caller Session, group, member (legacy peerId field), and new flag.
    */
   @Remote('setAutoWakeFrom')
   async setAutoWakeFrom(request: SessionLinkWakeRequest): Promise<void> {
     request = wakeRequestSchema.parse(request)
-    if (request.peerId === request.callerId) {
-      throw new SessionLinkError('auto-wake 只针对互联的对方会话设置', 'LINK_SELF')
-    }
     await this.setMemberAutoWake(request.linkId, request.peerId, request.on, request.callerId)
   }
 
@@ -595,6 +598,7 @@ export class SessionLinkService extends TypertRemoteService {
    * @param callKey - the spawn call's identity.
    * @param name - group name for a newly granted group.
    * @param autoWake - whether later messages may wake the spawned Session.
+   * @param wakeCaller - whether peer replies may wake the caller; defaults false for direct-call compatibility.
    * @returns the call's group.
    */
   async claimSpawnLink(
@@ -603,15 +607,20 @@ export class SessionLinkService extends TypertRemoteService {
     callKey: string,
     name: string,
     autoWake: boolean,
+    wakeCaller = false,
   ): Promise<SessionLinkId> {
     return await this.chain(async () => {
       if (this.disposed) throw new SessionLinkError('Session Link service is disposing', 'DISPOSED')
       const key = `${callerId}:${callKey}`
-      const grant = (linkId: SessionLinkId, recordedSession: SessionId) => this.linkNow(
+      const initialWakes = [...(autoWake ? [sessionId] : []), ...(wakeCaller ? [callerId] : [])]
+      const grant = (linkId: SessionLinkId, recordedSession: SessionId, autoWakeSessionIds: readonly SessionId[]) => this.linkNow(
         name,
         [callerId, recordedSession],
         { kind: 'session', sessionId: callerId },
-        { autoWakeSessionIds: autoWake ? [recordedSession] : [], createAs: linkId },
+        {
+          autoWakeSessionIds,
+          createAs: linkId,
+        },
       )
       const recorded = this.readLedgers().spawns[key]
       if (recorded !== undefined) {
@@ -622,7 +631,8 @@ export class SessionLinkService extends TypertRemoteService {
           )
         }
         // An intent committed before a failed group write completes under its recorded id.
-        if (this.links.get(recorded.linkId) === undefined) await grant(recorded.linkId, recorded.sessionId)
+        // Legacy intents did not record grants: conservatively recover with none.
+        if (this.links.get(recorded.linkId) === undefined) await grant(recorded.linkId, recorded.sessionId, recorded.autoWakeSessionIds ?? [])
         return recorded.linkId
       }
       const ledger = this.readLedgers()
@@ -632,9 +642,9 @@ export class SessionLinkService extends TypertRemoteService {
       // The call record commits first; the group follows under the recorded id.
       await this.writeLedgers({
         ...ledger,
-        spawns: { ...ledger.spawns, [key]: { sessionId, linkId, ...(earlier === undefined ? { intent: true } : {}) } },
+        spawns: { ...ledger.spawns, [key]: { sessionId, linkId, ...(earlier === undefined ? { intent: true, autoWakeSessionIds: initialWakes } : {}) } },
       })
-      if (earlier === undefined) await grant(linkId, sessionId)
+      if (earlier === undefined) await grant(linkId, sessionId, initialWakes)
       return linkId
     })
   }

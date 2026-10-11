@@ -4,6 +4,7 @@ artifacts/
 tsconfig.sdk.json
 tsconfig.build.json
 output/
+prototypes/*-preview.png
 .DS_Store
 .env
 .env.*

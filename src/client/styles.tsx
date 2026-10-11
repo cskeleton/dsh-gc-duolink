@@ -15,7 +15,19 @@ const CSS = `
 .slp-notice{display:flex;flex-wrap:wrap;align-items:center;gap:6px;padding:6px 8px;font-size:12px;line-height:18px;color:var(--dsw-alias-state-error-primary);overflow-wrap:anywhere}
 .slp-group{border:1px solid var(--dsw-alias-border-l1);border-radius:12px;overflow:hidden}
 .slp-group-header{display:flex;align-items:center;gap:6px;padding:8px 10px;color:var(--dsw-alias-label-secondary);font-size:12px;font-weight:500;background:var(--dsw-alias-bg-layer-2)}
-.slp-peer{display:flex;align-items:center;gap:8px;min-width:0;padding:8px 10px;border-top:1px solid var(--dsw-alias-border-l1)}
+.slp-peer{display:flex;flex-direction:column;gap:8px;min-width:0;padding:10px;border-top:1px solid var(--dsw-alias-border-l1)}
+.slp-peer-heading{display:flex;align-items:center;justify-content:space-between;gap:8px;min-width:0}
+.slp-linked{flex:none;color:var(--dsw-alias-brand-primary);font-size:11px}
+.slp-wake-setting{display:flex;align-items:center;gap:8px;min-width:0;padding:8px 0}
+.slp-wake-copy{display:flex;flex:1;flex-direction:column;gap:4px;min-width:0;font-size:12px;overflow-wrap:anywhere}
+.slp-wake-copy .slp-peer-meta{white-space:normal}
+.slp-group-self{padding:0 10px 8px;border-top:1px solid var(--dsw-alias-border-l1)}
+.slp-picker{display:flex;flex-direction:column;gap:8px;margin-top:8px}
+.slp-row-action{display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;padding:4px;border:0;border-radius:4px;background:transparent;color:var(--dsw-alias-label-tertiary);cursor:pointer}
+.slp-row-action.slp-row-linked{color:var(--dsw-alias-brand-primary)}
+.slp-row-action:hover,.slp-menu-item:hover{background:var(--dsw-alias-interactive-bg-hover)}
+.slp-row-action:focus-visible,.slp-menu-item:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:2px}
+.slp-menu-item{display:flex;align-items:center;gap:8px;width:100%;padding:8px 12px;border:0;border-radius:6px;background:transparent;color:var(--dsw-alias-label-primary);font:inherit;text-align:left;cursor:pointer}
 .slp-popover .slp-peer:first-of-type{border-top:0}
 .slp-dot{flex:none;display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--dsw-alias-state-idle-primary)}
 .slp-dot-on{background:var(--dsw-alias-state-success-primary)}

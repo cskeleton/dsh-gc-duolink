@@ -108,7 +108,7 @@
     "test": "pnpm run test:client && pnpm run test:contracts",
     "test:integration": "node tests/integration/installed-smoke.mjs",
     "test:contracts": "node --test tests/built-contract.test.mjs",
-    "test:client": "vitest run tests/client",
+    "test:client": "vitest run tests/client tests/scope.spec.ts",
     "test:host": "node scripts/test-host.mjs"
   },
   "packageManager": "pnpm@10.33.2"

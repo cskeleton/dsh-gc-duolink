@@ -152,6 +152,8 @@ export interface SessionLinkAddRequest {
   readonly peerId: SessionId
   /** Whether admitted messages may wake the peer automatically. */
   readonly autoWake: boolean
+  /** Whether replies may wake the caller; omitted preserves the legacy false default. */
+  readonly autoWakeCaller?: boolean
 }
 
 /** Result of one accepted `sessionLinks/linkFrom` Remote call. */
@@ -165,11 +167,11 @@ export interface SessionLinkRevokeRequest {
   readonly linkId: SessionLinkId
 }
 
-/** Request accepted by the `sessionLinks/setAutoWakeFrom` Remote: toggle one peer's auto-wake in one group. */
+/** Request accepted by the `sessionLinks/setAutoWakeFrom` Remote: toggle one member's auto-wake in one group. */
 export interface SessionLinkWakeRequest {
   readonly callerId: SessionId
   readonly linkId: SessionLinkId
-  /** Member whose auto-wake flag flips; must differ from the caller. */
+  /** Member whose auto-wake flag flips; may be the caller itself for human RPC requests. */
   readonly peerId: SessionId
   readonly on: boolean
 }

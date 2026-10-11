@@ -17,6 +17,15 @@ The existing checkout and live profiles remain intact. Keep storage domain `sess
 
 5. (0.3.0) Mount tools and the command per preset into top-level Agent scopes through a child plugin under `agent.ctx`, following `agent-preset/selected` and row unload. Give the spawn tool's initial task one budgeted wake, link before rename and delivery, validate the calling Session, reject duplicate pairs inside the admission chain, and gate repeated UI writes.
 
+## Approved UI / wake update (0.4.1 workspace)
+
+- Omitted `presets` selects standard/ptc/cordis plus public registry `defaultId` (effective selectedDefault fallback); explicit lists, including empty, remain exact. Always exclude minimal and child-owned Agents. Clear Schemastery's implicit array default to preserve omission. Re-evaluate on existing Agent/preset lifecycle events, without inventing a default-change event.
+- Remove the leading mark entirely. Register right-side hover action and formal `…` menu through workspace slots. Store the managed row's Session id in typed sidebar-right navigation params; bind mutations to that id, not the visible conversation. No DOM interception or Host modification.
+- Reuse one searchable, explicit-confirmation picker in the header and panel. Show separate visible wake directions and budget cost; membership and execution state are independent. Multi-member groups use receiving-member terminology.
+- New spawn `wake_caller` defaults to `auto_awake`; explicit false opts out. Human link requests have optional `autoWakeCaller` (omission preserves legacy false); human wake RPC can edit the caller's own receiving flag. Existing groups and human-disabled flags never change on replay.
+- Persist the original new spawn intent's optional `autoWakeSessionIds` before its group write. Recovery uses these original grants, not replay arguments. Legacy incomplete intents recover with no later-wake grants; the existing owed-first-task wake remains. Storage version stays 1.
+- Host tests cover return wake with the real ToolRuntime/mock model and storage-failure replay; browser smoke uses a packed artifact, isolated profile/npm cache, and non-foreground peer row management. The browser fixture's rename materializes Host projections and attaches its peer; cold-catalog non-activation is covered by host regression, not inferred from that browser fixture. No live profile or model call is required.
+
 ## Acceptance
 
 - Official DSH runs the plugin without the fork's session-link packages or generated metadata.

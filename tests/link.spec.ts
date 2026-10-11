@@ -461,6 +461,25 @@ describe('dsh-session-link', () => {
     expect(s.links.list()).toEqual([])
   })
 
+  it('grants caller return wake only when requested and never changes a replayed group', async () => {
+    const s = await stack()
+    const linkId = await s.links.claimSpawnLink(s.alice.id, s.bob.id, 'call-wakes', 'spawned', true, true)
+    expect(s.links.list()[0]!.autoWakeSessionIds).toEqual([s.bob.id, s.alice.id])
+    await s.links.setMemberAutoWake(linkId, s.alice.id, false, s.alice.id)
+    const original = s.links.list()[0]
+    expect(await s.links.claimSpawnLink(s.alice.id, s.bob.id, 'call-wakes', 'changed', true, true)).toBe(linkId)
+    expect(s.links.list()[0]).toEqual(original)
+  })
+
+  it('direct callers retain the legacy one-way default and replay cannot add return wake', async () => {
+    const s = await stack()
+    const id = await s.links.claimSpawnLink(s.alice.id, s.bob.id, 'legacy-default', 'spawned', true)
+    expect(s.links.list()[0]!.autoWakeSessionIds).toEqual([s.bob.id])
+    await s.links.claimSpawnLink(s.alice.id, s.bob.id, 'legacy-default', 'spawned', true, true)
+    expect(s.links.list()[0]!.id).toBe(id)
+    expect(s.links.list()[0]!.autoWakeSessionIds).toEqual([s.bob.id])
+  })
+
   it('reads ledger rows written before the spawn ledger existed', () => {
     // Storage parses every stored row through this schema; a 0.3.0/0.3.1 row has no `spawns`.
     const legacy = sessionLinkLedgersSchema.parse({ idempotency: { 'session-alice:k': 'm' }, wakes: {} })
@@ -499,6 +518,35 @@ describe('dsh-session-link', () => {
       const linkId = await restarted.links.claimSpawnLink(restarted.alice.id, restarted.bob.id, 'call-b', 'spawned', false)
       expect(linkId).toBe(recorded!.linkId)
       expect(restarted.links.list().map(link => link.id)).toEqual([linkId])
+    })
+
+    it.each([[false, false], [true, false], [false, true], [true, true]])(
+      'failed group write preserves the original peer=%s caller=%s grants across restart and changed arguments',
+      async (peer, caller) => {
+        const pool = new MemoryMediaPool()
+        const s = await stack(undefined, pool)
+        pool.failWritesTo('links', 1)
+        await expect(s.links.claimSpawnLink(s.alice.id, s.bob.id, 'call-grants', 'spawned', peer, caller)).rejects.toThrow('injected')
+        await s.disposeLinks()
+        const restarted = await stack(undefined, pool)
+        await restarted.links.claimSpawnLink(restarted.alice.id, restarted.bob.id, 'call-grants', 'changed', !peer, !caller)
+        expect(restarted.links.list()[0]!.autoWakeSessionIds).toEqual([
+          ...(peer ? [restarted.bob.id] : []), ...(caller ? [restarted.alice.id] : []),
+        ])
+      },
+    )
+
+    it('legacy incomplete intent recovers conservatively without grants from new args', async () => {
+      const s = await stack()
+      await s.links['ledgers'].put(SESSION_LINK_LEDGER_KEY, {
+        idempotency: {}, wakes: {}, spawns: {
+          'session-alice:legacy-intent': { sessionId: s.bob.id, linkId: SessionLinkId('old-intent'), intent: true },
+        },
+      })
+      await s.links.claimSpawnLink(s.alice.id, s.bob.id, 'legacy-intent', 'old', true, true)
+      expect(s.links.list()[0]!.autoWakeSessionIds).toEqual([])
+      const task = await s.links.send(s.alice, s.bob.id, { targetId: s.bob.id, text: 'initial work' })
+      expect(task.status).toBe('accepted')
     })
 
     it('an unlink whose removal mark fails keeps the group; one whose delete fails still blocks replay', async () => {

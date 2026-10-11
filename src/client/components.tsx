@@ -1,11 +1,12 @@
 /** Self-contained controls for the plugin's allocated Harness slots. */
 import {
-  useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState,
+  useEffect, useId, useLayoutEffect, useMemo, useRef, useState,
   type CSSProperties, type ReactNode,
 } from 'react'
 import { createPortal } from 'react-dom'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
 import type { HostObservable, InjectFace, SnapshotSelectorHook, TranslateNS } from '@deepseek-ai/dsh-client-ui-slots'
+import type { UseSidebarRightTabInfo } from '@deepseek-ai/dsh-client-ui-sidebar-right/client'
 import type { SessionLinkId } from '../types.ts'
 import { LinkBusyError, type LinkSnapshot } from './state.ts'
 import { linkCandidates, peerRows, sessionTitle, type PeerRow } from './selectors.ts'
@@ -16,49 +17,44 @@ import { Styles } from './styles.tsx'
 export interface LinkInjected {
   readonly hooks: { readonly links: HostObservable<LinkSnapshot> }
   readonly refresh: () => Promise<boolean>
-  readonly link: (peerId: SessionId, autoWake: boolean) => Promise<void>
-  readonly setWake: (linkId: SessionLinkId, peerId: SessionId, on: boolean) => Promise<void>
+  readonly link: (peerId: SessionId, autoWake: boolean, autoWakeCaller: boolean) => Promise<void>
+  readonly setWake: (linkId: SessionLinkId, memberId: SessionId, on: boolean) => Promise<void>
   readonly unlink: (linkId: SessionLinkId) => Promise<void>
   readonly openPanel: () => void
   readonly openSession: (sessionId: SessionId) => void
 }
-
-/** Component inputs produced by the slot renderer's observable adapter. */
 export type LinkProps = InjectFace<LinkInjected> & {
   readonly sessionId: SessionId
   readonly t: TranslateNS<typeof NS>
 }
+export type LinkActions = Pick<LinkInjected, 'link' | 'setWake' | 'unlink' | 'openPanel' | 'openSession'>
 
 /** Local link icon, using only the current text color. */
 export function LinkIcon({ size = 16 }: { readonly size?: number }): ReactNode {
-  return (
-    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" aria-hidden="true">
-      <path d="m10 14 4-4M8.5 15.5 6 18a4.25 4.25 0 0 1-6-6l4-4a4.25 4.25 0 0 1 6 0m5.5.5L18 6a4.25 4.25 0 0 1 6 6l-4 4a4.25 4.25 0 0 1-6 0" transform="translate(1.5 0) scale(.875)" />
-    </svg>
-  )
+  return <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" aria-hidden="true">
+    <path d="M10 13a5 5 0 0 0 7 .5l3-3a5 5 0 0 0-7-7l-2 2M14 11a5 5 0 0 0-7-.5l-3 3a5 5 0 0 0 7 7l2-2" />
+  </svg>
 }
 
-/** Accessible switch with the Host's token colors and keyboard semantics. */
-function WakeSwitch({ checked, disabled, onChange, label, title }: {
+/** Visible direction, state, explanation, and keyboard-operable switch. */
+function WakeSetting({ checked, disabled, onChange, label, hint, t }: {
   readonly checked: boolean
   readonly disabled: boolean
   readonly onChange: (checked: boolean) => void
   readonly label: string
-  readonly title: string
+  readonly hint: string
+  readonly t: LinkProps['t']
 }): ReactNode {
-  return (
-    <button type="button" role="switch" aria-checked={checked} aria-label={label} title={title}
+  return <div className="slp-wake-setting">
+    <div className="slp-wake-copy"><span>{label}</span><span className="slp-peer-meta">{hint}</span></div>
+    <span className="slp-peer-meta">{t(checked ? 'wake.on' : 'wake.off')}</span>
+    <button type="button" role="switch" aria-checked={checked} aria-label={label} title={hint}
       className={`slp-switch${checked ? ' slp-switch-on' : ''}`} disabled={disabled}
-      onClick={() => { onChange(!checked) }}>
-      <span className="slp-switch-thumb" />
-    </button>
-  )
+      onClick={() => { onChange(!checked) }}><span className="slp-switch-thumb" /></button>
+  </div>
 }
 
-/**
- * Run one write at a time; a click during a pending write is ignored. A
- * completed operation never repaints another Session or an unmounted entry.
- */
+/** A pending write cannot repaint another Session or an unmounted entry. */
 function useOperation(sessionId: SessionId) {
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -71,7 +67,6 @@ function useOperation(sessionId: SessionId) {
   }, [])
   useEffect(() => { setBusy(false); setError(null); current.current.epoch++ }, [sessionId])
   const run = async (action: () => Promise<void>): Promise<boolean> => {
-    // A ref, not `busy`: two clicks in one frame both read the same stale state.
     if (inflight.current) return false
     inflight.current = true
     const token = ++current.current.epoch
@@ -95,79 +90,102 @@ function useOperation(sessionId: SessionId) {
   return { busy, error, run }
 }
 
-/** Query failures stay beside retained content; an unresolved read has one state. */
 function QueryState({ snapshot, refresh, t }: {
   readonly snapshot: LinkSnapshot
   readonly refresh: () => Promise<boolean>
-  readonly t: TranslateNS<typeof NS>
+  readonly t: LinkProps['t']
 }): ReactNode {
-  if (snapshot.status === 'error') {
-    return (
-      <div role="alert" className="slp-notice">
-        <span>{t('panel.error')}{snapshot.error ? `: ${snapshot.error}` : ''}</span>
-        <button type="button" className="slp-text-button" onClick={() => { void refresh() }}>{t('panel.retry')}</button>
-      </div>
-    )
-  }
+  if (snapshot.status === 'error') return <div role="alert" className="slp-notice">
+    <span>{t('panel.error')}{snapshot.error ? `: ${snapshot.error}` : ''}</span>
+    <button type="button" className="slp-text-button" onClick={() => { void refresh() }}>{t('panel.retry')}</button>
+  </div>
   return snapshot.view === undefined ? <div className="slp-state" role="status">{t('panel.loading')}</div> : null
 }
 
-/** A peer row shared by the hover summary and full panel. */
-function Peer({ row, snapshot, busy, setWake, openSession, compact, t }: {
+/** One creation form used in the header and management pane. */
+function LinkPicker({ sessionId, snapshot, link, t, onLinked, autoFocus = false }: {
+  readonly sessionId: SessionId
+  readonly snapshot: LinkSnapshot
+  readonly link: LinkInjected['link']
+  readonly t: LinkProps['t']
+  readonly onLinked: () => void
+  readonly autoFocus?: boolean
+}): ReactNode {
+  const [query, setQuery] = useState('')
+  const [selected, setSelected] = useState<SessionId | null>(null)
+  const [autoWake, setAutoWake] = useState(true)
+  const [autoWakeCaller, setAutoWakeCaller] = useState(true)
+  const { busy, error, run } = useOperation(sessionId)
+  const candidates = useMemo(() => snapshot.view === undefined ? [] : linkCandidates(snapshot.view, sessionId), [snapshot.view, sessionId])
+  const filtered = candidates.filter(candidate => `${candidate.title} ${candidate.id}`.toLowerCase().includes(query.trim().toLowerCase()))
+  const self = snapshot.view?.sessions.find(session => session.id === sessionId)
+  const disabled = busy || snapshot.status !== 'ready' || self === undefined || !self.ordinary || self.archived
+  // Never send a candidate that disappeared after a poll or a change of query.
+  const chosen = selected !== null && filtered.some(candidate => candidate.id === selected)
+  useEffect(() => { setQuery(''); setSelected(null); setAutoWake(true); setAutoWakeCaller(true) }, [sessionId])
+  return <div className="slp-picker" aria-busy={busy}>
+    <input className="slp-input" value={query} placeholder={t('add.search')} aria-label={t('add.search')}
+      autoFocus={autoFocus} disabled={busy} onChange={event => { setQuery(event.target.value); setSelected(null) }} />
+    <div className="slp-candidates">
+      {filtered.length === 0 ? <div className="slp-state">{t('add.empty')}</div> : filtered.map(candidate => (
+        <button key={candidate.id} type="button" aria-pressed={selected === candidate.id} disabled={disabled}
+          className={`slp-candidate${selected === candidate.id ? ' slp-candidate-selected' : ''}`}
+          onClick={() => { setSelected(candidate.id) }}>
+          <span className="slp-peer-title">{candidate.title}</span><span className="slp-peer-meta">{String(candidate.id).replace(/^session-/, '').slice(0, 8)}</span>
+        </button>
+      ))}
+    </div>
+    <WakeSetting checked={autoWake} disabled={disabled} onChange={setAutoWake} label={t('add.wake')} hint={t('add.wake.hint')} t={t} />
+    <WakeSetting checked={autoWakeCaller} disabled={disabled} onChange={setAutoWakeCaller} label={t('add.wake.self')} hint={t('add.wake.self.hint')} t={t} />
+    <p className="slp-footnote">{t('wake.budget.hint')}</p>
+    {error === null ? null : <div role="alert" className="slp-notice">{error}</div>}
+    <button type="button" className="slp-button slp-add-submit" disabled={!chosen || disabled} onClick={() => {
+      if (!chosen || selected === null) return
+      void run(() => link(selected, autoWake, autoWakeCaller)).then(ok => { if (ok) onLinked() })
+    }}>{t('add.action')}</button>
+  </div>
+}
+
+function Peer({ row, snapshot, busy, setWake, openSession, t }: {
   readonly row: PeerRow
   readonly snapshot: LinkSnapshot
   readonly busy: boolean
   readonly setWake: (on: boolean) => void
-  readonly openSession: (sessionId: SessionId) => void
-  readonly compact?: boolean
-  readonly t: TranslateNS<typeof NS>
+  readonly openSession: LinkInjected['openSession']
+  readonly t: LinkProps['t']
 }): ReactNode {
   const session = snapshot.view?.sessions.find(item => item.id === row.peerId)
   const title = sessionTitle(snapshot.view, row.peerId)
   const status = session?.archived ? t('peer.archived') : t(session?.running ? 'peer.running' : 'peer.idle')
-  return (
-    <div className="slp-peer">
-      <span aria-hidden="true" className={`slp-dot${session?.running ? ' slp-dot-on' : ''}`} />
-      <div className="slp-peer-main">
-        <span className="slp-peer-title" title={title}>{title}</span>
-        <span className="slp-peer-meta">{compact ? status : `${String(row.peerId).slice(0, 8)} · ${status}`}</span>
-      </div>
-      <WakeSwitch checked={row.autoWake} disabled={busy || snapshot.status === 'error'} onChange={setWake}
-        label={`${t('row.wake')} · ${title}`} title={t('row.wake.title')} />
-      {!compact && !session?.archived
-        ? <button type="button" className="slp-text-button" title={t('peer.open.title', { title })}
-            onClick={() => { openSession(row.peerId) }}>{t('peer.open')}</button>
-        : null}
+  const group = row.link.memberIds.length > 2
+  return <div className="slp-peer">
+    <div className="slp-peer-heading">
+      <div className="slp-peer-main"><span className="slp-peer-title" title={title}>{title}</span>
+        <span className="slp-peer-meta">{String(row.peerId).replace(/^session-/, '').slice(0, 8)} · {status}</span></div>
+      <span className="slp-linked">{t('peer.linked')}</span>
+      {!session?.archived ? <button type="button" className="slp-text-button" title={t('peer.open.title', { title })}
+        onClick={() => { openSession(row.peerId) }}>{t('peer.open')}</button> : null}
     </div>
-  )
+    <WakeSetting checked={row.autoWake} disabled={busy || snapshot.status !== 'ready' || session?.archived === true}
+      onChange={setWake} label={`${t(group ? 'row.wake.group' : 'row.wake')} · ${title}`}
+      hint={t(group ? 'row.wake.group.hint' : 'row.wake.title')} t={t} />
+  </div>
 }
 
-/** Session-scoped header entry with a viewport-fitted, dismissible hover summary. */
+/** Click-to-open quick linker. Escape restores focus; outside pointer/focus dismisses. */
 export function HeaderAction(props: LinkProps & {
   readonly useSession: SnapshotSelectorHook<{ readonly openState: string }>
 }): ReactNode {
-  const { sessionId, useLinks, useSession, refresh, setWake, openPanel, t } = props
+  const { sessionId, useLinks, useSession, refresh, openPanel, t } = props
   const snapshot = useLinks(value => value)
   const visible = useSession(value => value.openState) === 'open'
-  const rows = snapshot.view === undefined ? [] : peerRows(snapshot.view.links, sessionId)
-  const count = new Set(rows.map(row => row.peerId)).size
+    && snapshot.view?.sessions.find(session => session.id === sessionId)?.ordinary !== false
+  const count = new Set(peerRows(snapshot.view?.links ?? [], sessionId).map(row => row.peerId)).size
   const [open, setOpen] = useState(false)
   const [position, setPosition] = useState<CSSProperties>({ visibility: 'hidden' })
   const trigger = useRef<HTMLButtonElement>(null)
   const panel = useRef<HTMLDivElement>(null)
-  const closeTimer = useRef<ReturnType<typeof setTimeout>>()
-  const ignoreFocus = useRef(false)
   const panelId = useId()
-  const { busy, error, run } = useOperation(sessionId)
-  const cancelClose = useCallback(() => {
-    if (closeTimer.current !== undefined) clearTimeout(closeTimer.current)
-    closeTimer.current = undefined
-  }, [])
-  const closeLater = (): void => {
-    cancelClose()
-    closeTimer.current = setTimeout(() => { setOpen(false) }, 180)
-  }
-  useEffect(() => cancelClose, [cancelClose])
   useEffect(() => { setOpen(false) }, [sessionId, visible])
   useLayoutEffect(() => {
     if (!open) return
@@ -188,161 +206,138 @@ export function HeaderAction(props: LinkProps & {
     if (panel.current !== null) observer.observe(panel.current)
     window.addEventListener('resize', place)
     window.addEventListener('scroll', place, true)
-    return () => {
-      observer.disconnect()
-      window.removeEventListener('resize', place)
-      window.removeEventListener('scroll', place, true)
-    }
+    return () => { observer.disconnect(); window.removeEventListener('resize', place); window.removeEventListener('scroll', place, true) }
   }, [open])
   useEffect(() => {
     if (!open) return
-    const outside = (event: PointerEvent): void => {
+    const outside = (event: Event): void => {
       if (!(event.target instanceof Node)) return
-      if (trigger.current?.contains(event.target) || panel.current?.contains(event.target)) return
-      cancelClose()
-      setOpen(false)
+      if (!trigger.current?.contains(event.target) && !panel.current?.contains(event.target)) setOpen(false)
     }
     const escape = (event: KeyboardEvent): void => {
       if (event.key !== 'Escape') return
-      event.stopPropagation()
-      cancelClose()
-      setOpen(false)
-      ignoreFocus.current = true
-      trigger.current?.focus()
-      queueMicrotask(() => { ignoreFocus.current = false })
+      event.stopPropagation(); setOpen(false); trigger.current?.focus()
     }
     document.addEventListener('pointerdown', outside)
+    document.addEventListener('focusin', outside)
     document.addEventListener('keydown', escape, true)
-    return () => {
-      document.removeEventListener('pointerdown', outside)
-      document.removeEventListener('keydown', escape, true)
-    }
-  }, [open, cancelClose])
+    return () => { document.removeEventListener('pointerdown', outside); document.removeEventListener('focusin', outside); document.removeEventListener('keydown', escape, true) }
+  }, [open])
   if (!visible) return null
-  const manage = (): void => { cancelClose(); setOpen(false); openPanel() }
-  return (
-    <div className="slp-header">
-      <Styles />
-      <button ref={trigger} type="button" className={`slp-trigger${open ? ' slp-trigger-open' : ''}`}
-        data-session-link-action="" title={t('trigger.label')}
-        aria-label={count > 0 ? t('trigger.badge.aria', { count }) : t('trigger.label')}
-        aria-expanded={open} aria-controls={open ? panelId : undefined}
-        onClick={manage} onPointerEnter={() => { cancelClose(); setOpen(true) }} onPointerLeave={closeLater}
-        onFocus={() => { if (!ignoreFocus.current) { cancelClose(); setOpen(true) } }}
-        onBlur={event => { if (!panel.current?.contains(event.relatedTarget)) closeLater() }}>
-        <LinkIcon />{count > 0 ? <span className="slp-badge" aria-hidden="true">{count}</span> : null}
-      </button>
-      {open ? createPortal(
-        <div ref={panel} id={panelId} role="group" aria-label={t('trigger.label')} className="slp-popover"
-          style={position} onPointerEnter={cancelClose} onPointerLeave={closeLater}
-          onFocus={cancelClose} onBlur={event => {
-            if (!panel.current?.contains(event.relatedTarget) && !trigger.current?.contains(event.relatedTarget)) closeLater()
-          }}>
-          <QueryState snapshot={snapshot} refresh={refresh} t={t} />
-          {snapshot.view !== undefined && rows.length === 0
-            ? <div className="slp-state">{t('panel.empty')}<div>{t('panel.empty.hint')}</div></div>
-            : rows.map(row => <Peer key={`${row.link.id}:${row.peerId}`} row={row} snapshot={snapshot}
-                busy={busy} compact setWake={on => { void run(() => setWake(row.link.id, row.peerId, on)) }}
-                openSession={props.openSession} t={t} />)}
-          {error === null ? null : <div role="alert" className="slp-notice">{error}</div>}
-          <div className="slp-popover-footer"><button type="button" className="slp-text-button" onClick={manage}>{t('popover.manage')}</button></div>
-        </div>, document.body,
-      ) : null}
-    </div>
-  )
+  return <div className="slp-header">
+    <Styles />
+    <button ref={trigger} type="button" className={`slp-trigger${open ? ' slp-trigger-open' : ''}`}
+      data-session-link-action="" title={t('trigger.label')} aria-haspopup="dialog"
+      aria-label={count > 0 ? t('trigger.badge.aria', { count }) : t('trigger.label')}
+      aria-expanded={open} aria-controls={open ? panelId : undefined} onClick={() => { setOpen(value => !value) }}>
+      <LinkIcon /><span>{t('trigger.short')}</span>{count > 0 ? <span className="slp-badge" aria-hidden="true">{count}</span> : null}
+    </button>
+    {open ? createPortal(<div ref={panel} id={panelId} role="dialog" aria-label={t('quick.title')} className="slp-popover" style={position}>
+      <div className="slp-peer-heading"><strong>{t('quick.title')}</strong><button type="button" className="slp-text-button"
+        aria-label={t('quick.close')} onClick={() => { setOpen(false); trigger.current?.focus() }}>×</button></div>
+      <div className="slp-footnote">{t('panel.owner', { title: sessionTitle(snapshot.view, sessionId) })}</div>
+      <QueryState snapshot={snapshot} refresh={refresh} t={t} />
+      {snapshot.view === undefined ? null : <LinkPicker key={sessionId} sessionId={sessionId} snapshot={snapshot} link={props.link} t={t}
+        autoFocus onLinked={() => { setOpen(false); trigger.current?.focus() }} />}
+      <div className="slp-popover-footer"><button type="button" className="slp-text-button" onClick={() => { setOpen(false); openPanel() }}>{t('popover.manage')}</button></div>
+    </div>, document.body) : null}
+  </div>
 }
 
-/** Session-scoped management tab, with Host-validated add, wake, and revoke operations. */
+/** Management actions always bind to this explicit owner, not the visible conversation. */
 export function LinkTab({ sessionId, useLinks, refresh, setWake, link, unlink, openSession, t }: LinkProps): ReactNode {
   const snapshot = useLinks(value => value)
   const view = snapshot.view
   const { busy, error, run } = useOperation(sessionId)
   const [pickerOpen, setPickerOpen] = useState(false)
-  const [query, setQuery] = useState('')
-  const [selected, setSelected] = useState<SessionId | null>(null)
-  const [autoWake, setAutoWake] = useState(true)
   const [confirming, setConfirming] = useState<SessionLinkId | null>(null)
   const groups = useMemo(() => view?.links.filter(group => group.memberIds.includes(sessionId)) ?? [], [view, sessionId])
-  const candidates = useMemo(() => view === undefined ? [] : linkCandidates(view, sessionId), [view, sessionId])
-  const filtered = candidates.filter(candidate => candidate.title.toLowerCase().includes(query.trim().toLowerCase())
-    || String(candidate.id).toLowerCase().includes(query.trim().toLowerCase()))
-  useEffect(() => {
-    setPickerOpen(false); setQuery(''); setSelected(null); setConfirming(null); setAutoWake(true)
-  }, [sessionId])
-  useEffect(() => {
-    if (selected !== null && !candidates.some(candidate => candidate.id === selected)) setSelected(null)
-    if (confirming !== null && !groups.some(group => group.id === confirming)) setConfirming(null)
-  }, [candidates, selected, confirming, groups])
-  const disabled = busy || snapshot.status === 'error'
-  return (
-    <div className="slp-panel" data-session-link-panel="" aria-busy={busy}>
-      <Styles /><QueryState snapshot={snapshot} refresh={refresh} t={t} />
-      {view === undefined ? null : <>
-        {groups.length === 0 ? <div className="slp-state">{t('panel.empty')}</div> : groups.map(group => (
-          <section key={group.id} className="slp-group" aria-label={group.name}>
-            <header className="slp-group-header"><LinkIcon size={14} />{group.name}</header>
-            {peerRows([group], sessionId).map(row => <Peer key={row.peerId} row={row} snapshot={snapshot}
-              busy={busy} setWake={on => { void run(() => setWake(group.id, row.peerId, on)) }} openSession={openSession} t={t} />)}
-            {confirming === group.id
-              ? <div className="slp-confirm"><div>{t('revoke.confirm')}</div><div className="slp-confirm-actions">
-                  <button type="button" className="slp-button" disabled={busy} onClick={() => { setConfirming(null) }}>{t('revoke.cancel')}</button>
-                  <button type="button" className="slp-button slp-danger" disabled={disabled}
-                    onClick={() => { void run(() => unlink(group.id)).then(ok => { if (ok) setConfirming(null) }) }}>{t('revoke.action')}</button>
-                </div></div>
-              : <div className="slp-confirm-actions"><button type="button" className="slp-text-button slp-danger" disabled={disabled}
-                  onClick={() => { setConfirming(group.id) }}>{t('peer.revoke')}</button></div>}
-          </section>
-        ))}
-        <div className="slp-add">
-          <button type="button" className="slp-text-button slp-add-toggle" aria-expanded={pickerOpen} disabled={busy}
-            onClick={() => { setPickerOpen(value => !value); setSelected(null); setQuery('') }}>{t('add.title')}</button>
-          {pickerOpen ? <>
-            <input className="slp-input" value={query} placeholder={t('add.search')} aria-label={t('add.search')}
-              onChange={event => { setQuery(event.target.value) }} />
-            <div className="slp-candidates">
-              {filtered.length === 0 ? <div className="slp-state">{t('add.empty')}</div>
-                : filtered.map(candidate => <button key={candidate.id} type="button" aria-pressed={selected === candidate.id}
-                    className={`slp-candidate${selected === candidate.id ? ' slp-candidate-selected' : ''}`}
-                    onClick={() => { setSelected(candidate.id) }}>
-                    <span className="slp-peer-title">{candidate.title}</span><span className="slp-peer-meta">{String(candidate.id).slice(0, 8)}</span>
-                  </button>)}
-            </div>
-            <div className="slp-add-options"><span>{t('add.wake.hint')}</span>
-              <WakeSwitch checked={autoWake} disabled={disabled} label={t('add.wake')} title={t('add.wake.hint')} onChange={setAutoWake} />
-            </div>
-            <button type="button" className="slp-button slp-add-submit" disabled={selected === null || disabled} onClick={() => {
-              if (selected === null) return
-              const peerId = selected
-              void run(() => link(peerId, autoWake)).then(ok => { if (ok) { setSelected(null); setPickerOpen(false) } })
-            }}>{t('add.action')}</button>
-          </> : null}
-        </div>
-        <div className="slp-footnote">{t('tab.command.hint')}</div>
-      </>}
-      {error === null ? null : <div role="alert" className="slp-notice">{error}</div>}
-    </div>
-  )
+  useEffect(() => { setPickerOpen(false); setConfirming(null) }, [sessionId])
+  useEffect(() => { if (confirming !== null && !groups.some(group => group.id === confirming)) setConfirming(null) }, [groups, confirming])
+  const self = view?.sessions.find(session => session.id === sessionId)
+  const disabled = busy || snapshot.status !== 'ready' || self === undefined || self.archived || !self.ordinary
+  return <div className="slp-panel" data-session-link-panel="" data-session-link-owner={sessionId} aria-busy={busy}>
+    <Styles /><div className="slp-footnote">{t('panel.owner', { title: sessionTitle(view, sessionId) })}</div>
+    <QueryState snapshot={snapshot} refresh={refresh} t={t} />
+    {view === undefined ? null : <>
+      {groups.length === 0 ? <div className="slp-state">{t('panel.empty')}</div> : groups.map(group => (
+        <section key={group.id} className="slp-group" aria-label={group.name}>
+          <header className="slp-group-header"><LinkIcon size={14} />{group.name}</header>
+          {peerRows([group], sessionId).map(row => <Peer key={row.peerId} row={row} snapshot={snapshot} busy={disabled}
+            setWake={on => { void run(() => setWake(group.id, row.peerId, on)) }} openSession={openSession} t={t} />)}
+          <div className="slp-group-self">
+            <WakeSetting checked={group.autoWakeSessionIds.includes(sessionId)} disabled={disabled}
+              onChange={on => { void run(() => setWake(group.id, sessionId, on)) }}
+              label={t(group.memberIds.length > 2 ? 'row.wake.self.group' : 'add.wake.self')}
+              hint={t('add.wake.self.hint')} t={t} />
+            {!group.autoWakeSessionIds.includes(sessionId) ? <p className="slp-footnote">{t('wake.self.off.hint')}</p> : null}
+          </div>
+          {confirming === group.id ? <div className="slp-confirm"><div>{t('revoke.confirm')}</div><div className="slp-confirm-actions">
+            <button type="button" className="slp-button" disabled={busy} onClick={() => { setConfirming(null) }}>{t('revoke.cancel')}</button>
+            <button type="button" className="slp-button slp-danger" disabled={disabled}
+              onClick={() => { void run(() => unlink(group.id)).then(ok => { if (ok) setConfirming(null) }) }}>{t('revoke.action')}</button>
+          </div></div> : <div className="slp-confirm-actions"><button type="button" className="slp-text-button slp-danger" disabled={disabled}
+            onClick={() => { setConfirming(group.id) }}>{t('peer.revoke')}</button></div>}
+        </section>
+      ))}
+      <div className="slp-add">
+        <button type="button" className="slp-text-button slp-add-toggle" aria-expanded={pickerOpen} disabled={disabled}
+          onClick={() => { setPickerOpen(value => !value) }}>{t('add.title')}</button>
+        {pickerOpen ? <LinkPicker key={sessionId} sessionId={sessionId} snapshot={snapshot} link={link} t={t} onLinked={() => { setPickerOpen(false) }} /> : null}
+      </div>
+      <div className="slp-footnote">{t('wake.budget.hint')}</div><div className="slp-footnote">{t('tab.command.hint')}</div>
+    </>}
+    {error === null ? null : <div role="alert" className="slp-notice">{error}</div>}
+  </div>
 }
 
-/** Tab chip copy and icon, reactive to peer count and current locale. */
+/** Navigation params identify the managed row without activating or switching that Session. */
+export function panelOwner(sessionId: SessionId, params: unknown): SessionId {
+  if (params !== null && typeof params === 'object' && 'sessionId' in params && typeof params.sessionId === 'string' && params.sessionId !== '') {
+    return params.sessionId as SessionId
+  }
+  return sessionId
+}
+type ManagedProps = LinkProps & { readonly useTabInfo: UseSidebarRightTabInfo; readonly actionsFor: (id: SessionId) => LinkActions }
+export function ManagedLinkTab(props: ManagedProps): ReactNode {
+  const owner = panelOwner(props.sessionId, props.useTabInfo().tab.navigation.params)
+  return <LinkTab key={owner} {...props} {...props.actionsFor(owner)} sessionId={owner} />
+}
 export function LinkTabTitle({ sessionId, useLinks, t }: LinkProps): ReactNode {
   const count = useLinks(snapshot => new Set(peerRows(snapshot.view?.links ?? [], sessionId).map(row => row.peerId)).size)
   return <span className="slp-tab-title"><Styles /><LinkIcon size={14} />{t('tab.title')}{count === 0 ? '' : ` (${count})`}</span>
 }
+export function ManagedLinkTabTitle(props: ManagedProps): ReactNode {
+  const owner = panelOwner(props.sessionId, props.useTabInfo().tab.navigation.params)
+  return <LinkTabTitle {...props} sessionId={owner} />
+}
 
-/** Idle-row mark; reading the shared catalog activates no Session. */
-export function LinkMark({ sessionId, useLinks, t }: {
-  readonly sessionId: SessionId
-  readonly useLinks: SnapshotSelectorHook<LinkSnapshot>
-  readonly t: TranslateNS<typeof NS>
-}): ReactNode {
-  const wake = useLinks(snapshot => {
-    const groups = snapshot.view?.links.filter(group => group.memberIds.includes(sessionId)) ?? []
-    return groups.length === 0 ? null : groups.some(group => group.autoWakeSessionIds.includes(sessionId))
-  })
-  if (wake === null) return null
-  const title = t(wake ? 'mark.wake.on' : 'mark.wake.off')
-  return <span className="slp-mark" data-session-link-mark="" title={title} onClick={event => { event.stopPropagation() }}>
-    <Styles /><span aria-hidden="true" className={`slp-dot${wake ? ' slp-dot-on' : ''}`} /><span className="slp-hidden">{title}</span>
-  </span>
+export interface RowInjected {
+  readonly hooks: { readonly links: HostObservable<LinkSnapshot> }
+  readonly openPanelFor: (id: SessionId) => void
+}
+type RowProps = InjectFace<RowInjected> & { readonly sessionId: SessionId; readonly t: LinkProps['t'] }
+/** The Host owns hover/focus visibility of this right-hand action strip. No leading decoration. */
+export function RowLinkAction({ sessionId, useLinks, openPanelFor, t }: RowProps): ReactNode {
+  const snapshot = useLinks(value => value)
+  const session = snapshot.view?.sessions.find(row => row.id === sessionId)
+  const [error, setError] = useState<string | null>(null)
+  if (session?.ordinary !== true || session.archived || session.blank) return null
+  const count = new Set(peerRows(snapshot.view?.links ?? [], sessionId).map(row => row.peerId)).size
+  const title = count > 0 ? t('row.linked', { count }) : t('row.unlinked')
+  return <><Styles /><button type="button" className={`slp-row-action${count > 0 ? ' slp-row-linked' : ''}`}
+    data-session-link-row-action="" title={error ?? title} aria-label={title} onClick={event => {
+      event.stopPropagation()
+      try { openPanelFor(sessionId); setError(null) } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)) }
+    }}><LinkIcon /></button>{error === null ? null : <span className="slp-hidden" role="alert">{error}</span>}</>
+}
+export function RowLinkMenu(props: RowProps & { readonly useMenuOpenState: () => readonly [boolean, (open: boolean) => void] }): ReactNode {
+  const snapshot = props.useLinks(value => value)
+  const [, setMenuOpen] = props.useMenuOpenState()
+  const [error, setError] = useState<string | null>(null)
+  const session = snapshot.view?.sessions.find(row => row.id === props.sessionId)
+  if (session?.ordinary !== true || session.archived || session.blank) return null
+  return <><Styles /><button type="button" role="menuitem" className="slp-menu-item" onClick={() => {
+    try { props.openPanelFor(props.sessionId); setMenuOpen(false); setError(null) } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)) }
+  }}><LinkIcon />{props.t('row.manage')}</button>{error === null ? null : <span className="slp-notice" role="alert">{error}</span>}</>
 }

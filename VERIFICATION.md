@@ -1,4 +1,33 @@
-# Verification — 2026-10-10
+# Verification — current 0.4.1 workspace
+
+## Approved preset / UI / return-wake implementation
+
+The current source and generated bundles implement the approved update. This is **workspace completion, not a live-profile upgrade**. No Host source, installed plugin, user profile, existing group authorization or historical messages were changed. An unrelated pre-existing model-routing plan was left untouched.
+
+| Check | Fresh result |
+| --- | --- |
+| `pnpm build` using installed npm SDK `0.2.0-rc.2` | PASS; TypeScript + Host/browser bundles |
+| `pnpm typecheck` | PASS using installed SDK |
+| `DSH_SOURCE_ROOT=/Users/gc/Dev/Opensource/deepseek-harness pnpm typecheck` | PASS using checkout declarations; default installed-SDK configuration restored afterward |
+| `pnpm test:client` | PASS; 39 tests in 5 suites, including 11 preset tests and 2 formal-slot/wire-owner tests |
+| `DSH_SOURCE_ROOT=… pnpm test:host` | PASS; 117 tests in 4 suites |
+| `pnpm test:contracts` | PASS; 3 built-artifact tests, including React-only browser imports and unminified RPC parameters |
+| Packed official-CLI browser smoke | PASS; `dsh 0.2.0-rc.2`, isolated Web profile/npm cache and Brave, no model requests |
+| `git diff --check` | PASS |
+
+Coverage and evidence boundaries:
+
+- Omitted preset config survives Loader schema resolution as automatic mode, includes effective default and standard/ptc/cordis, excludes minimal/subagents; explicit lists and empty lists remain exact. Default-id changes take effect when an Agent is next evaluated through the existing lifecycle; no synthetic default-change event was added.
+- The leading mark is no longer registered. Formal workspace right-hover action and menu seats are registered. Component and wire-owner tests prove that management params bind mutations to the clicked Session, not the foreground Session. The installed browser exercise switches management between alpha/beta in the same tab without switching the foreground conversation.
+- Quick linking requires explicit confirmation and sends separate peer/caller grants; the installed browser verifies independent defaults and resulting persistence. Linked count/color are independent of wake.
+- Real ToolRuntime + mock model tests verify B→idle-A reply wake, caller opt-out queueing, and reply-chain-budget queueing. These are not paid/live-model tests.
+- Replay keeps existing/human-disabled grants unchanged. Storage-failure tests verify all four initial wake combinations survive restart even with changed replay arguments. Legacy incomplete intents without the optional original-grants field recover conservatively, preserving the first-task special case. Domain version remains 1.
+- The browser fixture's preparatory rename attaches beta to materialize Host title/workspace projections. Its non-foreground management test must not be described as a cold-resume test; cold catalog non-activation is separately covered by Host regression.
+- Final installed light/dark screenshots were read and visually checked for readable directional labels and unclipped layout. The temporary browser/server/profile were cleaned up. Electron launch, live profile upgrade, touch-device smoke and live model exchange: NOT_RUN.
+
+Rerun results: [installed smoke](tests/integration/RESULTS.md). Screenshots: [light](output/playwright/session-link-light.png), [dark](output/playwright/session-link-dark.png).
+
+## Historical verification — 2026-10-10 (before this update)
 
 `dsh-session-link 0.4.1` is an independently built and installed plugin. The original DSH checkout remains at `656ca65`, with its pre-existing modified/untracked files left untouched. The user's running Desktop profile was not switched.
 

@@ -93,6 +93,21 @@ describe('dsh-session-link remote surface', () => {
     expect(s.links.list(s.bob.id).map(link => link.id)).toContain(result.linkId)
   })
 
+  it.each([
+    [true, true], [true, false], [false, true], [false, false],
+  ])('linkFrom atomically grants peer=%s caller=%s for human GUI requests', async (autoWake, autoWakeCaller) => {
+    const s = await stack()
+    const { linkId } = await s.links.linkFrom({ callerId: s.alice.id, peerId: s.bob.id, autoWake, autoWakeCaller })
+    const group = s.links.list().find(link => link.id === linkId)!
+    expect(group.autoWakeSessionIds).toEqual([
+      ...(autoWake ? [s.bob.id] : []), ...(autoWakeCaller ? [s.alice.id] : []),
+    ])
+    expect(group.revision).toBe(1)
+    await expect(s.links.linkFrom({ callerId: s.alice.id, peerId: s.bob.id, autoWake: true, autoWakeCaller: true }))
+      .rejects.toMatchObject({ code: 'LINK_ALREADY_LINKED' })
+    expect(s.links.list()[0]).toEqual(group)
+  })
+
   it('linkFrom rejects self-links, duplicates, unknown peers, and subagent-owned peers', async () => {
     const s = await stack()
     await expect(s.links.linkFrom({ callerId: s.alice.id, peerId: s.alice.id, autoWake: false }))
@@ -151,8 +166,10 @@ describe('dsh-session-link remote surface', () => {
     const { id: linkId } = await s.links.link('trio', [s.alice.id, s.bob.id, eve.id], { kind: 'human' }, {
       autoWakeSessionIds: [eve.id],
     })
-    await expect(s.links.setAutoWakeFrom({ callerId: s.alice.id, linkId, peerId: s.alice.id, on: true }))
-      .rejects.toMatchObject({ code: 'LINK_SELF' })
+    await s.links.setAutoWakeFrom({ callerId: s.alice.id, linkId, peerId: s.alice.id, on: true })
+    expect(s.links.list(s.alice.id)[0]?.autoWakeSessionIds).toEqual([eve.id, s.alice.id])
+    await s.links.setAutoWakeFrom({ callerId: s.alice.id, linkId, peerId: s.alice.id, on: false })
+    expect(s.links.list(s.alice.id)[0]?.autoWakeSessionIds).toEqual([eve.id])
     await expect(s.links.setAutoWakeFrom({ callerId: SessionId('session-eve-x'), linkId, peerId: s.bob.id, on: true }))
       .rejects.toMatchObject({ code: 'LINK_CALLER_NOT_MEMBER' })
     await expect(s.links.setAutoWakeFrom({ callerId: s.alice.id, linkId, peerId: SessionId('session-eve-x'), on: true }))

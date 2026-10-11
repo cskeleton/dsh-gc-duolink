@@ -93,6 +93,8 @@ export const sessionLinkSpawnLedgerSchema = z.record(
     linkId,
     intent: z.boolean().optional(),
     removed: z.boolean().optional(),
+    /** Creation intent's original grants; replay cannot widen these from changed arguments. */
+    autoWakeSessionIds: z.array(sessionId).optional(),
   }),
 )
 
