@@ -136,5 +136,11 @@ interface TaskHostCarrier {
  */
 export function resolveTaskHost(ctx: Context): HostTaskHostCapability | undefined {
   const carrier = ctx as unknown as TaskHostCarrier
-  return carrier.taskHost
+  try {
+    // A plain Cordis context gates unknown service keys ("cannot get property
+    // without inject"); an agent context on a capability host answers.
+    return carrier.taskHost
+  } catch {
+    return undefined
+  }
 }

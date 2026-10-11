@@ -21,6 +21,14 @@ import type {} from '@deepseek-ai/dsh-session-title'
 import { SessionLinkError, SessionLinkMessageId } from './index.ts'
 import type { SessionLinkId } from './index.ts'
 import type {} from './index.ts'
+import { resolveTaskHost } from './host-capability.ts'
+import {
+  ModelRoutingError,
+  projectModelCatalog,
+  readModelCatalog,
+  SessionListModelsParamsError,
+} from './model-policy.ts'
+import type { ModelCatalogLike } from './model-policy.ts'
 import { mountPerPresetAgent, PresetScopeConfig, resolvePresets } from './scope.ts'
 
 export const name = 'tool-session-link'
@@ -81,6 +89,76 @@ function unlinkedReplay(callKey: string, sessionId: SessionId): string {
 function reason(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
+
+/**
+ * Model-facing text for a model-routing failure. The leading classification
+ * code lets the calling model and Task 4's admission path distinguish
+ * CATALOG_UNAVAILABLE (needs_decision-eligible) from parameter errors.
+ */
+function routingFailure(error: ModelRoutingError): string {
+  return `${error.code}: ${error.message}`
+}
+
+const listModelsOutputProperties = {
+  taskHost: {
+    type: 'boolean',
+    required: true,
+    description: 'Whether this deployment exposes the host task-execution capability. When false, passing model routing parameters to session_spawn_linked_session or session_send_session_message fails with HOST_CAPABILITY_UNAVAILABLE; never guess routing support.',
+  },
+  deploymentDefault: {
+    type: 'object',
+    required: true,
+    additionalProperties: false,
+    description: 'Route new Sessions start from before any selection; may carry the default reasoning effort.',
+    properties: {
+      provider: { type: 'string', required: true },
+      model: { type: 'string', required: true },
+      reasoningEffort: { type: 'string' },
+    },
+  },
+  providers: {
+    type: 'array',
+    required: true,
+    items: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        id: { type: 'string', required: true },
+        name: { type: 'string' },
+        models: {
+          type: 'array',
+          required: true,
+          items: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              id: { type: 'string', required: true },
+              name: { type: 'string' },
+              description: { type: 'string' },
+              efforts: {
+                type: 'array',
+                required: true,
+                description: 'Reasoning efforts THIS exact provider/model route accepts; never inherited from another route.',
+                items: {
+                  type: 'object',
+                  additionalProperties: false,
+                  properties: {
+                    id: { type: 'string', required: true },
+                    name: { type: 'string' },
+                    isDefault: { type: 'boolean', required: true, description: 'True for the effort this route uses when reasoning_effort is omitted.' },
+                  },
+                },
+              },
+              defaultEffort: { type: 'string', description: 'Effort applied when reasoning_effort is omitted for this route.' },
+              isDeploymentDefault: { type: 'boolean', required: true, description: 'True for the deployment default provider+model route.' },
+            },
+          },
+        },
+        catalogError: { type: 'string', description: 'Set when this provider\'s catalog query failed: its models are UNKNOWN, not empty — the failure is never reported as an empty catalog.' },
+      },
+    },
+  },
+} as const
 
 /**
  * Register the four Session Link tools in each eligible top-level Agent's scope.
@@ -373,5 +451,74 @@ function definitions(ctx: Context): ToolDefinition[] {
       }
     },
     presentCall: args => ({ card: 'generic', title: `Spawn session in ${args.cwd}`, kind: 'other' }),
+  }), defineTool({
+    name: 'session_list_models',
+    description:
+      'List the models this deployment can route linked-Session tasks to: providers, '
+      + 'models, the reasoning efforts each exact provider/model route accepts with its '
+      + 'own default, and the deployment default route. Use pair(provider, model) values '
+      + 'from here for the model routing parameters of session_spawn_linked_session and '
+      + 'session_send_session_message; provider/model must always be given together, an '
+      + 'omitted effort means that route\'s own default, and effort lists never transfer '
+      + 'across routes. The taskHost flag tells whether task-level model routing is '
+      + 'available at all on this host; when false, do not pass routing parameters. '
+      + 'A provider with catalogError failed to answer: its model list is unknown, not '
+      + 'empty. Filter by provider, or by an exact model together with its provider.',
+    parameters: {
+      provider: {
+        type: 'string',
+        description: 'Narrow the catalog to one provider id.',
+      },
+      model: {
+        type: 'string',
+        description: 'Narrow to one exact model; requires provider.',
+      },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: listModelsOutputProperties,
+      },
+      render: (_args, value) => [{
+        type: 'text',
+        text: [
+          `task-level model routing on this host: ${value.taskHost ? 'available' : 'UNAVAILABLE (do not pass model routing parameters)'}`,
+          `deployment default: ${value.deploymentDefault.provider}/${value.deploymentDefault.model}`
+            + `${value.deploymentDefault.reasoningEffort === undefined ? '' : ` (effort ${value.deploymentDefault.reasoningEffort})`}`,
+          ...value.providers.map(provider =>
+            provider.catalogError === undefined
+              ? `${provider.id}${provider.name === undefined ? '' : `「${provider.name}」`}: ${
+                provider.models.map(model =>
+                  `${model.id}${model.isDeploymentDefault ? ' [default]' : ''}${
+                    model.efforts.length === 0 ? '' : ` (efforts: ${model.efforts.map(effort => `${effort.id}${effort.isDefault ? '*' : ''}`).join(', ')})`}`
+                ).join(', ') || 'no models match the filter'}`
+              : `${provider.id}${provider.name === undefined ? '' : `「${provider.name}」`}: CATALOG QUERY FAILED — ${provider.catalogError} (models unknown, not absent)`,
+          ),
+        ].join('\n'),
+      }],
+    },
+    async execute(args, exec) {
+      const caller = requireCaller(ctx, exec)
+      if (args.model !== undefined && args.provider === undefined) {
+        throw new Error('an exact model filter requires the provider parameter')
+      }
+      let catalog: ModelCatalogLike
+      try {
+        catalog = await readModelCatalog(() => ctx.sessionController.modelCatalog() as Promise<ModelCatalogLike>)
+      } catch (error: unknown) {
+        throw error instanceof ModelRoutingError ? new Error(routingFailure(error)) : error
+      }
+      try {
+        return projectModelCatalog(catalog, {
+          ...(args.provider === undefined ? {} : { provider: args.provider }),
+          ...(args.model === undefined ? {} : { model: args.model }),
+        }, resolveTaskHost(caller.ctx) !== undefined)
+      } catch (error: unknown) {
+        if (error instanceof SessionListModelsParamsError) throw new Error(error.message)
+        throw error
+      }
+    },
+    presentCall: () => ({ card: 'generic', title: 'List available models', kind: 'other' }),
   })]
 }
