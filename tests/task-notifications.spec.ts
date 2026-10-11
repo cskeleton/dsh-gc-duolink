@@ -2,6 +2,9 @@
  * Task 5 (MODEL_ROUTING_PLAN): the outbox → REAL mailbox delivery path, the
  * task-status source attribution, budget and revalidation semantics, restart
  * dedupe, the get_task/resolve_task tools, and decision idempotency.
+ * Task 7 added the fix-wave + matrix rows: restart notifiedMessageId
+ * identity, blocked-once pump stability, per-chain budget as its own gate,
+ * and fork/compact execution-rights isolation.
  *
  * Stack: real AgentLoops on alice + bob, the real SessionLinkService and
  * SessionLinkTaskService over per-domain pooled memory backends (a "restart"
@@ -14,7 +17,7 @@
 
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
-import { ToolCallId } from '@deepseek-ai/dsh-llm'
+import { HarnessError, ToolCallId, type GenerateOptions } from '@deepseek-ai/dsh-llm'
 import type { ToolExecutionResult, ToolExecutionSuccess } from '@deepseek-ai/dsh-tools'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { SessionId } from '@deepseek-ai/dsh-session'
@@ -181,6 +184,10 @@ describe('task-notifications: delivery paths and attribution', () => {
     }, { timeout: 5000 })
     // The sender never claimed it yet: alice has no task-status in her log yet.
     expect(sourcesOf(first.alice).filter(source => source.kind === 'session-task-status')).toHaveLength(0)
+    // Capture the FIRST admission's durable notification identity: the same
+    // mailbox message must answer the event after the restart — never a re-mint.
+    const notifiedBefore = first.ctx.sessionLinkTasks.getRow(taskId)?.outbox[0]?.notifiedMessageId
+    expect(notifiedBefore).toBeDefined()
 
     // RESTART: dispose the whole first context, boot a fresh one over the
     // same pools (same agents Alice/Bob identities but through the fresh loop).
@@ -197,6 +204,10 @@ describe('task-notifications: delivery paths and attribution', () => {
     expect(row2?.outbox).toHaveLength(1)
     expect(['admitted', 'delivered']).toContain(row2?.outbox[0]?.status)
     expect(row2?.outbox[0]?.eventId).toBe(`task:${second.alice.id}:call-restart-1/1/model_unavailable`)
+    expect(row2?.outbox[0]?.notifiedMessageId).toBe(notifiedBefore)
+    // Exactly ONE mailbox row carries the notification identity: no second
+    // admission was minted across the full context teardown and reboot.
+    expect(second.ctx.sessionLinks.message(notifiedBefore!)).toBeDefined()
   }, 20000)
 
   it('an unlink blocks events the pump attempts after the grant vanished, with the revocation reason, and keeps them queryable', async () => {
@@ -237,6 +248,65 @@ describe('task-notifications: delivery paths and attribution', () => {
     expect(view.taskState).toBe('waiting_decision')
     const blocked = s.ctx.sessionLinkTasks.getRow(taskId)?.outbox[0]
     expect(blocked?.status).toBe('blocked')
+  }, 20000)
+
+  it('a blocked event is never re-blocked, duplicated, or re-emitted by later pump passes', async () => {
+    const adapter = new MockAdapter([textResponse('ok')])
+    const pools: BackendPools = { links: new MemoryMediaPool(), tasks: new MemoryMediaPool() }
+    const s = await bootStack(contexts, pools, { adapter, noToolRow: true })
+    const granted = await s.ctx.sessionLinks.link('pair', [s.alice.id, s.bob.id], { kind: 'human' })
+    const tasks = s.ctx.sessionLinkTasks
+    await tasks.saveTaskIntent({
+      callerId: s.alice.id,
+      request: { kind: 'send', callId: 'call-blocked-once', text: 'task on missing model', targetSessionId: s.bob.id },
+      policy: {
+        scope: 'task',
+        candidates: [{ provider: 'mock', model: 'model-absent' }],
+        ifExhausted: 'notify_sender',
+        usesSessionDefault: false,
+      },
+      tracked: true,
+      precheckFailure: { reason: 'model_unavailable', results: [] },
+    })
+    const taskId = taskIdFor(s.alice.id, 'call-blocked-once')
+    await s.ctx.sessionLinks.unlink(granted.id)
+    const pump = installTaskNotifications(s.ctx, {
+      tasks: () => s.ctx.sessionLinkTasks,
+      links: () => s.ctx.sessionLinks,
+    })
+    // Pass 1: the vanished grant blocks the event exactly once.
+    await drain(pump)
+    const once = tasks.getRow(taskId)
+    expect(once?.outbox).toHaveLength(1)
+    expect(once?.outbox[0]?.status).toBe('blocked')
+    const reasonOnce = once?.outbox[0]?.blockedReason
+    expect(String(reasonOnce)).toContain('link_revoked')
+    const revisionOnce = once?.revision
+    const notificationCount = () => {
+      const table = (s.ctx.sessionLinks as unknown as {
+        messages: { entries(): Iterable<[unknown, { statusKind?: string }]>; values?(): Iterable<{ statusKind?: string }> }
+      }).messages
+      const records = typeof table.entries === 'function'
+        ? [...table.entries()].map(([, record]) => record)
+        : [...(table.values?.() ?? [])]
+      return records.filter(record => record.statusKind === 'task-status').length
+    }
+    expect(notificationCount()).toBe(0)
+    // Pass 2 (+ more): pendingOutbox excludes blocked rows, so no block path
+    // runs at all — no CAS conflict to swallow, no second block write, no
+    // re-emitted event, no duplicate mailbox row.
+    await drain(pump)
+    await drain(pump)
+    const twice = tasks.getRow(taskId)
+    expect(twice?.outbox).toHaveLength(1)
+    expect(twice?.outbox[0]?.status).toBe('blocked')
+    expect(twice?.outbox[0]?.blockedReason).toBe(reasonOnce)
+    expect(twice?.revision).toBe(revisionOnce)
+    expect(twice?.outbox[0]?.eventId).toBe(once?.outbox[0]?.eventId)
+    expect(notificationCount()).toBe(0)
+    // The blocked row stays queryable by the sender and is never duplicated.
+    expect(s.ctx.sessionLinkTasks.getTask(s.alice.id, taskId).taskState).toBe('waiting_decision')
+    expect(tasks.listRows().filter(row => row.callId === 'call-blocked-once')).toHaveLength(1)
   }, 20000)
 
   it('both original parties keep read access after unlink; a third party never sees the task', async () => {
@@ -370,6 +440,202 @@ describe('task-notifications: budget and archived treatment', () => {
       await drain(pump)
     }
     expect(s.ctx.sessionLinkTasks.getRow(taskId)?.outbox[0]?.status).toBe('delivered')
+  }, 20000)
+
+  it('chain-budget exhaustion is its own gate: a spent chain queues its OWN continuation while the sender\'s daily ledger still has room', async () => {
+    // Chain-budget isolation (Task 7 matrix 通知链预算耗尽; Task 5 flagged it
+    // shared the daily-budget path). maxAutoWakesPerChain = 1,
+    // maxAutoWakesPerMessage and the daily ledger generous. Alice→bob openers
+    // on two INDEPENDENT chains spend 2/2 of BOB's daily allowance (one wake
+    // per chain). Bob's reply hanging off chain A then has: per-message
+    // budget clean (≤2), daily ledger clean (1/2 left) — ONLY chain A's own
+    // budget is spent (single wake burned on the opener), so it MUST queue
+    // with wakesUsed === 0. The task's notification to alice starts its own
+    // fresh chain (runtime route failures clear the binding, so there is no
+    // root to reply into) whose chain budget is clean; alice's daily ledger
+    // is untouched — it admits with EXACTLY ONE wake (the documented
+    // admitted+wake path), proving the spent chain's single-wake count
+    // binds ONLY that chain and never lifts, folds, or resets (claimWake
+    // re-derives spend from recorded wakesUsed under each chain's own root).
+    class RouteDown extends MockAdapter {
+      constructor() { super([textResponse('warm one'), textResponse('warm two'), textResponse('reply answer')]) }
+      override async *stream(options: GenerateOptions) {
+        this.requests.push(options)
+        if (options.model === 'model-available') throw new HarnessError('upstream down', 'PROVIDER_UNAVAILABLE')
+        for (const chunk of textResponse('warm answer' as never)) yield chunk as never
+      }
+    }
+    const adapter = new RouteDown()
+    const pools: BackendPools = { links: new MemoryMediaPool(), tasks: new MemoryMediaPool() }
+    const s = await bootStack(contexts, pools, {
+      adapter,
+      links: { maxAutoWakesPerChain: 1, maxAutoWakesPerMessage: 2 },
+    })
+    const granted = await s.ctx.sessionLinks.link('pair', [s.alice.id, s.bob.id], { kind: 'human' })
+    await s.ctx.sessionLinks.setAutoWake(granted.id, [s.alice.id, s.bob.id])
+    // Warm chains A and B (alice→bob), each claiming its chain's single wake.
+    const opening = await s.ctx.sessionLinks.send(s.alice, s.bob.id, {
+      targetId: s.bob.id,
+      text: 'chain A opener',
+      idempotencyKey: 'chain-warm-open',
+    })
+    expect(s.ctx.sessionLinks.message(opening.messageId)?.wakesUsed).toBe(1)
+    await s.bob.whenIdle()
+    const second = await s.ctx.sessionLinks.send(s.alice, s.bob.id, {
+      targetId: s.bob.id,
+      text: 'chain B opener',
+      idempotencyKey: 'chain-warm-second',
+    })
+    expect(s.ctx.sessionLinks.message(second.messageId)?.wakesUsed).toBe(1)
+    await s.bob.whenIdle()
+    // Bob's continuation INSIDE chain A: daily + per-message budgets are
+    // clean — ONLY chain A's own budget is spent, so no wake is claimed.
+    // This is the per-chain gate acting alone.
+    const continuation = await s.ctx.sessionLinks.send(s.bob, s.alice.id, {
+      targetId: s.alice.id,
+      text: 'chain A continuation',
+      inReplyTo: opening.messageId,
+      idempotencyKey: 'chain-warm-cont',
+    })
+    expect(continuation.status).toBe('queued')
+    expect(s.ctx.sessionLinks.message(continuation.messageId)?.chainLength).toBe(2)
+    expect(s.ctx.sessionLinks.message(continuation.messageId)?.wakesUsed).toBe(0)
+    // Sanity: chain B's budget is untouched — identical sender/target, so
+    // the refusal above came from chain A's accounting, nothing global.
+    expect(s.ctx.sessionLinks.message(second.messageId)?.wakesUsed).toBe(1)
+    // Task: model request fails route-availability → runtime parks the task
+    // waiting_decision with ONE pending model_unavailable event.
+    succeeded(await call(s.ctx, 'session_send_session_message', {
+      session_id: s.bob.id,
+      message: 'chain-budget task',
+      provider: 'mock',
+      model: 'model-available',
+    }, s.alice, 'call-chain-budget-1'))
+    const taskId = taskIdFor(s.alice.id, 'call-chain-budget-1')
+    await s.bob.whenIdle().catch(() => {})
+    await vi.waitFor(() => {
+      const row = s.ctx.sessionLinkTasks.getRow(taskId)
+      expect(row?.taskState).toBe('waiting_decision')
+      expect(row?.outbox.some(event => event.kind === 'model_unavailable')).toBe(true)
+    }, { timeout: 5000 })
+    const pump = installTaskNotifications(s.ctx, {
+      tasks: () => s.ctx.sessionLinkTasks,
+      links: () => s.ctx.sessionLinks,
+    })
+    await drain(pump)
+    const row = s.ctx.sessionLinkTasks.getRow(taskId)
+    const failureEvent = row?.outbox.find(event => event.kind === 'model_unavailable')
+    expect(['admitted', 'delivered']).toContain(failureEvent?.status)
+    const notificationId = failureEvent?.notifiedMessageId
+    expect(notificationId).toBeDefined()
+    const message = s.ctx.sessionLinks.message(notificationId!)
+    // The notification rides its OWN fresh chain (no surviving root); its
+    // chain budget is clean, alice's daily ledger is untouched — the
+    // admitted+wake path claims exactly one wake. Chain accounting is
+    // per-root: A's spent wake gates ONLY chain A.
+    expect(message?.inReplyTo).toBeUndefined()
+    expect(message?.chainLength).toBe(1)
+    expect(message?.wakesUsed).toBe(1)
+    await s.alice.whenIdle()
+    // The queued in-chain continuation rides along the same wake-driven
+    // delivery WITHOUT claiming a wake itself, and no counts move afterwards.
+    await s.ctx.sessionLinks.deliverPending(s.alice.id)
+    await s.alice.whenIdle()
+    await drain(pump)
+    expect(s.ctx.sessionLinks.message(continuation.messageId)?.wakesUsed).toBe(0)
+    expect(s.ctx.sessionLinks.message(continuation.messageId)?.inReplyTo).toBe(opening.messageId)
+    expect(s.ctx.sessionLinks.message(opening.messageId)?.wakesUsed).toBe(1)
+    expect(s.ctx.sessionLinks.message(notificationId!)?.wakesUsed).toBe(1)
+    expect(sourcesOf(s.alice).some(source => source.messageId === String(notificationId))).toBe(true)
+    expect(sourcesOf(s.alice).some(source => source.messageId === String(continuation.messageId))).toBe(true)
+  }, 20000)
+})
+
+describe('task-notifications: fork isolation', () => {
+  it('a forked copy of the bound target NEVER gains the task\'s execution rights', async () => {
+    // Task 7 matrix fork/compact/resume row: the forked Session carries the
+    // copied log (including the bound task message id) but has NO link grant
+    // over the task pair. Simulating the fork through the harness = same
+    // sessionId on a fresh stack without any grant: the durable row + host
+    // turn-intent facts (the facts a store compaction must preserve) survive
+    // the context teardown; the delivered message id is re-presented to the
+    // forked runtime's claimed gate. Activation re-validates the live grant
+    // against the row's caller+target (task-runtime brief 4f-iv) and MUST
+    // refuse with queue_denied_unlinked — no claim, no running projection,
+    // no route freeze — while the row's durable owner remains the ORIGINAL
+    // target. Host turn/turn-intent fact survival across a REAL transcript
+    // compaction is NOT_RUN here: this test harness has no compaction op;
+    // the durable host facts are asserted directly instead (see report).
+    class RouteDown extends MockAdapter {
+      constructor() { super([textResponse('unused')]) }
+      override async *stream(options: GenerateOptions) {
+        this.requests.push(options)
+        throw new HarnessError('upstream down', 'PROVIDER_UNAVAILABLE')
+      }
+    }
+    const adapter = new RouteDown()
+    const pools: BackendPools = { links: new MemoryMediaPool(), tasks: new MemoryMediaPool() }
+    const first = await bootStack(contexts, pools, {
+      adapter,
+      links: { maxAutoWakesPerChain: 1, maxAutoWakesPerSessionPerDay: 6, maxAutoWakesPerMessage: 2 },
+    })
+    await first.ctx.sessionLinks.link('pair', [first.alice.id, first.bob.id], { kind: 'human' }, { autoWakeSessionIds: [first.bob.id] })
+    succeeded(await call(first.ctx, 'session_send_session_message', {
+      session_id: first.bob.id,
+      message: 'fork-isolation task',
+      provider: 'mock',
+      model: 'model-available',
+    }, first.alice, 'call-fork-1'))
+    const taskId = taskIdFor(first.alice.id, 'call-fork-1')
+    await first.bob.whenIdle().catch(() => {})
+    await vi.waitFor(() => {
+      const row = first.ctx.sessionLinkTasks.getRow(taskId)
+      expect(row?.taskState).toBe('waiting_decision')
+      expect(row?.outbox.some(event => event.kind === 'model_unavailable')).toBe(true)
+    }, { timeout: 5000 })
+    const rowBefore = first.ctx.sessionLinkTasks.getRow(taskId)
+    expect(rowBefore?.execution.messageId).toBeUndefined()
+    const revisionBefore = rowBefore?.revision
+
+    // FORK = the bound target's copy WITHOUT the grant: unlink the pair on
+    // the live stack (the fork keeps the Session/log identity, never the
+    // link ledger rows the tasks domain does not own), then dispose the
+    // whole context and boot a fresh stack over the SAME durable pools —
+    // the "compaction" the harness can express (context teardown + durable
+    // reload). The task row + host turn-intent facts must survive untouched.
+    const notified = first.ctx.sessionLinkTasks.getRow(taskId)?.outbox
+      .find(event => event.kind === 'model_unavailable')?.notifiedMessageId
+    expect(notified).toBeDefined()
+    const requestsBefore = adapter.requests.length
+    const linkBefore = (await first.ctx.sessionLinks.list(first.bob.id))[0]!
+    await first.ctx.sessionLinks.unlink(linkBefore.id)
+    await first.ctx.fiber.dispose()
+    contexts.delete(first.ctx)
+    const forked = await bootStack(contexts, pools, { adapter })
+    const forkRow = forked.ctx.sessionLinkTasks.getRow(taskId)
+    // Durable reconciliation facts survive: the task row + revision, and the
+    // owner target is STILL the original bob — the fork changed nothing.
+    expect(forkRow?.taskState).toBe('waiting_decision')
+    expect(forkRow?.revision).toBe(revisionBefore)
+    expect(forkRow?.targetSessionId).toBe(forked.bob.id)
+    // The already-admitted event reconciles under its ORIGINAL identity —
+    // never re-blocked, never re-admitted, never re-minted on the fork.
+    const forkPump = installTaskNotifications(forked.ctx, {
+      tasks: () => forked.ctx.sessionLinkTasks,
+      links: () => forked.ctx.sessionLinks,
+    })
+    await drain(forkPump)
+    const settled = forked.ctx.sessionLinkTasks.getRow(taskId)
+    const event = settled?.outbox.find(candidate => candidate.kind === 'model_unavailable')
+    expect(['admitted', 'delivered']).toContain(event?.status)
+    expect(event?.notifiedMessageId).toBe(notified)
+    expect(settled?.outbox).toHaveLength(rowBefore?.outbox.length)
+    expect(settled?.taskState).toBe('waiting_decision')
+    expect(settled?.execution.currentlyExecuting).toBeUndefined()
+    // The fork NEVER activated: no running turn, and the adapter logged NO
+    // new model request from the moment the fork booted (unlink + restart +
+    // pump passes ran zero model traffic).
+    expect(adapter.requests).toHaveLength(requestsBefore)
   }, 20000)
 })
 

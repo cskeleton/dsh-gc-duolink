@@ -105,10 +105,11 @@
     "sdk:configure": "node scripts/configure-sdk.mjs",
     "build": "node scripts/configure-sdk.mjs && node scripts/clean-build.mjs && tsc -p tsconfig.build.json && tsdown",
     "typecheck": "node scripts/configure-sdk.mjs && tsc -p tsconfig.build.json --noEmit",
-    "test": "pnpm run test:client && pnpm run test:contracts",
+    "test": "pnpm run test:client && pnpm run test:policy && pnpm run test:contracts",
     "test:integration": "node tests/integration/installed-smoke.mjs",
     "test:contracts": "node --test tests/built-contract.test.mjs",
-    "test:client": "vitest run tests/client tests/scope.spec.ts",
+    "test:client": "vitest run tests/client-turn.spec.tsx tests/client-panel.spec.tsx tests/client-state.spec.ts tests/client-registration.spec.ts tests/scope.spec.ts",
+    "test:policy": "vitest run tests/model-policy.spec.ts",
     "test:host": "node scripts/test-host.mjs"
   },
   "packageManager": "pnpm@10.33.2"
