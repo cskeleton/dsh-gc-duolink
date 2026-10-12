@@ -247,6 +247,14 @@ export interface TaskView {
   readonly currentRoute?: ModelRouteSelection
   readonly routeUsed?: ModelRouteSelection
   readonly latestIssue?: { code?: string; message?: string }
+  /**
+   * Live marker-write failure notes (review risk 2): unmarked pending events
+   * whose last marker attempt FAILED DURABLY, one entry per eventId. Live
+   * state — the durable row stays the authority (the event is pending,
+   * marker absent); the note only names the failure while it persists.
+   * Absent when nothing is noted.
+   */
+  readonly outboxMarkerFailureNotes?: { eventId: string; message: string }[]
   readonly createdAt: string
   readonly updatedAt: string
 }
@@ -485,6 +493,15 @@ export class SessionLinkTaskService extends Service {
   private readonly hostFor?: (sessionId: SessionId) => HostTaskHostCapability | undefined
   private readonly now: () => Date
   private disposed = false
+  /**
+   * Live marker-write failure notes (review risk 2), keyed task → eventId →
+   * message. Deliberately NOT durable: the authoritative fact is the event's
+   * durable pending status (marker absent); the note only explains WHY the
+   * marker is absent while the failure persists. It attaches against the
+   * attempted revision, clears when a marker finally lands, and a fresh
+   * durable read reports plain pending when nothing is noted.
+   */
+  private readonly outboxMarkerFailures = new Map<SessionLinkTaskId, Map<string, string>>()
 
   constructor(ctx: Context, options: SessionLinkTaskServiceOptions = {}) {
     super(ctx, 'sessionLinkTasks')
@@ -520,7 +537,22 @@ export class SessionLinkTaskService extends Service {
 
   /** Read one stored task row (wire-layer helper; access rules live in `getTask`). */
   getRow(taskId: SessionLinkTaskId): SessionLinkTaskRecordData | undefined {
-    return this.tasks.get(taskId)
+    const row = this.tasks.get(taskId)
+    /* Event-set-based note pruning on every read: the notes explain a live
+     * failure realm; once an event's marker landed the note must not leak
+     * into a later read (stale notes belong to the failed epoch only). */
+    if (row !== undefined) this.pruneMarkerNotes(taskId, row)
+    return row
+  }
+
+  /** Drop notes whose event no longer sits unmarked-pending on the row. */
+  private pruneMarkerNotes(taskId: SessionLinkTaskId, row: SessionLinkTaskRecordData): void {
+    const notes = this.outboxMarkerFailures.get(taskId)
+    if (notes === undefined) return
+    for (const event of row.outbox) {
+      if (event.status !== 'pending' || event.notifiedMessageId !== undefined) notes.delete(event.eventId)
+    }
+    if (notes.size === 0) this.outboxMarkerFailures.delete(taskId)
   }
 
   /** List all stored rows (reconciliation/reporting helper). */
@@ -575,7 +607,22 @@ export class SessionLinkTaskService extends Service {
     if (row === undefined || !this.canRead(callerId, row)) {
       throw new SessionLinkError(`task "${taskId}" not found`, 'MESSAGE_NOT_FOUND')
     }
-    return this.project(row)
+    const view = this.project(row)
+    /* Review risk 2 observability: surface the live marker-write failure
+     * notes as pending-failure context on the read model. The durable row is
+     * the authority (the event is genuinely pending, marker absent) — the
+     * note only says WHY. An event whose marker finally landed (or whose
+     * note is no longer in its pending set) does not appear. */
+    const notes = this.outboxMarkerFailures.get(taskId)
+    if (notes !== undefined && notes.size > 0) {
+      const failureNotes: { eventId: string; message: string }[] = []
+      for (const event of row.outbox) {
+        const message = notes.get(event.eventId)
+        if (message !== undefined) failureNotes.push({ eventId: event.eventId, message })
+      }
+      if (failureNotes.length > 0) return { ...view, outboxMarkerFailureNotes: [...failureNotes] }
+    }
+    return view
   }
 
   private canRead(callerId: SessionId, row: SessionLinkTaskRecordData): boolean {
@@ -1112,6 +1159,7 @@ export class SessionLinkTaskService extends Service {
       this.assertNotificationRecipient(row, notifiedMessageId)
       const outbox = row.outbox.slice()
       outbox[index] = { ...event, status: 'admitted', notifiedMessageId }
+      this.outboxMarkerFailures.get(taskIdFor(row.callerId, row.callId))?.delete(eventId)
       return { ...row, outbox, revision: row.revision + 1, updatedAt: this.clock() }
     })
   }
@@ -1127,7 +1175,14 @@ export class SessionLinkTaskService extends Service {
       if (index === -1) throw new SessionLinkError(`outbox event "${eventId}" not found on task "${taskId}"`, 'MESSAGE_NOT_FOUND')
       const event = row.outbox[index]!
       if (event.status === 'delivered') return row
-      if (event.status !== 'admitted') {
+      /* Review risk 2 self-heal (marker CAS inside the same atom): a previous
+       * pass admitted the event to the mailbox but its marker write failed
+       * durably (admitted-not-marker-confirmed); a LATER pass saw the mailbox
+       * message reach `delivered` before the admitted marker could persist.
+       * Recording delivered straight from pending skips no mailbox fact —
+       * the message already shipped with the SAME identity. The row mutation
+       * below also drops the live (in-memory) marker-failure note. */
+      if (event.status !== 'admitted' && event.status !== 'pending') {
         throw new SessionLinkError(
           `outbox event "${eventId}" is ${event.status}; only admitted events can be delivered`,
           'MESSAGE_UNDELIVERABLE',
@@ -1135,6 +1190,7 @@ export class SessionLinkTaskService extends Service {
       }
       const outbox = row.outbox.slice()
       outbox[index] = { ...event, status: 'delivered' }
+      this.outboxMarkerFailures.get(taskIdFor(row.callerId, row.callId))?.delete(eventId)
       return { ...row, outbox, revision: row.revision + 1, updatedAt: this.clock() }
     })
   }
@@ -1155,6 +1211,44 @@ export class SessionLinkTaskService extends Service {
       outbox[index] = { ...event, status: 'blocked', blockedReason }
       return { ...row, outbox, revision: row.revision + 1, updatedAt: this.clock() }
     })
+  }
+
+  /**
+   * Record WHY one outbox marker write just failed durably (review risk 2):
+   * the event's mailbox leg SUCCEEDED but its durable receipt never
+   * persisted, leaving the event honestly pending (admitted-not-marker-
+   * confirmed). The note is LIVE process state — attending the failure with
+   * ANOTHER durable write would throw the same persistent code — so instead
+   * the caller passes the revision it attempted against, and the note lands
+   * only when the CURRENT row still sits at exactly that revision (the live
+   * analogue of CAS). `session_get_task` then surfaces the pending event
+   * with a visible failure reason instead of a silent stuck pending; a
+   * later genuine pass clears the note by finally landing a marker. The
+   * durable row NEVER claims admitted/delivered without the marker CAS —
+   * this writes no forged marker.
+   */
+  noteOutboxMarkerFailure(
+    taskId: SessionLinkTaskId,
+    eventId: string,
+    attemptedRevision: number,
+    failure: unknown,
+  ): SessionLinkTaskRecordData | undefined {
+    const message = failure instanceof Error ? failure.message : String(failure)
+    /* Live-only: the CURRENT row must still be at the revision the failed
+     * marker attempted against (a concurrent write since means another
+     * pass's facts apply; nothing is noted for a revision the task moved
+     * past). Under PERSISTENT write failure a durable touch-write would
+     * throw the same code — visibility must not depend on the very medium
+     * that is failing; the revision equality is the CAS fact this
+     * observation carries, and the event must still be unmarked-pending. */
+    const row = this.tasks.get(taskId)
+    if (row === undefined || row.revision !== attemptedRevision) return row
+    const event = row.outbox.find(candidate => candidate.eventId === eventId)
+    if (event === undefined || event.status !== 'pending' || event.notifiedMessageId !== undefined) return row
+    const notes = this.outboxMarkerFailures.get(taskId) ?? new Map<string, string>()
+    notes.set(eventId, message)
+    this.outboxMarkerFailures.set(taskId, notes)
+    return row
   }
 
   /** Guard: the notification message must ride the same sender→target pair as the task. */
@@ -1391,7 +1485,18 @@ export class SessionLinkTaskService extends Service {
       events.push({ kind: 'cancelled', decisionRequired: false, resumable: false })
     } else {
       toState = input.action === 'retry' ? 'preparing' : 'queued'
-      const policy = input.policy ?? row.policy
+      /* Retry-scope adjudication (MODEL_ROUTING_FIX_PLAN Task 5, review risk
+       * 3), LOCKED semantics: a decision that replaces the ROUTE omits scope
+       * from the wire surface BY DESIGN — model_scope is a user grant scoped
+       * to this task's persistent-selection consent, and silently degrading
+       * session → task would strip consent the user gave. The replacement
+       * policy therefore preserves the ORIGINAL attempt's scope; the durable
+       * row snapshot (below) records that exact scope so the persisted
+       * baseline commit and session_get_task agree on what was granted. A
+       * caller who genuinely wants a different scope starts a NEW task. */
+      const policy = input.policy === undefined
+        ? row.policy
+        : { ...input.policy, scope: row.policy.scope as 'task' | 'session' }
       newAttempt = {
         attemptId: attemptIdFor(taskId, row.attempts.length + 1),
         ordinal: row.attempts.length + 1,
@@ -1458,7 +1563,10 @@ export class SessionLinkTaskService extends Service {
         ...retired,
         attempts,
         currentAttemptId,
-        ...(input.policy === undefined ? {} : { policy: clonePolicy(input.policy) }),
+        /* The durable policy snapshot carries the SAME adjudicated scope the
+         * attempt normalization above computed: a replaced route keeps the
+         * ORIGINAL scope (never a silent session→task downgrade). */
+        ...(input.policy === undefined ? {} : { policy: clonePolicy({ ...input.policy, scope: row.policy.scope }) }),
         execution: {},
         decisions: [...current.decisions, decision],
       }

@@ -817,7 +817,12 @@ async function projectWait(
     /* CRITICAL-2: this projection committed an outbox event; the sender
      * must not wait for an unrelated tool call before the notification. */
     runtime.schedulePump?.()
-  } catch { /* CAS conflict: a concurrent projection already landed honestly */ }
+  } catch (error: unknown) {
+    /* CAS conflict: a concurrent projection already landed honestly. A durable
+     * write failure is not that — surface it (the caller's own catch projects
+     * or logs honestly) instead of pretending the wait state stuck. */
+    if (!isStaleRejection(error)) throw error
+  }
 }
 
 /** Recover the stable task identity from a stored row. */
@@ -1106,7 +1111,15 @@ async function projectFinishTasks(
         try {
           await tasks.appendCandidateResult(active.taskId, revision, { route: routeUsed, outcome: 'selected' })
           revision = (tasks.getRow(active.taskId) ?? row).revision
-        } catch { /* never blocks the finish projection */ }
+        } catch (error: unknown) {
+          /* Review risk (terminal projection vs outbox marker revision race):
+           * a STALE CAS here means a concurrent projection/marker legitimately
+           * landed first — forward progress; the finish projection falls
+           * through on the live row. A DURABLE write failure instead throws
+           * honestly (the attempt journal is not durable) — NEVER collapsed
+           * into the "another terminal projection already done" class. */
+          if (!isStaleRejection(error)) throw error
+        }
       }
     }
     try {
@@ -1124,7 +1137,12 @@ async function projectFinishTasks(
         }],
       })
       pumped(true)
-    } catch { /* CAS conflict: state already landed */ }
+    } catch (error: unknown) {
+      /* Marker CAS ≠ terminal CAS: a stale rejection means another projection
+       * legitimately settled the row first; a durable write failure must
+       * surface, never masquerade as a completed terminal projection. */
+      if (!isStaleRejection(error)) throw error
+    }
     return
   }
 
@@ -1160,7 +1178,10 @@ async function projectFinishTasks(
         events: [event],
       })
       pumped(true)
-    } catch { /* concurrently projected */ }
+    } catch (error: unknown) {
+      // Concurrent projection is the only benign race; durable failures surface.
+      if (!isStaleRejection(error)) throw error
+    }
     return
   }
 
@@ -1174,7 +1195,10 @@ async function projectFinishTasks(
         ...(active.lastFailureMessage === undefined ? {} : { message: active.lastFailureMessage }),
       })
       revision = (tasks.getRow(active.taskId) ?? row).revision
-    } catch { /* fall through to the waiting_decision projection */ }
+    } catch (error: unknown) {
+      // Only a stale CAS falls through to the waiting_decision projection.
+      if (!isStaleRejection(error)) throw error
+    }
   }
   const finalRow = tasks.getRow(active.taskId) ?? row
   const finalAttempt = finalRow.attempts.find(candidate => candidate.attemptId === active.attemptId) ?? attempt
@@ -1201,5 +1225,25 @@ async function projectFinishTasks(
       }],
     })
     pumped(true)
-  } catch { /* CAS conflict: the row already settled */ }
+  } catch (error: unknown) {
+    // Same classification: settled-by-a-concurrent-writer vs durable failure.
+    if (!isStaleRejection(error)) throw error
+  }
+}
+
+/**
+ * Marker conflict ≠ projection conflict (MODEL_ROUTING_FIX_PLAN Task 5,
+ * review risk 1): the terminal projections above share the task row's CAS
+ * revision with the outbox pump's marker writes, so a bare catch could read
+ * ANY failure as "another terminal projection already landed". Only a typed
+ * stale/terminal rejection means the row legitimately moved on; typed
+ * durable write failures (TASK_WRITE_FAILED) and unexpected errors must
+ * propagate to the finish-loop caller's warn log, never be swallowed.
+ */
+function isStaleRejection(error: unknown): boolean {
+  return error instanceof Error
+    && 'code' in error
+    && typeof (error as { code?: unknown }).code === 'string'
+    && ((error as { code: string }).code === 'TASK_STALE_REVISION'
+      || (error as { code: string }).code === 'TASK_TERMINAL')
 }

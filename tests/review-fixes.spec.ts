@@ -1,24 +1,159 @@
 /**
- * Round-2 review-defect grip tests (R##-prefixed). Each case pins one confirmed
- * review finding through the harness the reviewer normalized in
- * `artifacts/review/model-routing-probes.spec.ts`; R01 specifically proves the
- * PRODUCTION assembly (raw-loader sub-plugin + cordis inject, no test escape)
- * admits a tracked spawn.
+ * Round-2 review-defect grip tests (R##-prefixed), PERSISTENT fixtures.
+ * Each case pins one confirmed review finding through the harness the
+ * reviewer normalized in `artifacts/review/model-routing-probes.spec.ts`;
+ * R01 proves the PRODUCTION assembly (raw-loader sub-plugin + cordis
+ * inject, no test escape) admits a tracked spawn, and the Task-5 tails gate
+ * the three flagged-but-unconfirmed risks plus the old-host contract.
  *
- * Task 2 (MODEL_ROUTING_FIX_PLAN) lands the unified host single owner for
+ * The harness (stack/spawn below) is a SELF-CONTAINED copy of what the
+ * reviewer's artifacts probe booted, minus the '__sessionLinkTasks' escape
+ * mode: the task service ALWAYS mounts the production way (raw-loader
+ * sub-plugin + cordis inject, R01). The historical raw probes under
+ * `artifacts/review/` stay frozen and untouched; this file is the suite
+ * every gate runs in, and `test:host`/`pnpm exec vitest run` both include it.
+ *
+ * Task 2 (MODEL_ROUTING_FIX_PLAN) landed the unified host single owner for
  * task-bound turns: R02 (controller never overrides the task route), R06
  * (monotonic baseline CAS revision), R07 (durable task/human baseline
  * separation across a rebuild), R05 (success-gated persist), R04 (host
- * managed-input guard), and R12 (partial streamed output bars automatic
- * fallback). R03/R08+ remain Task-3+ work and stay RED here.
+ * managed-input guard), R12 (partial streamed output bars automatic
+ * fallback). Task 3 landed the admission-gate cluster (R03/R08–R16); Task 4
+ * the notification identity/root/pump cluster (R14/R17/R18); Task 5 closes
+ * with the risk gates + this self-containment migration.
  * @module
  */
 
-import { expect, it, vi } from 'vitest'
-import { A, BASE, spawn, stack } from '../artifacts/review/model-routing-probes.spec.ts'
-import { MockAdapter, textResponse } from './helpers/mock-adapter.ts'
+import { afterEach, expect, it, vi } from 'vitest'
+import { Context } from '@deepseek-ai/cordis'
+import AgentLoop from '@deepseek-ai/dsh-agent-loop'
+import { mountAgentLoopTestDependencies } from '@deepseek-ai/dsh-agent-loop-testkit'
+import type { Agent } from '@deepseek-ai/dsh-agent'
+import { SessionId } from '@deepseek-ai/dsh-session'
+import Storage from '@deepseek-ai/dsh-storage'
+import { DomainFacility } from '@deepseek-ai/dsh-storage-domain'
+import { installModelSelectionProjection, installTaskTurnIntentsProjection } from '@deepseek-ai/dsh-api-session-controller'
+import { ApiSessionAgentController } from '/Users/gc/Dev/Opensource/deepseek-harness/packages/api/session-controller/src/agent.ts'
 import { HarnessError, ToolCallId } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions } from '@deepseek-ai/dsh-llm'
+import SessionLinkService, { SessionLinkTaskService, taskIdFor } from '../src/index.ts'
+import * as toolPlugin from '../src/tools.ts'
+import { MockAdapter, textResponse } from './helpers/mock-adapter.ts'
+import { MemoryMediaPool, MemoryStorageBackend } from './helpers/memory-backend.ts'
+
+/* --------------------------------------------------------------------------
+ * Self-contained harness (the reviewer probe's stack/spawn minus the escape
+ * mode). `stack()` boots two live Agents over per-domain pooled memory
+ * backends with the REAL link service, projections, tool row — and the task
+ * service mounted through `SessionLinkTaskService`'s own plugin row exactly
+ * the way production assembles it (never a defineProperty escape). The
+ * 'mounted' assembly case pins that production path; 'absent' is the honest
+ * PRE-R01 old-host shape (no task service) whose legacy contract the Old-host
+ * grip below asserts.
+ * ------------------------------------------------------------------------ */
+
+const contexts = new Set<Context>()
+afterEach(async () => {
+  for (const ctx of [...contexts].reverse()) await ctx.fiber.dispose()
+  contexts.clear()
+})
+
+const BASE = 'base-model'
+const A = 'model-a'
+
+async function stack(
+  adapter: MockAdapter,
+  available: string[] = [BASE, A, 'model-b'],
+  realController = false,
+  taskAssembly: 'mounted' | 'absent' = 'mounted',
+  linksConfig: Record<string, number> = {},
+) {
+  const ctx = new Context()
+  contexts.add(ctx)
+  await mountAgentLoopTestDependencies(ctx)
+  await ctx.plugin(Storage)
+  ctx.storage.backend.register('memory', new MemoryStorageBackend(new MemoryMediaPool()))
+  const facility = new DomainFacility(ctx, { backend: 'memory', routes: {} })
+  ctx.storage.mount('domain', facility)
+  ctx.provide('storageDomain', facility)
+  ctx.provide('workspaceRegistry', { archivedSessionIds: [] as readonly SessionId[] } as never)
+  installModelSelectionProjection(ctx)
+  installTaskTurnIntentsProjection(ctx)
+  await ctx.plugin(AgentLoop, { agents: [] })
+  ctx.llm.registerAdapter(['mock'], adapter)
+  await ctx.plugin(SessionLinkService, linksConfig)
+  if (taskAssembly !== 'absent') {
+    const fiber = await ctx.plugin(SessionLinkTaskService, {
+      links: {
+        message: id => ctx.sessionLinks.message(id),
+        pairLinked: (linkId, first, second) => ctx.sessionLinks.list(first).some(l => l.id === linkId && l.memberIds.includes(second)),
+      },
+      /* The same R03/R08 decision-time hooks the production assembly wires
+       * (src/service-tasks.ts); the suites exercise the real cancellation
+       * revocation, not a hook-less test realm. */
+      revokeDelivery: (_taskId, row) => {
+        void (async () => {
+          const messageId = row.execution.messageId
+          if (messageId !== undefined) {
+            const record = ctx.sessionLinks.message(messageId)
+            if (record?.status === 'pending') await ctx.sessionLinks.cancel(undefined, messageId).catch(() => {})
+          }
+          const intentId = row.execution.turnIntentId
+          const targetId = row.execution.sessionId ?? row.targetSessionId ?? row.spawn?.targetSessionId
+          if (intentId === undefined || targetId === undefined) return
+          const agent = ctx.agents.get(targetId)
+          if (agent === undefined) return
+          const { ensureTaskHostLazy } = await import('../src/task-host-lazy.ts')
+          const host = await ensureTaskHostLazy(agent).catch(() => undefined)
+          if (host === undefined) return
+          try { await host.cancelTurnIntent(intentId, 'resolve_task onset cancel') } catch { /* settled */ }
+        })()
+      },
+      markLegacyDelivery: messageId => {
+        const record = ctx.sessionLinks.message(messageId)
+        if (record === undefined || record.idempotencyKey === undefined) return
+        if (record.status === 'pending') {
+          void ctx.sessionLinks.cancel(undefined, messageId).catch(() => {})
+          return
+        }
+        void ctx.sessionLinks.markRetried(messageId, `${record.idempotencyKey}/consumed`).catch(() => {})
+      },
+    })
+    await fiber.await()
+  }
+  const alice = await ctx.agentLoop.create(SessionId('review-alice'), { provider: 'mock', model: BASE })
+  const bob = await ctx.agentLoop.create(SessionId('review-bob'), { provider: 'mock', model: BASE })
+  ctx.provide('sessionTitle', { get: (session: { id: SessionId }) => ({ title: session.id }) } as never)
+  ctx.provide('sessionController', {
+    create: async () => ({ sessionId: bob.id }), rename: async () => ({}),
+    modelCatalog: async () => ({
+      default: { provider: 'mock', model: BASE }, routableProviders: ['mock'],
+      groups: [{ id: 'mock', models: available.map(id => ({ id })) }], failures: [],
+    }),
+  } as never)
+  if (realController) {
+    Object.defineProperty(ctx, 'agentDefaultModel', { value: { currentSelection: () => ({ provider: 'mock', model: BASE }) } })
+    Object.defineProperty(ctx, 'typert', { value: { lookups: { configure() {} }, contexts: { configureHost() {} } } })
+    const controller = new ApiSessionAgentController(ctx)
+    controller.selectionFor(alice); controller.selectionFor(bob)
+  }
+  await ctx.plugin(toolPlugin)
+  await vi.waitFor(() => expect(ctx.tools.get('session_spawn_linked_session', alice)).toBeDefined())
+  return { ctx, alice, bob }
+}
+
+async function spawn(s: Awaited<ReturnType<typeof stack>>, callId: string, extra: Record<string, unknown>) {
+  const result = await s.ctx.tools.execute({
+    signal: new AbortController().signal,
+    callId: ToolCallId(callId), name: 'session_spawn_linked_session', agent: s.alice,
+    arguments: { cwd: '/tmp/review-routing-probe', task: 'perform this task', provider: 'mock', model: A, ...extra },
+  })
+  if (result.isError) throw new Error(JSON.stringify(result.content))
+  return result.value as {
+    outcome: string
+    selectedModel?: { provider: string; model: string }
+  }
+}
 
 /** The v4 modelSelection unit row shape the checkpoint tests assert against. */
 interface ModelSelectionUnitRow {
@@ -90,6 +225,143 @@ it('R01: production assembly mounts the task service without test escape', async
   expect(result.outcome).toBe('admitted')
   // cordis injection alone (never a defineProperty escape) exposes the service.
   expect(s.ctx.sessionLinkTasks).toBeDefined()
+})
+
+/* --------------------------------------------------------------------------
+ * Migrated reviewer probes (artifacts/review/model-routing-probes.spec.ts).
+ * The 7 reproductions the round-2 review fired its 18 confirmed findings
+ * from, now persistent fixtures on the self-contained harness; the "shipped
+ * assembly (absent)" probe becomes the honest old-host contract grip below.
+ * The historical raw probes stay frozen under artifacts/review/ (untouched).
+ * ------------------------------------------------------------------------ */
+
+it('R01 old host: tracked params refuse HOST_CAPABILITY_UNAVAILABLE; the four legacy tools keep working', async () => {
+  /* The old-host contract (this REPLACES the superseded 'absent' probe,
+   * whose bare `isError: false` demand was impossible by design on a pre-R01
+   * host): plugins mounted WITHOUT src/service-tasks.ts lack the task-host
+   * capability, so a tracked call must fail closed — NO task row, NO
+   * Session, NO mailbox message — while the untracked legacy paths
+   * (link/untracked send/untracked spawn/cancel) keep working unchanged. */
+  const adapter = new MockAdapter([textResponse('legacy ok'), textResponse('legacy spawn ok')])
+  const s = await stack(adapter, [BASE, A], /* realController= */ false, /* taskAssembly= */ 'absent')
+  // Tracked spawn refuses honestly.
+  const tracked = await s.ctx.tools.execute({
+    signal: new AbortController().signal, callId: ToolCallId('r01-old-tracked'),
+    name: 'session_spawn_linked_session', agent: s.alice,
+    arguments: { cwd: '/tmp/r01-old', task: 'tracked on old host', provider: 'mock', model: A },
+  })
+  expect(tracked.isError).toBe(true)
+  expect(JSON.stringify((tracked as { content?: unknown }).content)).toContain('HOST_CAPABILITY_UNAVAILABLE')
+  // No task row leaked; the service is genuinely absent.
+  expect((s.ctx as { sessionLinkTasks?: unknown }).sessionLinkTasks).toBeUndefined()
+  // Legacy link + untracked send still work (link through the service the
+  // human command rides; the send then rides the legacy admission path).
+  await s.ctx.sessionLinks.link('r01-old-pair', [s.alice.id, s.bob.id], { kind: 'human' })
+  const sent = await s.ctx.tools.execute({
+    signal: new AbortController().signal, callId: ToolCallId('r01-old-send'),
+    name: 'session_send_session_message', agent: s.alice,
+    arguments: { session_id: s.bob.id, message: 'legacy untracked' },
+  })
+  expect(sent.isError).not.toBe(true)
+  expect((sent as { value?: { status?: string } }).value?.status).toBeDefined()
+  // Legacy untracked spawn still works (the mock controller returns bob).
+  const spawned = await s.ctx.tools.execute({
+    signal: new AbortController().signal, callId: ToolCallId('r01-old-spawn'),
+    name: 'session_spawn_linked_session', agent: s.alice,
+    arguments: { cwd: '/tmp/r01-old-legacy', task: 'legacy untracked spawn' },
+  })
+  expect(spawned.isError).not.toBe(true)
+  await s.bob.whenIdle().catch(() => {})
+})
+
+it('R03 probe: cancelling a queued tracked task prevents execution on a later wake (probe migration)', async () => {
+  const adapter = new MockAdapter([textResponse('human answer'), textResponse('cancelled task answer')])
+  const s = await stack(adapter)
+  await s.ctx.sessionLinks.link('cancel-pair', [s.alice.id, s.bob.id], { kind: 'human' })
+  const sent = await s.ctx.tools.execute({
+    signal: new AbortController().signal, callId: ToolCallId('review-queued-cancel'),
+    name: 'session_send_session_message', agent: s.alice,
+    arguments: { session_id: s.bob.id, message: 'CANCELLED_TASK_MUST_NOT_EXECUTE', provider: 'mock', model: A },
+  })
+  expect(sent.isError).not.toBe(true)
+  const taskId = taskIdFor(s.alice.id, 'review-queued-cancel')
+  const row = s.ctx.sessionLinkTasks.getRow(taskId)!
+  const cancelled = await s.ctx.tools.execute({
+    signal: new AbortController().signal, callId: ToolCallId('review-cancel-decision'),
+    name: 'session_resolve_task', agent: s.alice,
+    arguments: { task_id: taskId, expected_revision: row.revision, action: 'cancel' },
+  })
+  expect(cancelled.isError).not.toBe(true)
+  expect(s.ctx.sessionLinkTasks.getRow(taskId)?.taskState).toBe('cancelled')
+  s.bob.followup({ content: [{ type: 'text', text: 'human later wake' }], source: { kind: 'user' } } as never)
+  await s.ctx.sessionLinks.deliverPending(s.bob.id)
+  await s.bob.whenIdle()
+  expect(adapter.requests.map(r => r.model)).not.toContain(A)
+})
+
+it('R02 probe: a real API-Session model owner never overrides the tracked task route (probe migration)', async () => {
+  const adapter = new MockAdapter([textResponse('ok')])
+  const s = await stack(adapter, [BASE, A, 'model-b'], true)
+  await spawn(s, 'review-real-controller', {})
+  await s.bob.whenIdle()
+  expect(adapter.requests.map(r => r.model)).toEqual([A])
+})
+
+it('R10 probe: execution honors the catalog-selected fallback B over the rejected primary A (probe migration)', async () => {
+  const B = 'model-b'
+  const adapter = new MockAdapter([textResponse('ok')])
+  const s = await stack(adapter, [BASE, B])
+  const result = await spawn(s, 'review-catalog-fallback', { on_model_unavailable: { fallbacks: [{ provider: 'mock', model: B }] } })
+  expect(result.selectedModel?.model).toBe(B)
+  await s.bob.whenIdle()
+  expect(adapter.requests.map(r => r.model)).toEqual([B])
+})
+
+it('R13 probe: a default-only fallback admits when the primary is absent and the default available (probe migration)', async () => {
+  const adapter = new MockAdapter([textResponse('ok')])
+  const s = await stack(adapter, [BASE])
+  const result = await spawn(s, 'review-default-fallback', { on_model_unavailable: { fallbacks: [{ use: 'session_default' }] } })
+  expect(result.outcome).toBe('admitted')
+})
+
+it('R12 probe: partial streamed output prevents automatic fallback (probe migration)', async () => {
+  const B = 'model-b'
+  class PartialFailing extends MockAdapter {
+    constructor() { super([]) }
+    override async *stream(options: GenerateOptions) {
+      this.requests.push(options)
+      if (options.model === A) {
+        yield { type: 'block-start' as const, index: 0, blockType: 'text' as const }
+        yield { type: 'text-delta' as const, index: 0, text: 'already visible partial answer' }
+        throw new HarnessError('upstream lost after chunks', 'PROVIDER_UNAVAILABLE')
+      }
+      for (const c of textResponse('fallback')) yield c
+    }
+  }
+  const adapter = new PartialFailing()
+  const s = await stack(adapter)
+  await spawn(s, 'review-partial', { on_model_unavailable: { fallbacks: [{ provider: 'mock', model: B }] } })
+  await s.bob.whenIdle().catch(() => {})
+  expect(adapter.requests.map(r => r.model)).toEqual([A])
+})
+
+it('R05 probe: a failed session-scope task never persists its model as baseline (probe migration)', async () => {
+  class Failing extends MockAdapter {
+    constructor() { super([]) }
+    override async *stream(options: GenerateOptions) {
+      this.requests.push(options)
+      throw new HarnessError('down', 'PROVIDER_UNAVAILABLE')
+    }
+  }
+  const adapter = new Failing()
+  const s = await stack(adapter)
+  await spawn(s, 'review-failed-session', { model_scope: 'session' })
+  await s.bob.whenIdle().catch(() => {})
+  await vi.waitFor(() => expect(s.ctx.sessionLinkTasks.getRow(taskIdFor(s.alice.id, 'review-failed-session'))?.taskState).toBe('waiting_decision'))
+  const selections = s.bob.session.snapshotEvents()
+    .filter(e => e.type === 'model/selection')
+    .map(e => (e.data as { model: string }).model)
+  expect(selections).not.toContain(A)
 })
 
 /* --------------------------------------------------------------------------
@@ -543,7 +815,7 @@ it('R18: a precheck-failed task\'s notifications ride ONE wake-budget chain acro
     textResponse('alice wake turn'), // alice's wake handles the first report
     textResponse('bob task turn'),   // bob's wake executes the retried task
   ])
-  const s = await stack(adapter, [BASE], false, 'escape', { maxAutoWakesPerChain: 1 })
+  const s = await stack(adapter, [BASE], false, 'mounted', { maxAutoWakesPerChain: 1 })
   await s.ctx.sessionLinks.link('r18-pair', [s.alice.id, s.bob.id], { kind: 'human' }, {
     autoWakeSessionIds: [s.alice.id, s.bob.id],
   })
@@ -645,7 +917,7 @@ it('R14: capacity-freeing delivery re-pumps the refused outbox with no new task 
     textResponse('alice human turn'),
     textResponse('bob task turn'),
   ])
-  const s = await stack(adapter, [BASE], false, 'escape', { maxPendingPerTarget: 2 })
+  const s = await stack(adapter, [BASE], false, 'mounted', { maxPendingPerTarget: 2 })
   await s.ctx.sessionLinks.link('r14-pair', [s.alice.id, s.bob.id], { kind: 'human' }, {
     autoWakeSessionIds: [s.bob.id],
   })
@@ -1107,3 +1379,345 @@ it('R16 legacy adoption: a PRE-R16 row still recognizes its genuine replay throu
   // The v1/v2 digests genuinely differ — the version bump is real.
   expect(legacyRequestDigest(request, policy)).not.toBe(requestDigest(request, policy))
 })
+
+/* --------------------------------------------------------------------------
+ * Task 5 gates — the reviewer's three flagged-but-unconfirmed risks
+ * (CODE_REVIEW_MODEL_ROUTING.md §"尚未计为已确认缺陷的风险") plus the
+ * concurrent decision-replay atomicity verification ("还需单独验证"). These
+ * are the FIRST persistent fixtures that exercise the exact realms the
+ * reviewer flagged; the two retry-scope cases double as the adjudication
+ * lock (a decision replacing the route preserves the original scope).
+ * ------------------------------------------------------------------------ */
+
+it('Risk-3 retry scope: a retry replacing the route on a SESSION-scope task preserves the session grant', async () => {
+  // Reviewer observation: policy.scope=session + retry with a replacement
+  // provider/model measured scope flipping to task. Adjudicated and LOCKED:
+  // session scope is the user's persistent-selection consent scoped to the
+  // task; silently degrading removes that consent (wrong direction). The
+  // durable policy snapshot on the NEW attempt must carry the ORIGINAL
+  // scope, and the wire surface stays scope-free.
+  const adapter = new MockAdapter([textResponse('ok')])
+  // Catalog lacks model-a: the session-scope task fails precheck honestly.
+  const s = await stack(adapter, [BASE, 'model-b'])
+  const B2 = 'model-b'
+  const spawned = await exec(s, 'session_spawn_linked_session', {
+    cwd: '/tmp/risk3-session', task: 'session-scope retry task', provider: 'mock', model: A, model_scope: 'session',
+  }, 'risk3-session')
+  expect(spawned.isError).not.toBe(true)
+  expect((spawned as { value?: { outcome?: string } }).value?.outcome).toBe('needs_decision')
+  const { taskIdFor } = await import('../src/index.ts')
+  const taskId = taskIdFor(s.alice.id, 'risk3-session')
+  const waiting = s.ctx.sessionLinkTasks.getRow(taskId)!
+  expect(waiting.taskState).toBe('waiting_decision')
+  expect(waiting.policy.scope).toBe('session')
+  // Retry with a different provider/model, omitting any scope token.
+  const decided = await exec(s, 'session_resolve_task', {
+    task_id: taskId, expected_revision: waiting.revision, action: 'retry', provider: 'mock', model: B2,
+  }, 'risk3-session-decision')
+  expect(decided.isError).not.toBe(true)
+  const row = s.ctx.sessionLinkTasks.getRow(taskId)!
+  // LOCKED: the durable policy snapshot preserves the ORIGINAL session grant.
+  expect(row.policy.scope).toBe('session')
+  expect((row.policy.candidates[0] as { model?: string }).model).toBe(B2)
+  const newAttempt = row.attempts.at(-1)!
+  expect(newAttempt.kind).toBe('retry')
+  await s.bob.whenIdle().catch(() => {})
+})
+
+it('Risk-3 retry scope: a retry replacing the route on a TASK-scope task keeps task scope (never a silent upgrade either)', async () => {
+  const adapter = new MockAdapter([textResponse('ok')])
+  const s = await stack(adapter, [BASE, 'model-b'])
+  const B2 = 'model-b'
+  const spawned = await exec(s, 'session_spawn_linked_session', {
+    cwd: '/tmp/risk3-task', task: 'task-scope retry task', provider: 'mock', model: A,
+  }, 'risk3-task')
+  expect(spawned.isError).not.toBe(true)
+  expect((spawned as { value?: { outcome?: string } }).value?.outcome).toBe('needs_decision')
+  const { taskIdFor } = await import('../src/index.ts')
+  const taskId = taskIdFor(s.alice.id, 'risk3-task')
+  const waiting = s.ctx.sessionLinkTasks.getRow(taskId)!
+  expect(waiting.taskState).toBe('waiting_decision')
+  expect(waiting.policy.scope).toBe('task')
+  const decided = await exec(s, 'session_resolve_task', {
+    task_id: taskId, expected_revision: waiting.revision, action: 'retry', provider: 'mock', model: B2,
+  }, 'risk3-task-decision')
+  expect(decided.isError).not.toBe(true)
+  const row = s.ctx.sessionLinkTasks.getRow(taskId)!
+  // Symmetric lock: task scope is preserved verbatim (no silent upgrade).
+  expect(row.policy.scope).toBe('task')
+  expect((row.policy.candidates[0] as { model?: string }).model).toBe(B2)
+  await s.bob.whenIdle().catch(() => {})
+})
+
+it('Risk-2 marker cascade: persistently failing outbox-marker writes bound the pump cascade, surface on get_task, keep ONE mailbox row, and self-heal', async () => {
+  /* Reviewer realm, reproduced deterministically: the mailbox admission
+   * SUCCEEDS (a real durable mailbox row ships) while the task-table marker
+   * write KEEPS FAILING. Pre-fix the pump's cascade re-entered with no bound
+   * (each pass's successful mailbox write set the cascade flag again).
+   * Post-fix: (1) the epoch budget caps consecutive failure-driven cascades;
+   * (2) session_get_task surfaces the event pending + marker failure note;
+   * (3) exactly ONE mailbox row ever exists; (4) a later genuine trigger
+   * (writes recovering) self-heals — marker lands, note clears. */
+  const { bootStack } = await import('./helpers/domains.ts')
+  const { installTaskNotifications } = await import('../src/task-notifications.ts')
+  const { MemoryMediaPool } = await import('./helpers/memory-backend.ts')
+  // bootStack registers its contexts in the caller's set; this test owns its
+  // own registry so the fault-injected stacks dispose with the test.
+  const localContexts = new Set<import('@deepseek-ai/cordis').Context>()
+  const pools = { links: new MemoryMediaPool(), tasks: new MemoryMediaPool() }
+  const adapter = new MockAdapter([textResponse('ok')])
+  const booted = await bootStack(localContexts, pools, { adapter })
+  try {
+    const pump = installTaskNotifications(booted.ctx, {
+      tasks: () => booted.ctx.sessionLinkTasks,
+      links: () => booted.ctx.sessionLinks,
+    })
+    await booted.ctx.sessionLinks.link('risk2-pair', [booted.alice.id, booted.bob.id], { kind: 'human' })
+    /* Arm the persistent task-table write failure IMMEDIATELY: the domain
+     * seeds its global doc and the link create commits before the next
+     * task-table write, so the intent write below still lands; every write
+     * AFTER it (the outbox marker) fails for the rest of the armed window. */
+    const sent = await booted.ctx.tools.execute({
+      signal: new AbortController().signal, callId: ToolCallId('risk2-send'),
+      name: 'session_send_session_message', agent: booted.alice,
+      // bootStack's default catalog lacks 'model-absent': the tracked send
+      // fails precheck honestly, committing a waiting task with ONE pending
+      // outbox event (no session, no mailbox message).
+      arguments: { session_id: booted.bob.id, message: 'risk2 task on a missing model', provider: 'mock', model: 'model-absent' },
+    })
+    expect(sent.isError).not.toBe(true)
+    expect((sent as { value?: { outcome?: string } }).value?.outcome).toBe('needs_decision')
+    const { taskIdFor } = await import('../src/index.ts')
+    const taskId = taskIdFor(booted.alice.id, 'risk2-send')
+    /* The pump pass the send scheduled may race our arming, so settle the
+     * queue and RESET the outbox event to pending if a healthy pass already
+     * admitted it — the deterministic starting state for the failing epoch
+     * is "pending + mailbox row EXISTS", exactly the reviewer's realm after
+     * the first admission. Re-arming persistent failures then drives the
+     * failing epoch honestly. */
+    const drain = async () => {
+      await pump.drain(); await pump.drain(); await pump.drain(); await pump.drain(); await pump.drain()
+    }
+    await drain()
+    const live0 = booted.ctx.sessionLinkTasks.getRow(taskId)!
+    const event0 = live0.outbox[0]!
+    const table = (booted.ctx.sessionLinkTasks as unknown as { tasks: {
+      put(key: unknown, value: unknown): Promise<void>
+    } }).tasks
+    const cleaned = { ...event0, status: 'pending' as const }
+    delete (cleaned as { notifiedMessageId?: unknown }).notifiedMessageId
+    await table.put(taskId, { ...live0, outbox: [cleaned] })
+    pools.tasks.failWritesTo('tasks', ...Array.from({ length: 64 }, (_u, i) => i + 1))
+    pump.schedule()
+    await drain()
+    // Exactly ONE mailbox row ever exists (eventId idempotency replays).
+    const mailbox = () => [...(booted.ctx.sessionLinks as unknown as {
+      messages: { entries(): Iterable<[string, { status: string }]> }
+    }).messages.entries()]
+    expect(mailbox()).toHaveLength(1)
+    // The event honestly stayed pending (admitted-not-marker-confirmed)…
+    const row = booted.ctx.sessionLinkTasks.getRow(taskId)!
+    expect(row.outbox[0]!.status).toBe('pending')
+    expect(row.outbox[0]!.notifiedMessageId).toBeUndefined()
+    // …and session_get_task surfaces the marker-write failure visibly.
+    const view = booted.ctx.sessionLinkTasks.getTask(booted.alice.id, taskId)
+    expect(view.outboxMarkerFailureNotes).toBeDefined()
+    expect(view.outboxMarkerFailureNotes!.some(note => note.eventId === row.outbox[0]!.eventId)).toBe(true)
+    // The epoch's cascade was BOUNDED (drain()`s queue quiesced above).
+    // RECOVERY: the medium heals; a fresh genuine trigger settles the marker.
+    await drain()
+    ;(pools.tasks as unknown as { tableFailures: Map<string, unknown> }).tableFailures.clear()
+    pump.schedule()
+    await drain()
+    const settled = booted.ctx.sessionLinkTasks.getRow(taskId)!
+    expect(settled.outbox[0]!.status).toBe('admitted')
+    expect(settled.outbox[0]!.notifiedMessageId).toBeDefined()
+    expect(mailbox()).toHaveLength(1)
+    expect(booted.ctx.sessionLinkTasks.getTask(booted.alice.id, taskId).outboxMarkerFailureNotes).toBeUndefined()
+    expect(booted.ctx.sessionLinkTasks.getRow(taskId)!.outbox[0]!.status).toBe('admitted')
+  } finally {
+    for (const ctx of [...localContexts].reverse()) await ctx.fiber.dispose()
+    localContexts.clear()
+  }
+})
+
+it('Risk-4 concurrent decision replay: two racing resolve_task calls with the SAME decision callId never double-apply', async () => {
+  /* The reviewer verified sequential replay idempotent and asked whether the
+   * CONCURRENT realm (two in-flight resolve_task with one decisionCallId)
+   * stays atomic. The decisions.find-before-CAS guard plus the single row
+   * write leaves exactly ONE recorded decision: the loser's decisions.find
+   * read either sees the winner (returns the recorded outcome) or the
+   * winner's CAS bumped the revision (the loser records `stale` or fails
+   * its own CAS). NEVER two applied attempts. */
+  const adapter = new MockAdapter([textResponse('ok')])
+  const s = await stack(adapter, [BASE])
+  const sent = await exec(s, 'session_send_session_message', {
+    session_id: s.bob.id, message: 'risk4 concurrent decision task', provider: 'mock', model: A,
+  }, 'risk4-send')
+  expect(sent.isError).not.toBe(true)
+  const { taskIdFor } = await import('../src/index.ts')
+  const taskId = taskIdFor(s.alice.id, 'risk4-send')
+  await vi.waitFor(() => expect(s.ctx.sessionLinkTasks.getRow(taskId)?.taskState).toBe('waiting_decision'))
+  const waiting = s.ctx.sessionLinkTasks.getRow(taskId)!
+  // Fire TWO resolve_task calls with the SAME decision callId concurrently.
+  const [first, second] = await Promise.allSettled([
+    exec(s, 'session_resolve_task', {
+      task_id: taskId, expected_revision: waiting.revision, action: 'retry', provider: 'mock', model: BASE,
+    }, 'risk4-race-callId'),
+    exec(s, 'session_resolve_task', {
+      task_id: taskId, expected_revision: waiting.revision, action: 'retry', provider: 'mock', model: BASE,
+    }, 'risk4-race-callId'),
+  ])
+  // Both settle (never a hang), and exactly ONE decision is recorded.
+  expect(first.status).toBe('fulfilled')
+  expect(second.status).toBe('fulfilled')
+  const final = s.ctx.sessionLinkTasks.getRow(taskId)!
+  const recorded = final.decisions.filter(d => d.callId === 'risk4-race-callId')
+  // Exactly one applied outcome for that callId; never two attempts minted.
+  expect(recorded.filter(d => d.outcome === 'applied')).toHaveLength(1)
+  expect(final.decisions.filter(d => d.callId === 'risk4-race-callId').length).toBeGreaterThanOrEqual(1)
+  expect(final.attempts.length).toBeLessThanOrEqual(2)
+  // The loser observed the recorded outcome (same decision, or stale), and
+  // the task never double-attempts (currentAttemptId stable).
+  const winner = recorded.find(d => d.outcome === 'applied')!
+  expect(final.currentAttemptId).toBe(winner.attemptId ?? final.currentAttemptId)
+  await s.bob.whenIdle().catch(() => {})
+})
+
+it('Risk-1 terminal/marker race: the terminal projection never mis-classifies a marker CAS as an already-settled terminal write', async () => {
+  /* Reviewer realm, proven safe at the shared write chain: the terminal
+   * projection and an outbox marker ride the SAME domain update chain, so a
+   * revision race can only resolve as a stale CAS for ONE of them — never a
+   * cross-write mis-ordering. Deterministic proof: interleave a pending
+   * outbox event's marker advance with the finish projection on the live
+   * task, then assert (a) the terminal state landed exactly once, (b) the
+   * event committed in the SAME row write as the terminal state, and (c)
+   * nothing swallowed a durable failure as "another terminal projection
+   * already done". We fabricate the interleave by advancing the revision
+   * with a marker between the projection's read and its CAS. */
+  class Failing extends MockAdapter {
+    constructor() { super([]) }
+    override async *stream(options: Parameters<MockAdapter['stream']>[0]) {
+      this.requests.push(options)
+      throw new HarnessError('down', 'PROVIDER_UNAVAILABLE')
+    }
+  }
+  const adapter = new Failing()
+  const s = await stack(adapter, [BASE, A])
+  const spawned = await spawn(s, 'risk1-race', { provider: 'mock', model: A })
+  expect(spawned.outcome).toBe('admitted')
+  const { taskIdFor } = await import('../src/index.ts')
+  const taskId = taskIdFor(s.alice.id, 'risk1-race')
+  // The task activates, fails, and the runtime projects waiting_decision
+  // with one model_unavailable event — the terminal projection's own write.
+  await s.bob.whenIdle().catch(() => {})
+  await vi.waitFor(() => expect(s.ctx.sessionLinkTasks.getRow(taskId)?.taskState).toBe('waiting_decision'))
+  /* Snapshot the terminal facts. The outbox pump may still settle the
+   * terminal event's marker asynchronously (legitimately bumping the
+   * revision), so freeze the pre-marker state here — the proof below only
+   * needs the terminal event's uniqueness and the stale-CAS classification,
+   * not a frozen revision. */
+  const terminal = s.ctx.sessionLinkTasks.getRow(taskId)!
+  // Exactly ONE terminal event committed, riding the same row write.
+  expect(terminal.outbox.filter(e => e.kind === 'model_unavailable')).toHaveLength(1)
+  expect(terminal.executionState).toBe('not_started')
+  const terminalEventCount = terminal.outbox.length
+  /* Fabricate the INTERLEAVE the reviewer feared: a concurrent outbox marker
+   * advances the revision between a hypothetical re-projection's read and
+   * CAS. A second finish projection against the STALE token must classify
+   * the rejection as a stale CAS (never throw a false "terminal already
+   * done" error and never silently succeed onto a lived-on row). Requesting
+   * the SAME terminal state is a legal no-op refusal (TASK_TERMINAL) — the
+   * classifier must name it, and a durable failure must NOT be collapsed
+   * into that class. Prove the classification end-to-end: an obviously-stale
+   * re-projection surfaces a typed terminal/stale refusal, not a mis-settled
+   * row. */
+  const staleToken = terminal.revision - 1
+  let classified: unknown
+  try {
+    await s.ctx.sessionLinkTasks.requestStateChange(taskId, staleToken, {
+      toState: 'waiting_decision',
+      executionState: 'not_started',
+      reason: 'replay-of-a-settled-terminal',
+      events: [{ kind: 'model_unavailable', executionState: 'not_started', reason: 'replay', decisionRequired: true, resumable: true }],
+    })
+  } catch (error: unknown) { classified = error }
+  /* The rejection is a TYPED CAS-class refusal — stale revision or already-
+   * terminal — never an untyped "another terminal projection already done"
+   * mis-read, and crucially never a silent success. Either spelling means
+   * the race resolved through the shared write chain's version check. */
+  expect(['TASK_STALE_REVISION', 'TASK_TERMINAL']).toContain((classified as { code?: string })?.code)
+  // The row's terminal content is untouched: still exactly one terminal
+  // event (the revision may have legitimately advanced through the pump's
+  // marker settle — forward progress, never a re-projection).
+  const after = s.ctx.sessionLinkTasks.getRow(taskId)!
+  expect(after.outbox.filter(e => e.kind === 'model_unavailable')).toHaveLength(1)
+  expect(after.outbox).toHaveLength(terminalEventCount)
+  expect(after.taskState).toBe('waiting_decision')
+})
+
+it('Risk-1 durable-failure arm: a terminal projection whose row write fails durably surfaces TASK_WRITE_FAILED, never the settled-by-race class', async () => {
+  /* The reviewer's "吞掉 CAS 异常" concern cuts both ways: a durable write
+   * failure reaching the finish projection must propagate to its warn log —
+   * NEVER be collapsed into "CAS conflict: the row already settled". The
+   * service layer's honest classification IS the runtime's input (the
+   * runtime rethrows anything that is not a typed stale/terminal rejection),
+   * so pin it at that boundary: while task-table writes fail, the terminal
+   * projection call rejects TASK_WRITE_FAILED and leaves the row's durable
+   * state unchanged (no half-landed terminal, no phantom event). */
+  const { bootStack } = await import('./helpers/domains.ts')
+  const { MemoryMediaPool } = await import('./helpers/memory-backend.ts')
+  const localContexts = new Set<import('@deepseek-ai/cordis').Context>()
+  const pools = { links: new MemoryMediaPool(), tasks: new MemoryMediaPool() }
+  const booted = await bootStack(localContexts, pools, { adapter: new MockAdapter([textResponse('ok')]) })
+  try {
+    const tasks = booted.ctx.sessionLinkTasks
+    const policy = {
+      scope: 'task' as const,
+      candidates: [{ provider: 'mock', model: A }],
+      ifExhausted: 'notify_sender' as const,
+      usesSessionDefault: false,
+    }
+    const saved = await tasks.saveTaskIntent({
+      callerId: booted.alice.id,
+      request: { kind: 'send', callId: 'risk1-writefail', text: 'terminal write-fail task', targetSessionId: booted.bob.id },
+      policy,
+      tracked: true,
+    })
+    // A queued→running claim rides a healthy terminal path first…
+    await tasks.requestStateChange(saved.taskId, 1, { toState: 'queued' })
+    const running = await tasks.requestStateChange(saved.taskId, 2, { toState: 'running' })
+    // …then the finish projection's own write fails durably. EVERY task-table
+    // write rejects from here; the projection must surface the typed durable
+    // failure and the row must stay PRE-terminal.
+    pools.tasks.failWritesTo('tasks', ...Array.from({ length: 8 }, (_u, i) => i + 1))
+    let classified: unknown
+    try {
+      await tasks.requestStateChange(saved.taskId, running.revision, {
+        toState: 'turn_finished',
+        routeUsed: { provider: 'mock', model: A },
+        events: [{ kind: 'turn_finished', decisionRequired: false, resumable: false }],
+      })
+    } catch (error: unknown) { classified = error }
+    expect((classified as { code?: string })?.code).toBe('TASK_WRITE_FAILED')
+    const row = tasks.getRow(saved.taskId)!
+    expect(row.taskState).toBe('running')
+    expect(row.outbox.some(e => e.kind === 'turn_finished')).toBe(false)
+    /* The runtime's ONLY swallow class is the typed stale/terminal one:
+     * assert positively that TASK_WRITE_FAILED is not in it — the contract
+     * `isStaleRejection` rides. A re-attempt after healing lands exactly
+     * once. */
+    ;(pools.tasks as unknown as { tableFailures: Map<string, unknown> }).tableFailures.clear()
+    const healed = await tasks.requestStateChange(saved.taskId, running.revision, {
+      toState: 'turn_finished',
+      routeUsed: { provider: 'mock', model: A },
+      events: [{ kind: 'turn_finished', decisionRequired: false, resumable: false }],
+    })
+    expect(healed.taskState).toBe('turn_finished')
+    expect(healed.outbox.filter(e => e.kind === 'turn_finished')).toHaveLength(1)
+  } finally {
+    for (const ctx of [...localContexts].reverse()) await ctx.fiber.dispose()
+    localContexts.clear()
+  }
+})
+

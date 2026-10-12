@@ -280,6 +280,18 @@ const getTaskOutputProperties = {
     additionalProperties: false,
     properties: { code: { type: 'string' }, message: { type: 'string' } },
   },
+  outboxMarkerFailureNotes: {
+    type: 'array',
+    items: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        eventId: { type: 'string', required: true },
+        message: { type: 'string', required: true },
+      },
+    },
+    description: 'Live marker-write failure notes (admitted-but-marker-write-failed receipts), one per still-pending unmarked outbox event; absent when none is noted.',
+  },
   outbox: { type: 'array', required: true, items: taskOutboxStatusProperties },
   decisions: {
     type: 'array',
@@ -1083,7 +1095,10 @@ function definitions(ctx: Context, pumpSchedule: () => void): ToolDefinition[] {
       + '(closes a paused/queued/interrupted task; a RUNNING task answers TASK_RUNNING and stays under the '
       + 'target\'s own cancel controls). expected_revision must equal the task\'s current revision; a stale '
       + 'token returns the current state with a stale indicator and mutates nothing. The tool callId is the '
-      + 'decision idempotency key: replaying the same call returns the recorded outcome, never re-applies it.',
+      + 'decision idempotency key: replaying the same call returns the recorded outcome, never re-applies it. '
+      + 'Scope semantics (locked): replacing provider/model on retry/continue NEVER changes the task\'s '
+      + 'model_scope — a session-scope task keeps the persistent-selection consent its original call granted '
+      + '(silently degrading to task scope would strip that consent); start a NEW task for a different scope.',
     parameters: {
       task_id: {
         type: 'string',
@@ -1987,6 +2002,7 @@ function getTaskWire(
     })),
     currentAttemptId: view.currentAttemptId,
     ...(view.latestIssue === undefined ? {} : { latestIssue: view.latestIssue }),
+    ...(view.outboxMarkerFailureNotes === undefined ? {} : { outboxMarkerFailureNotes: view.outboxMarkerFailureNotes }),
     outbox,
     decisions,
     createdAt: view.createdAt,

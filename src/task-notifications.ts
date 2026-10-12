@@ -56,6 +56,7 @@ import type {
   SessionLinkTaskOutboxEvent,
   SessionLinkTaskRecordData,
 } from './task-spec.ts'
+import { SessionLinkTaskError, TASK_WRITE_FAILED } from './tasks.ts'
 import type { SessionLinkTaskService } from './tasks.ts'
 import type { SessionLinkTaskId } from './types.ts'
 
@@ -63,6 +64,12 @@ import type { SessionLinkTaskId } from './types.ts'
 export interface TaskNotificationPump {
   /** Queue one pump pass; multiple triggers collapse into one scheduled pass. */
   schedule(): void
+  /**
+   * Queue a cascade pass sharing the current schedule epoch's remaining
+   * budget; reaches zero on persistently failing marker writes instead of
+   * re-entering unboundedly (review risk 2). The next schedule() re-arms.
+   */
+  cascade(remaining: number): void
   /** Await every queued pass (test/flush boundary). */
   drain(): Promise<void>
 }
@@ -143,6 +150,17 @@ function reportOf(
  * maps to a real transition, and a pass that changes nothing retriggers
  * nothing. Single-flight coalescing lives in {@link TaskNotificationPump.schedule}
  * (one scheduled pass absorbs any burst of triggers).
+ *
+ * Review risk 2 (MODEL_ROUTING_FIX_PLAN Task 5, marker-write failure
+ * cascade): a mailbox admission that SUCCEEDED while its durable outbox
+ * marker write keeps FAILING must never cascade unboundedly. The cascade
+ * budget caps consecutive failure-driven cascades within ONE schedule epoch
+ * (see {@link TaskNotificationPump.schedule}); a cascaded pass inherits the
+ * remaining budget and a pass that fails only marker writes STOPS — the
+ * event honestly stays admitted-not-marker-confirmed, visible in
+ * `session_get_task` through the live marker-failure notes, and both the
+ * retry-condition subscription and any new schedule() re-arm a full-budget
+ * epoch (never a timer/poller).
  */
 export function installTaskNotifications(
   ctx: Context,
@@ -155,9 +173,27 @@ export function installTaskNotifications(
     schedule(): void {
       if (disposed || scheduled) return
       scheduled = true
+      /* A fresh epoch: the full cascade budget is granted HERE, at the
+       * schedule-boundary — a cascaded pass shares its predecessor's budget
+       * (the cascade does NOT re-enter schedule()), so a persistently failing
+       * marker write caps out instead of re-entering without bound. The next
+       * genuine trigger (a durable mailbox transition, a task mutation that
+       * schedules the pump) re-arms a full budget: progress never freezes. */
       const run = tail.then(async () => {
         scheduled = false
-        await pumpPending(resolve, () => pump.schedule())
+        await pumpPending(resolve, MARKER_CASCADE_BUDGET, remaining => pump.cascade(remaining))
+      }).catch((error: unknown) => {
+        ctx.logger?.warn?.(`task-notifications: pump pass failed: ${String(error)}`)
+      })
+      tail = run.then(() => undefined, () => undefined)
+    },
+    /** Re-pump from INSIDE a pass with the epoch's remaining budget. */
+    cascade(remaining: number): void {
+      if (disposed || scheduled || remaining <= 0) return
+      scheduled = true
+      const run = tail.then(async () => {
+        scheduled = false
+        await pumpPending(resolve, remaining, rest => pump.cascade(rest))
       }).catch((error: unknown) => {
         ctx.logger?.warn?.(`task-notifications: pump pass failed: ${String(error)}`)
       })
@@ -165,17 +201,20 @@ export function installTaskNotifications(
     },
     async drain(): Promise<void> {
       // Run one explicit pass NOW — pending scheduled work settles first,
-      // then one fresh pass reads the live rows so the drain observes any
-      // reconciliation the caller's preceding mutations obligated.
+      // then one fresh full-budget pass reads the live rows so the drain
+      // observes any reconciliation the caller's preceding mutations
+      // obligated.
       await tail
       const run = tail.then(async () => {
-        await pumpPending(resolve, () => {})
+        await pumpPending(resolve, MARKER_CASCADE_BUDGET, () => {})
       }).catch(() => {})
       tail = run.then(() => undefined, () => undefined)
       await tail
     },
   }
   // R14: real retry conditions, wired from the mailbox's own transitions.
+  // Each emission is a durable transition, so it legitimately re-arms a
+  // full-budget epoch.
   ctx.on('session-link/mailbox', () => {
     pump.schedule()
   })
@@ -189,15 +228,34 @@ export function installTaskNotifications(
   return pump
 }
 
-/** One pass over pending outbox events plus admitted-marker reconciliation. */
+/**
+ * Maximum consecutive cascade passes ONE schedule epoch tolerates after
+ * success-with-failing-marker sequences. A single admission ideally cascades
+ * exactly once (marker settles, next pass sees no new writes); anything
+ * beyond this bound is a persistently failing durable write — the pump
+ * stops and waits for the next genuine trigger instead of re-entering.
+ * Small and total: the bound covers the legitimate settle legs of several
+ * same-pass admissions without approaching "unbounded".
+ */
+const MARKER_CASCADE_BUDGET = 4
+
+/**
+ * One pass over pending outbox events plus admitted-marker reconciliation.
+ * Returns the cascade decision: whether a follow-up pass is needed and the
+ * budget it may spend.
+ */
 async function pumpPending(
   resolve: { tasks: () => SessionLinkTaskService | undefined; links: () => SessionLinkService },
-  cascade: () => void,
+  cascadeBudget: number,
+  cascade: (remaining: number) => void,
 ): Promise<void> {
   const tasks = resolve.tasks()
   if (tasks === undefined) return
   const links = resolve.links()
   let settledMailboxWrite = false
+  /** A marker write FAILED durably this pass: re-pumping immediately would
+   * re-attempt the same failing write — stop instead (bounded cascade). */
+  let markerWriteFailed = false
 
   // Pass 1: an event already admitted whose mailbox message since reached
   // `delivered` flips to delivered — with NO new admission. The row's
@@ -209,12 +267,13 @@ async function pumpPending(
       if (event.status !== 'admitted' || event.notifiedMessageId === undefined) continue
       const message = links.message(event.notifiedMessageId)
       if (message === undefined || message.status !== 'delivered') continue
-      try {
-        const live = tasks.getRow(taskId)
-        if (live === undefined) continue
-        await tasks.markOutboxDelivered(taskId, live.revision, event.eventId)
-        settledMailboxWrite = true
-      } catch { /* a concurrent projection settled; nothing re-applies */ }
+      const live = tasks.getRow(taskId)
+      if (live === undefined) continue
+      markerWriteFailed = await recordMarkerResult(
+        tasks, taskId, event.eventId, live.revision,
+        () => tasks.markOutboxDelivered(taskId, live.revision, event.eventId),
+      ) || markerWriteFailed
+      settledMailboxWrite = !markerWriteFailed || settledMailboxWrite
     }
   }
 
@@ -225,25 +284,36 @@ async function pumpPending(
     const linkId = resolveLiveLink(links, row)
     if (linkId === undefined) {
       // Unlinked: a permanent refusal. Keep the event queryable + blocked.
-      try {
-        await tasks.blockOutboxEvent(taskId, row.revision, event.eventId, 'link_revoked: original pair no longer shares a link grant')
-        settledMailboxWrite = true
-      } catch { /* concurrent transition */ }
+      const blockedFailed = await recordMarkerResult(
+        tasks, taskId, event.eventId, row.revision,
+        () => tasks.blockOutboxEvent(taskId, row.revision, event.eventId, 'link_revoked: original pair no longer shares a link grant'),
+      )
+      markerWriteFailed = blockedFailed || markerWriteFailed
+      settledMailboxWrite = !blockedFailed || settledMailboxWrite
       continue
     }
     try {
       const sent = await links.admitTaskStatus(reportOf(row, taskId, event, row.notificationRoot.rootMessageId))
-      settledMailboxWrite = true
       const live = tasks.getRow(taskId)
       if (live !== undefined) {
-        try {
-          await tasks.markOutboxAdmitted(taskId, live.revision, event.eventId, sent.messageId)
-        } catch { /* concurrent transition */ }
+        /* Mailbox admission committed; its marker is the durable receipt.
+         * A durable failure here leaves the event admitted-not-marker-
+         * confirmed (honest pending-with-note), visible in session_get_task —
+         * the event is NEVER re-admitted with a second mailbox copy because
+         * the mailbox's own eventId idempotency makes a re-admission replay
+         * its first row, which the marker then adopts. */
+        const admittedFailed = await recordMarkerResult(
+          tasks, taskId, event.eventId, live.revision,
+          () => tasks.markOutboxAdmitted(taskId, live.revision, event.eventId, sent.messageId),
+        )
+        markerWriteFailed = admittedFailed || markerWriteFailed
+        settledMailboxWrite = !markerWriteFailed || settledMailboxWrite
         const after = tasks.getRow(taskId)
-        if (after !== undefined && sent.status === 'accepted') {
-          try {
-            await tasks.markOutboxDelivered(taskId, after.revision, event.eventId)
-          } catch { /* concurrent transition */ }
+        if (after !== undefined && sent.status === 'accepted' && !admittedFailed) {
+          markerWriteFailed = await recordMarkerResult(
+            tasks, taskId, event.eventId, after.revision,
+            () => tasks.markOutboxDelivered(taskId, after.revision, event.eventId),
+          ) || markerWriteFailed
         }
       }
     } catch (error: unknown) {
@@ -256,9 +326,52 @@ async function pumpPending(
     }
   }
 
-  // Cascade exactly once: the writes above may have settled markers/events
-  // the same pass could not yet see.
-  if (settledMailboxWrite) cascade()
+  /* Cascade exactly once when durable facts changed — the writes above may
+   * have settled markers/events the same pass could not yet see. A pass
+   * whose marker writes FAILED does not cascade: an immediate re-pass would
+   * race the same failing storage write; the event honestly stays
+   * admitted-not-marker-confirmed until a genuine retry-condition signal or
+   * the next task mutation re-arms a full-budget epoch. */
+  if (markerWriteFailed) return
+  if (settledMailboxWrite) cascade(cascadeBudget - 1)
+}
+
+/**
+ * Run one marker write with honest failure classification (review risk 2):
+ *
+ *  - a STALE CAS means a concurrent projection/marker legitimately advanced
+ *    the row — forward progress; nothing is recorded, the pass may cascade;
+ *  - a DURABLE write failure means the admission succeeded but its receipt
+ *    never persisted. The failure is recorded onto the LATEST task-row
+ *    snapshot (best-effort, in-memory; a fresh durable read replaces it) so
+ *    `session_get_task` surfaces the event as pending with a visible
+ *    marker-write failure `reason` instead of a silent stuck pending, and
+ *    the pass refrains from cascading (bounded re-entry).
+ *
+ * Returns true when a durable failure was observed.
+ */
+async function recordMarkerResult(
+  tasks: SessionLinkTaskService,
+  taskId: SessionLinkTaskId,
+  eventId: string,
+  attemptedRevision: number,
+  write: () => Promise<SessionLinkTaskRecordData>,
+): Promise<boolean> {
+  try {
+    await write()
+    return false
+  } catch (error: unknown) {
+    if (error instanceof SessionLinkTaskError && error.code === TASK_WRITE_FAILED) {
+      /* Visible failure accounting: note the failure against the exact event
+       * and revision the marker attempted (live-only; the note never forges
+       * a marker, and clears the moment one lands). */
+      tasks.noteOutboxMarkerFailure(taskId, eventId, attemptedRevision, error)
+      return true
+    }
+    /* Concurrent transition (stale revision / illegal lifecycle step): the
+     * row legitimately moved on — the next pass reconciles against it. */
+    return false
+  }
 }
 
 /** Derive the task id of one stored row (the service's stable identity). */
