@@ -450,13 +450,14 @@ describe('task-notifications: budget and archived treatment', () => {
     // then has: per-message budget clean (≤2), daily ledger clean (2/6 used)
     // — ONLY chain A's own budget is spent (single wake burned on the
     // opener), so it MUST queue
-    // with wakesUsed === 0. The task's notification to alice starts its own
-    // fresh chain (runtime route failures clear the binding, so there is no
-    // root to reply into) whose chain budget is clean; alice's daily ledger
-    // is untouched — it admits with EXACTLY ONE wake (the documented
-    // admitted+wake path), proving the spent chain's single-wake count
-    // binds ONLY that chain and never lifts, folds, or resets (claimWake
-    // re-derives spend from recorded wakesUsed under each chain's own root).
+    // with wakesUsed === 0. The task's notification to alice rides the
+    // TASK's own durable root chain (R18: minted at intent admission and
+    // never reset by the runtime route failure) — a chain whose wake spend
+    // on alice's side is clean; alice's daily ledger is untouched — it
+    // admits with EXACTLY ONE wake (the documented admitted+wake path),
+    // proving the spent chain's single-wake count binds ONLY that chain and
+    // never lifts, folds, or resets (claimWake re-derives spend from
+    // recorded wakesUsed under each chain's own root).
     class RouteDown extends MockAdapter {
       constructor() { super([textResponse('warm one'), textResponse('warm two'), textResponse('reply answer')]) }
       override async *stream(options: GenerateOptions) {
@@ -529,11 +530,16 @@ describe('task-notifications: budget and archived treatment', () => {
     const notificationId = failureEvent?.notifiedMessageId
     expect(notificationId).toBeDefined()
     const message = s.ctx.sessionLinks.message(notificationId!)
-    // The notification rides its OWN fresh chain (no surviving root); its
-    // chain budget is clean, alice's daily ledger is untouched — the
-    // admitted+wake path claims exactly one wake. Chain accounting is
-    // per-root: A's spent wake gates ONLY chain A.
-    expect(message?.inReplyTo).toBeUndefined()
+    /* R18: the notification rides the TASK's durable root minted at intent
+     * admission — never a fresh per-event chain (this precheck-failed task
+     * never bound a delivery, so the root row itself is absent from the
+     * mailbox and chainLength stays 1). That root chain is wake-spend-clean
+     * on alice's side and alice's daily ledger is untouched, so the
+     * admitted+wake path claims exactly one wake. Chain accounting is
+     * per-root: chain A's spent wake gates ONLY chain A. */
+    const row2 = s.ctx.sessionLinkTasks.getRow(taskId)
+    expect(row2?.notificationRoot.rootMessageId).toBeDefined()
+    expect(message?.inReplyTo).toBe(row2?.notificationRoot.rootMessageId)
     expect(message?.chainLength).toBe(1)
     expect(message?.wakesUsed).toBe(1)
     await s.alice.whenIdle()

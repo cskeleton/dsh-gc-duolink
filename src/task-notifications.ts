@@ -29,13 +29,17 @@
  *
  * Notifications never trigger notifications: the delivered source is
  * `session-task-status`, which nothing in the plugin treats as a task.
- * Chain semantics are honest by design: a BOUND task's events (a
- * turn_finished/interrupted/cancelled report about an admitted delivery)
- * ride the task's notification root as `inReplyTo` so the chain wake
- * budget is never reset; events whose task has no durable root anymore
- * (runtime route failures cleared the binding, precheck failures, and
- * reconcile's repair notices) mint their OWN fresh one-message chain
- * instead of fabricating a root identity the mailbox never recorded.
+ * Chain semantics are honest by design: EVERY task's events ride the
+ * task's notification root as `inReplyTo`, and that root mints at FIRST
+ * intent admission (R18 — `saveTaskIntent`, the deterministic attempt-1
+ * delivery identity). Precheck failures, runtime route failures that
+ * cleared the binding, and reconcile's repair notices therefore share the
+ * task's ONE wake-budget chain instead of minting fresh chains per event
+ * that would bypass the per-chain budget on retry; where the root row
+ * itself never reached the mailbox (never-bound tasks), the mailbox
+ * threads the event to the durable root id it names, so the per-chain
+ * accounting's root resolution still attributes every report to the same
+ * chain.
  * @module dsh-session-link/task-notifications
  */
 
@@ -127,6 +131,18 @@ function reportOf(
  * behind one chain; the subscription at mount replays pending/admitted rows
  * the prior process left, and every trigger point the wiring registers calls
  * `schedule` — an event-driven pump, never a timer.
+ *
+ * R14 (MODEL_ROUTING_FIX_PLAN Task 4): the pump also subscribes to the
+ * mailbox's own retry-condition signal (`session-link/mailbox`): the link
+ * service emits it strictly after durable transitions that can make a
+ * previously refused event deliverable — capacity freed (pending →
+ * delivered/cancelled/revoked/failed), a receiver taking delivery (a turn
+ * claimed/inserted), or grant changes (auto-wake re-granted, link
+ * created/updated/removed). An event refused MAILBOX_FULL or denied budget
+ * writes nothing and emits nothing, so the feedback settles: every emission
+ * maps to a real transition, and a pass that changes nothing retriggers
+ * nothing. Single-flight coalescing lives in {@link TaskNotificationPump.schedule}
+ * (one scheduled pass absorbs any burst of triggers).
  */
 export function installTaskNotifications(
   ctx: Context,
@@ -159,6 +175,10 @@ export function installTaskNotifications(
       await tail
     },
   }
+  // R14: real retry conditions, wired from the mailbox's own transitions.
+  ctx.on('session-link/mailbox', () => {
+    pump.schedule()
+  })
   ctx.effect(() => async () => {
     disposed = true
     await tail

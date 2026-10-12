@@ -39,6 +39,7 @@ import type { TaskNotificationPump } from './task-notifications.ts'
 import { ensureTaskHostLazy } from './task-host-lazy.ts'
 import { installTaskRuntime, precheckFailureOf, requestedRouteOf } from './task-runtime.ts'
 import { TaskInvariantError, taskIdFor } from './tasks.ts'
+import { attemptCallKey, mintTaskMessageId } from './tasks.ts'
 import type { CreateTaskIntentInput, SavedTaskIntent, TaskEventInput } from './tasks.ts'
 import type { SessionLinkTaskRecordData } from './task-spec.ts'
 import { mountPerPresetAgent, PresetScopeConfig, resolvePresets } from './scope.ts'
@@ -1897,24 +1898,13 @@ function ownerOfScope(ctx: Context, scoped: Context): Agent | undefined {
 }
 
 /**
- * Derive the mailbox message identity one tracked ADMISSION will use
- * (R08(1)): deterministic per (attempt-scope, attempt idempotency key). The
- * original attempt passes its taskId + raw callId and mints the SAME value
- * every replay of that call answers; each retry attempt passes
- * `<callKey>/attempt-<N>` and mints a FRESH identity — the re-admission of
- * a delivered-task retry never reuses the consumed mailbox delivery its
- * predecessor owned, while the taskId + notification-root budget chain the
- * task row carries stay continuous across attempts.
+ * The tracked admission identity vocabulary lives in the durable task service
+ * ({@link mintTaskMessageId}/{@link attemptCallKey} re-imported above):
+ * deterministic per (attempt-scope, attempt idempotency key), so the original
+ * attempt's call mints the SAME value every replay answers, each retry mints
+ * a FRESH identity, and the task row's notification root the service mints
+ * equals the attempt-1 derivation exactly.
  */
-function mintTaskMessageId(taskScope: string, callKey: string): ReturnType<typeof SessionLinkMessageId> {
-  const hex = createHash('sha256').update(`task-msg\0${taskScope}\0${callKey}`).digest('hex')
-  return SessionLinkMessageId(`session-link-message-${hex.slice(0, 32)}`)
-}
-
-/** The attempt-scoped idempotency key: original = callId, retry = callId/attempt-N. */
-function attemptCallKey(callId: string, ordinal: number): string {
-  return ordinal === 1 ? callId : `${callId}/attempt-${ordinal}`
-}
 
 /* --------------------------------------------------------------------------
  * session_get_task / session_resolve_task wire projections

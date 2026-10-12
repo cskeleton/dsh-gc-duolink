@@ -4,7 +4,7 @@
  * @module dsh-session-link/link
  */
 
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { Context, Service } from '@deepseek-ai/cordis'
 import { brandString } from '@deepseek-ai/dsh-brand'
 import { z as wire } from 'zod'
@@ -230,6 +230,33 @@ function taskEntryOf(row: SessionLinkTaskRecordData): SessionLinkTaskViewEntry {
   }
 }
 
+declare module '@deepseek-ai/cordis' {
+  interface Events {
+    /**
+     * One durable mailbox/link fact changed so a previous refusal may now
+     * succeed: capacity freed (pending → delivered/cancelled/revoked/failed),
+     * a receiver took delivery, or an auto-wake/membership grant changed. The
+     * task-notification pump subscribes and schedules a coalesced pass;
+     * emission is strictly after the durable write, never from a timer.
+     * @mode emit
+     */
+    'session-link/mailbox'(): void
+  }
+}
+
+/**
+ * R17 (MODEL_ROUTING_FIX_PLAN Task 4): the mailbox identity of one task-status
+ * report derives from the FULL eventId through a stable hash — never a
+ * lossy character-sanitize, so `review/a` and `review_a` (or any pair of
+ * eventIds diverging only in non-identifier characters) hash to DISTINCT
+ * message ids and can never overwrite each other. The full eventId already
+ * includes arbitrary user-controlled callId characters; hashing absorbs them.
+ */
+export function notificationMessageId(eventId: string): SessionLinkMessageId {
+  const hex = createHash('sha256').update(`task-report\0${eventId}`).digest('hex')
+  return SessionLinkMessageId(`task-report-${hex.slice(0, 32)}`)
+}
+
 /**
  * Durable link registry plus mailbox. Cross-session state lives in the
  * `session-link` storage domain; delivery to a live target uses the Agent
@@ -364,6 +391,7 @@ export class SessionLinkService extends TypertRemoteService {
       }
       await this.links.put(options.linkId, next)
       await this.revokeUndelivered(options.linkId, unique)
+      this.mailboxSettled()
       return { id: options.linkId, record: next }
     }
     if (options.requireNewPair === true) {
@@ -385,6 +413,7 @@ export class SessionLinkService extends TypertRemoteService {
       grantedBy: grant,
     }
     await this.links.put(id, record)
+    this.mailboxSettled()
     return { id, record }
   }
 
@@ -412,6 +441,7 @@ export class SessionLinkService extends TypertRemoteService {
       }
       await this.links.delete(linkId)
       await this.revokeUndelivered(linkId, [])
+      this.mailboxSettled()
     })
   }
 
@@ -493,6 +523,7 @@ export class SessionLinkService extends TypertRemoteService {
       updatedAt: new Date().toISOString(),
     }
     await this.links.put(linkId, next)
+    this.mailboxSettled()
     return { id: linkId, record: next }
   }
 
@@ -836,6 +867,7 @@ export class SessionLinkService extends TypertRemoteService {
         return
       }
       await this.messages.put(messageId, { ...record, status: 'cancelled' })
+      this.mailboxSettled()
     })
   }
 
@@ -916,6 +948,18 @@ export class SessionLinkService extends TypertRemoteService {
     const run = this.tail.then(operation, operation)
     this.tail = run.then(() => undefined, () => undefined)
     return run
+  }
+
+  /**
+   * R14: announce one durable retry-condition change (capacity freed,
+   * receiver moved pending mail to delivered, grant changed). Listeners —
+   * the task outbox pump — coalesce bursts themselves; this service just
+   * reports transitions, never deciding what may retry. Emission happens
+   * strictly AFTER the durable write that settles the transition.
+   */
+  private mailboxSettled(): void {
+    if (this.disposed) return
+    this.ctx.emit('session-link/mailbox')
   }
 
   /** Admission plus one immediate delivery leg, in one serialized chain slot. */
@@ -1036,6 +1080,7 @@ export class SessionLinkService extends TypertRemoteService {
       const record = this.messages.get(options.wakeFor)
       if (record?.status !== 'pending' || this.mayBeHeld(options.wakeFor, record, target, recorded)) return
       await this.messages.put(options.wakeFor, { ...record, status: 'cancelled' })
+      this.mailboxSettled()
       throw signal.reason
     }
     await cancelIfAborted()
@@ -1046,6 +1091,7 @@ export class SessionLinkService extends TypertRemoteService {
       if (link === undefined || !link.memberIds.includes(record.senderId) || !link.memberIds.includes(record.targetId)) {
         // The grant vanished under a message the target does not hold: tombstone rather than retry forever.
         await this.messages.put(messageId, { ...record, status: 'revoked' })
+        this.mailboxSettled()
         continue
       }
       queue.push(messageId)
@@ -1252,12 +1298,25 @@ export class SessionLinkService extends TypertRemoteService {
     let chainLength = 1
     if (request.inReplyTo !== undefined) {
       const original = this.messages.get(request.inReplyTo)
-      if (original === undefined || original.targetId !== request.targetId || original.senderId !== request.callerId) {
-        // Root identity unknown to the mailbox: keep the report admissible on
-        // its own chain rather than fabricate a root.
-      } else {
+      if (original === undefined) {
+        /* R18: the root may be a HOST-MINTED task delivery identity the
+         * mailbox never admitted — a precheck-failed task's notifications
+         * thread the root its durable intent row minted at FIRST admission
+         * (the deterministic attempt-1 delivery identity; Task 4), which no
+         * mailbox write ever reached. Thread it anyway: the root identity is
+         * not fabricated per event, it is the task's single durable root, and
+         * the per-chain wake budget keys on the root id through
+         * {@link rootIdOf} — threading is what keeps the task's whole
+         * notification lifecycle on ONE chain (chainLength stays 1: no parent
+         * chain existed to extend). */
+        inReplyTo = request.inReplyTo
+      } else if (original.targetId === request.targetId && original.senderId === request.callerId) {
         inReplyTo = request.inReplyTo
         chainLength = original.chainLength + 1
+      } else {
+        /* A root the mailbox recorded for a DIFFERENT pair is never threaded
+         * onto this report — the report stays admissible on its own chain
+         * rather than riding a foreign root's budget. */
       }
     }
     const pendingForTarget = this.pendingFor(request.callerId).length
@@ -1267,7 +1326,19 @@ export class SessionLinkService extends TypertRemoteService {
         'MAILBOX_FULL',
       )
     }
-    const messageId = SessionLinkMessageId(`task-report-${request.eventId.replace(/[^A-Za-z0-9.-]/g, '_')}`)
+    const messageId = notificationMessageId(request.eventId)
+    /* R17 put-time conflict validation: the id must name THIS event. A stored
+     * row whose event differs (a genuine digest collision, or corruption)
+     * refuses loudly — NEVER overwrite one event's report with another's. The
+     * same-event replay never reaches here (the idempotency probe above
+     * adopts it), so a same-id row at put time is always a different event. */
+    const existingRow = this.messages.get(messageId)
+    if (existingRow !== undefined && existingRow.taskStatus?.eventId !== request.eventId) {
+      throw new SessionLinkError(
+        `task-status message "${messageId}" already names a different event ("${existingRow.taskStatus?.eventId ?? '<non-task row>'}"); refusing to overwrite`,
+        'MESSAGE_UNDELIVERABLE',
+      )
+    }
     const record: SessionLinkMessageRecordData = {
       linkId: link.id,
       senderId: request.targetId,
@@ -1403,6 +1474,7 @@ export class SessionLinkService extends TypertRemoteService {
     const record = this.messages.get(messageId)
     if (record === undefined || record.status !== 'pending') return
     await this.messages.put(messageId, { ...record, status: 'delivered' })
+    this.mailboxSettled()
   }
 
   /** Record a failed immediate leg; never terminal from a single attempt. */
@@ -1410,9 +1482,12 @@ export class SessionLinkService extends TypertRemoteService {
     const record = this.messages.get(messageId)
     if (record === undefined || record.status !== 'pending' || record.inserted === true) return
     const attempts = record.attempts + 1
-    await this.messages.put(messageId, attempts >= this.resolved.maxDeliveryAttempts
-      ? { ...record, attempts, status: 'failed', error }
-      : { ...record, attempts, error })
+    if (attempts >= this.resolved.maxDeliveryAttempts) {
+      await this.messages.put(messageId, { ...record, attempts, status: 'failed', error })
+      this.mailboxSettled()
+      return
+    }
+    await this.messages.put(messageId, { ...record, attempts, error })
   }
 
   /** Service-start recovery: replay pending mail for any already-live target. */
@@ -1436,6 +1511,7 @@ export class SessionLinkService extends TypertRemoteService {
 
   /** Tombstone undelivered messages whose link membership no longer pairs sender and target. */
   private async revokeUndelivered(linkId: SessionLinkId, memberIds: readonly SessionId[]): Promise<void> {
+    let tombstoned = false
     for (const [messageId, record] of this.messages.entries()) {
       if (record.linkId !== linkId || record.status !== 'pending') continue
       const stillGranted = memberIds.includes(record.senderId) && memberIds.includes(record.targetId)
@@ -1443,7 +1519,9 @@ export class SessionLinkService extends TypertRemoteService {
       // Possibly held by the target: not recalled, confirmed by a later flush.
       if (this.mayBeHeld(messageId, record, this.ctx.agents.get(record.targetId))) continue
       await this.messages.put(messageId, { ...record, status: 'revoked' })
+      tombstoned = true
     }
+    if (tombstoned) this.mailboxSettled()
   }
 
   /** Require a live membership edge between caller and target. */

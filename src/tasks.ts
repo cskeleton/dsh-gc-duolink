@@ -12,8 +12,9 @@
  *                             model precheck failure — with NO Session and NO
  *                             mailbox message).
  *  2. create/adopt Session  — Task 4's own ledger domain writes.
- *  3. `attachBinding`       — CAS commit of target sessionId/linkId/messageId;
- *                             the notification root binds here too.
+ *  3. `attachBinding`       — CAS commit of target sessionId/linkId/messageId
+ *                             (the notification root minted at step 1 since
+ *                             R18; this step only back-fills legacy rows).
  *  4. `recordTurnIntent`    — CAS commit after host `recordTurnIntent`
  *                             succeeds; only now is the model binding durable.
  *
@@ -33,6 +34,7 @@
  * @module dsh-session-link/tasks
  */
 
+import { createHash } from 'node:crypto'
 import { Context, Service } from '@deepseek-ai/cordis'
 import type { SessionId } from '@deepseek-ai/dsh-session'
 import type { KvTable } from '@deepseek-ai/dsh-storage-domain'
@@ -325,6 +327,34 @@ export interface SessionLinkTaskServiceOptions {
 /** The stable task identity of one caller + first call id. */
 export function taskIdFor(callerId: SessionId, callId: string): SessionLinkTaskId {
   return SessionLinkTaskId(`task:${callerId}:${callId}`)
+}
+
+/**
+ * Derive the mailbox message identity one tracked ADMISSION will use
+ * (R08(1)): deterministic per (attempt-scope, attempt idempotency key). The
+ * original attempt passes its taskId + raw callId and mints the SAME value
+ * every replay of that call answers; each retry attempt passes
+ * `<callKey>/attempt-<N>` and mints a FRESH identity — the re-admission of
+ * a delivered-task retry never reuses the consumed mailbox delivery its
+ * predecessor owned.
+ *
+ * R18 (MODEL_ROUTING_FIX_PLAN Task 4): the SAME derivation mints the task's
+ * `notificationRoot.rootMessageId` at FIRST intent admission
+ * (`saveTaskIntent`), so the budget-chain authority is durable before any
+ * binding exists and never moves across retries: it equals the attempt-1
+ * delivery identity exactly.
+ */
+export function mintTaskMessageId(
+  taskScope: string,
+  callKey: string,
+): SessionLinkMessageId {
+  const hex = createHash('sha256').update(`task-msg\0${taskScope}\0${callKey}`).digest('hex')
+  return SessionLinkMessageId(`session-link-message-${hex.slice(0, 32)}`)
+}
+
+/** The attempt-scoped idempotency key: original = callId, retry = callId/attempt-N. */
+export function attemptCallKey(callId: string, ordinal: number): string {
+  return ordinal === 1 ? callId : `${callId}/attempt-${ordinal}`
 }
 
 /** The deterministic outbox identity of one event (task + revision + kind). */
@@ -697,7 +727,14 @@ export class SessionLinkTaskService extends Service {
       taskState: precheck === undefined ? 'preparing' : 'waiting_decision',
       ...(precheck === undefined ? {} : { executionState: 'not_started' as const, reason: precheck.reason }),
       execution: {},
-      notificationRoot: {},
+      /* R18: the notification root mints at FIRST intent admission — the
+       * deterministic attempt-1 delivery identity ({@link mintTaskMessageId}
+       * of the raw callId). It is stable per task, survives retry/re-attempt
+       * (applyDecision's execution clear never touches it), and every
+       * task-status notification threads it, so ONE wake-budget chain covers
+       * the task's whole notification/decision lifecycle — precheck-failed
+       * tasks (never `attachBinding`) included. */
+      notificationRoot: { rootMessageId: mintTaskMessageId(taskId, attemptCallKey(input.request.callId, 1)) },
       outbox,
       decisions: [],
       createdAt: now,
@@ -848,11 +885,13 @@ export class SessionLinkTaskService extends Service {
 
   /**
    * Attach the target binding under CAS after Session/link/mailbox committed
-   * (write-ahead step 3). The notification ROOT mints here: notification and
-   * decision chains keep it across every later binding, so retries never
-   * reset the chain wake budget. `admittedAs: 'accepted'` requires the host
-   * turn intent to be recorded FIRST — otherwise the message would already
-   * be model-visible without a durable model binding; that call throws
+   * (write-ahead step 3). The notification ROOT normally minted earlier at
+   * FIRST intent admission (R18); this method only fills it in for a row
+   * that predates that mint — notification and decision chains keep it
+   * across every later binding, so retries never reset the chain wake
+   * budget. `admittedAs: 'accepted'` requires the host turn intent to be
+   * recorded FIRST — otherwise the message would already be model-visible
+   * without a durable model binding; that call throws
    * `TASK_BINDING_INCOMPLETE` and changes nothing.
    */
   async attachBinding(
@@ -1399,8 +1438,24 @@ export class SessionLinkTaskService extends Service {
       // ORIGINAL spawn callKey/send admission replays and attaches a fresh
       // binding (notificationRoot survives — the chain never resets).
       resolvedTaskId = taskIdFor(current.callerId, current.callId)
+      /* Restart-window closure (Task-4 handoff): the predecessor delivery the
+       * post-commit marking hook re-keys is recorded DURABLY in the same CAS
+       * that clears the binding. A restart between this commit and the hook's
+       * settle leaves the original key adoptable — reconcile's classification
+       * re-drives marking from this ledger and drops it once the mailbox fact
+       * is observed. `current.attempts.length` is the PREDECESSOR's ordinal
+       * (the new attempt only lands in `attempts` below). */
+      const retired = input.action === 'retry' && legacyMessageId !== undefined
+        ? {
+          retiredDeliveries: [
+            ...(current.retiredDeliveries ?? []),
+            { messageId: legacyMessageId, callKey: attemptCallKey(current.callId, current.attempts.length) },
+          ],
+        }
+        : {}
       return {
         ...base,
+        ...retired,
         attempts,
         currentAttemptId,
         ...(input.policy === undefined ? {} : { policy: clonePolicy(input.policy) }),
@@ -1532,6 +1587,14 @@ export class SessionLinkTaskService extends Service {
    */
   async reconcile(): Promise<ReconcileResult> {
     this.assertLive()
+    /* Restart-window closure (Task-4 handoff, phase 0): re-drive the retired
+     * -delivery marking every retiredDeliveries ledger entry still owes, then
+     * drop entries whose mailbox fact is observed (message absent, cancelled,
+     * or already aliased to `<callKey>/consumed`). The decision-time hook is
+     * fire-and-forget; this phase is its restart-safe completion driver, so
+     * the original call key can never stay adoptable across a restart that
+     * landed between the retry commit and the marking. */
+    await this.settleRetiredDeliveries()
     const resumableIntents: SessionLinkTaskRecordData[] = []
     const needsBindingRepair: SessionLinkTaskRecordData[] = []
     const orphanChecks: ReconcileReport['orphanChecks'][number][] = []
@@ -1648,6 +1711,46 @@ export class SessionLinkTaskService extends Service {
       }
     }
     return false
+  }
+
+  /**
+   * Re-drive and complete the durable retired-delivery ledger. For every
+   * entry: read the mailbox fact through the probe; an entry whose delivery
+   * is gone, cancelled, or already re-keyed to `<callKey>/consumed` is
+   * COMPLETE and drops in one CAS per row; an incomplete entry re-invokes
+   * the wire-layer marking hook (same vocabulary as the decision-time call —
+   * intentId-or-messageId identity, never a third form). Per-row failures
+   * skip just that row, exactly like {@link repairOne}.
+   */
+  private async settleRetiredDeliveries(): Promise<void> {
+    if (this.probe === undefined) return
+    for (const [taskId, row] of this.tasks.entries()) {
+      const entries = row.retiredDeliveries ?? []
+      if (entries.length === 0) continue
+      let dirty = false
+      const kept: typeof entries = []
+      for (const entry of entries) {
+        const message = this.probe.message(entry.messageId)
+        const observed = message === undefined
+          || message.status === 'cancelled'
+          || message.idempotencyKey === `${entry.callKey}/consumed`
+        if (!observed) {
+          kept.push(entry)
+          if (this.markLegacyDelivery !== undefined) {
+            try { this.markLegacyDelivery(entry.messageId, taskId) } catch { /* re-classified next pass */ }
+          }
+          continue
+        }
+        dirty = true
+      }
+      if (!dirty || kept.length === entries.length) continue
+      try {
+        await this.update(taskId, row.revision, current => {
+          if ((current.retiredDeliveries ?? []).length !== entries.length) return current
+          return { ...current, retiredDeliveries: kept, revision: current.revision + 1, updatedAt: this.clock() }
+        })
+      } catch { /* a racing writer re-classifies on the next pass */ }
+    }
   }
 
   /** Build one outbox event with its deterministic id inside a CAS mutator. */

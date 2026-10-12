@@ -47,7 +47,7 @@ declare module '@deepseek-ai/cordis' {
   }
 }
 
-export { SessionLinkService, frameSessionLinkText } from './link.ts'
+export { SessionLinkService, frameSessionLinkText, notificationMessageId } from './link.ts'
 export type { SessionLinkLimits, SessionLinkOptions } from './link.ts'
 export {
   sessionLinkDomainSpec,
@@ -111,7 +111,9 @@ export type {
   SessionLinkTaskRecordData,
 } from './task-spec.ts'
 export {
+  attemptCallKey,
   candidatesEqual,
+  mintTaskMessageId,
   requestDigest,
   SessionLinkTaskError,
   SessionLinkTaskService,

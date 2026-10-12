@@ -250,6 +250,22 @@ export const sessionLinkTaskSchema = z.object({
   notificationRoot: z.object({
     rootMessageId: messageId.optional(),
   }),
+  /**
+   * Retired predecessor deliveries a retry decision must re-key in the
+   * mailbox to its `<callKey>/consumed` realm (R08(1), restart-window closure
+   * of MODEL_ROUTING_FIX_PLAN Task 4). The decision commit records each
+   * predecessor's (messageId, callKey) DURABLY in the same row write; the
+   * wire-layer marking hook is fire-and-forget, so a restart between decision
+   * and marking would otherwise leave the original key adoptable forever.
+   * `reconcile()` re-drives the marking for every entry whose mailbox fact
+   * is not yet observed (message absent, cancelled, or key already aliased
+   * → observed), then drops completed entries. Optional so pre-Task-4 rows
+   * read it absent.
+   */
+  retiredDeliveries: z.array(z.strictObject({
+    messageId,
+    callKey: z.string().min(1),
+  })).optional(),
   outbox: z.array(taskOutboxEventSchema),
   decisions: z.array(taskDecisionRecordSchema),
   createdAt: z.string(),

@@ -31,6 +31,7 @@ import type { SessionId } from '@deepseek-ai/dsh-session'
 import Storage from '@deepseek-ai/dsh-storage'
 import { DomainFacility } from '@deepseek-ai/dsh-storage-domain'
 import {
+  mintTaskMessageId,
   SessionLinkError,
   SessionLinkMessageId,
   SessionLinkTaskError,
@@ -262,7 +263,11 @@ describe('session-link tasks: write-ahead binding sequence', () => {
     })
     expect(bound.taskState).toBe('queued')
     expect(bound.revision).toBe(2)
-    expect(bound.notificationRoot.rootMessageId).toBe(messageId)
+    /* R18: the notification root minted at FIRST intent admission (the
+     * deterministic attempt-1 delivery identity) and stays the single
+     * budget-chain authority; attachBinding never re-mints it, even when the
+     * synthetic binding id is not the minted one (a legacy/forged realm). */
+    expect(bound.notificationRoot.rootMessageId).toBe(mintTaskMessageId(saved.taskId, saved.row.callId))
     // Message bound but no host turn intent: not deliverable/wakeable.
     expect(s.tasks.isExecutionBound(saved.taskId)).toBe(false)
     expect(() => s.tasks.assertBindingDurable(saved.taskId)).toThrowError(expect.objectContaining({ code: 'TASK_BINDING_INCOMPLETE' }))
@@ -475,7 +480,9 @@ describe('session-link tasks: resolution decisions', () => {
       messageId: SessionLinkMessageId('session-link-message-retry1'), sessionId: bobId, admittedAs: 'queued',
     })
     expect(repaired.taskState).toBe('queued')
-    expect(repaired.notificationRoot.rootMessageId).toBe(SessionLinkMessageId('session-link-message-retry1'))
+    /* R18: the intent-admission root survives the retry's binding clear and
+     * the fresh binding — chain budget never resets across attempts. */
+    expect(repaired.notificationRoot.rootMessageId).toBe(mintTaskMessageId(taskId, 'call-r1'))
   })
 
   it('rejects retry on partial or unknown execution progress', async () => {

@@ -409,6 +409,345 @@ it('Task prompt invariant: under a REAL controller the task turn\'s prompt varia
 })
 
 /* --------------------------------------------------------------------------
+ * Task 4 grips (MODEL_ROUTING_FIX_PLAN notification cluster):
+ *  R17 collision-free notification messageId derivation + put-time conflict
+ *      validation; R18 notification root minted at FIRST intent admission,
+ *      riding through retry, sharing ONE wake-budget chain per task; R14
+ *      event-driven outbox re-pump on real retry conditions (mailbox capacity
+ *      freed by delivery, never a timer); plus the markRetried restart-window
+ *      closure through the durable retired-delivery ledger + reconcile.
+ * ------------------------------------------------------------------------ */
+
+it('R17: colliding sanitized callIds produce DISTINCT notification messages, never an overwrite', async () => {
+  /* Reviewer repro: `review/a` vs `review_a` — the pre-fix derivation replaced
+   * non-identifier chars with `_`, so two DIFFERENT events derived the SAME
+   * messageId and the second admission silently overwrote the first mailbox
+   * row. Two precheck-failed tracked calls whose callIds collide under the old
+   * sanitize must each own a mailbox row, and each row's structured eventId
+   * must name its own task event. */
+  const adapter = new MockAdapter([textResponse('unused')])
+  const s = await stack(adapter, [BASE]) // catalog lacks model-a: both calls fail precheck
+  await s.ctx.sessionLinks.link('r17-pair', [s.alice.id, s.bob.id], { kind: 'human' })
+  const first = await exec(s, 'session_send_session_message', {
+    session_id: s.bob.id, message: 'r17 first task', provider: 'mock', model: A,
+  }, 'r17/a')
+  const second = await exec(s, 'session_send_session_message', {
+    session_id: s.bob.id, message: 'r17 second task', provider: 'mock', model: A,
+  }, 'r17_a')
+  expect(first.isError).not.toBe(true)
+  expect(second.isError).not.toBe(true)
+  const { taskIdFor } = await import('../src/index.ts')
+  const firstTask = taskIdFor(s.alice.id, 'r17/a')
+  const secondTask = taskIdFor(s.alice.id, 'r17_a')
+  /* Two distinct notifications land in the mailbox (the pump's pass admits
+   * both pending outbox events; collision-free derivation keeps both ids). */
+  const reports: { id: string; eventId?: string; taskId?: string }[] = []
+  await vi.waitFor(() => {
+    reports.length = 0
+    const table = (s.ctx.sessionLinks as unknown as {
+      messages: { entries(): Iterable<[string, { taskStatus?: { eventId: string; taskId: string } }]> };
+    }).messages
+    for (const [id, record] of table.entries()) {
+      if (record.taskStatus !== undefined) {
+        reports.push({ id, eventId: record.taskStatus.eventId, taskId: record.taskStatus.taskId })
+      }
+    }
+    expect(reports).toHaveLength(2)
+  })
+  // Each row names its own task's event, and the message ids are distinct.
+  expect(new Set(reports.map(report => report.id)).size).toBe(2)
+  const byTask = new Map(reports.map(report => [report.taskId, report]))
+  expect(String(byTask.get(String(firstTask))!.eventId)).toContain('r17/a')
+  expect(String(byTask.get(String(secondTask))!.eventId)).toContain('r17_a')
+})
+
+it('R17 conflict: admitTaskStatus never overwrites a row whose stored event differs', async () => {
+  /* Put-time conflict validation at the mailbox boundary: an admission whose
+   * derived message id already names a DIFFERENT event is an error, never a
+   * silent overwrite. A genuine hash collision is unreachable by construction,
+   * so we seed the same-id/different-event row directly (the corruption
+   * realm) and admit — the admission must refuse and the stored row must
+   * survive byte-for-byte. */
+  const adapter = new MockAdapter([textResponse('unused')])
+  const s = await stack(adapter)
+  await s.ctx.sessionLinks.link('r17c-pair', [s.alice.id, s.bob.id], { kind: 'human' })
+  const { notificationMessageId, taskIdFor } = await import('../src/index.ts')
+  const reportFor = (callId: string, eventId: string) => ({
+    eventId,
+    taskId: taskIdFor(s.alice.id, callId),
+    attemptId: `${taskIdFor(s.alice.id, callId)}/attempt-1`,
+    revision: 1,
+    eventKind: 'model_unavailable' as const,
+    callerId: s.alice.id,
+    targetId: s.bob.id,
+    requestedModel: { provider: 'mock', model: A },
+    attempts: 1,
+    decisionRequired: true,
+    resumable: true,
+  })
+  // Corruption realm: a stored row under event-A's derived id that names
+  // event-B (its idempotency key misses the event-A probe).
+  const table = s.ctx.sessionLinks as unknown as {
+    messages: {
+      get(id: never): { taskStatus?: { eventId: string }; text: string } | undefined
+      put(id: never, value: unknown): Promise<void>
+    }
+  }
+  const collisionId = notificationMessageId('event-A')
+  const linkRow = s.ctx.sessionLinks.list(s.alice.id)[0]!
+  await table.messages.put(collisionId as never, {
+    linkId: linkRow.id,
+    senderId: s.bob.id,
+    senderTitle: 'forged',
+    targetId: s.alice.id,
+    text: 'pre-existing row under the derived id',
+    status: 'pending',
+    wakesUsed: 0,
+    chainLength: 1,
+    attempts: 0,
+    createdAt: new Date().toISOString(),
+    seq: 1,
+    statusKind: 'task-status',
+    taskStatus: {
+      taskId: 'task:forged', attemptId: 'a', eventId: 'event-B', revision: 1,
+      kind: 'model_unavailable', requestedModel: { provider: 'mock', model: A },
+      attempts: 1, decisionRequired: true, resumable: true,
+    },
+    idempotencyKey: 'task-event:event-B',
+  })
+  const admission = await s.ctx.sessionLinks.admitTaskStatus(reportFor('c-dot', 'event-A'))
+    .then(() => ({ threw: false as const }))
+    .catch((error: unknown) => ({ threw: true as const, error }))
+  expect(admission.threw).toBe(true)
+  // The stored row was never overwritten.
+  expect(table.messages.get(collisionId as never)?.taskStatus?.eventId).toBe('event-B')
+  expect(table.messages.get(collisionId as never)?.text).toBe('pre-existing row under the derived id')
+  // The same-event replay still re-delivers its own stored row.
+  const stored = await s.ctx.sessionLinks.admitTaskStatus(reportFor('c-dot', 'event-original'))
+  const replayed = await s.ctx.sessionLinks.admitTaskStatus(reportFor('c-dot', 'event-original'))
+  expect(replayed.messageId).toBe(stored.messageId)
+  // The derivation itself covers the WHOLE eventId (arbitrary user chars
+  // incl.), so `review/a` and `review_a` never co-derive one id.
+  expect(String(notificationMessageId('review/a'))).not.toBe(String(notificationMessageId('review_a')))
+  expect(String(notificationMessageId('x:y'))).not.toBe(String(notificationMessageId('x_y')))
+})
+
+it('R18: a precheck-failed task\'s notifications ride ONE wake-budget chain across the retry', async () => {
+  /* Reviewer repro: maxAutoWakesPerChain=1 with the reverse auto-wake granted.
+   * Initial missing-model status + explicit retry produced 3 status messages
+   * on 2-3 fresh chains — wakesUsed [1,1,0] = 2 wakes for the SAME task. The
+   * notification root must mint at FIRST intent admission (stable per task,
+   * surviving the retry) and every status report threads it as inReplyTo, so
+   * the whole lifecycle spends at most ONE wake: wakesUsed must be [1,0,0]. */
+  const adapter = new MockAdapter([
+    textResponse('alice wake turn'), // alice's wake handles the first report
+    textResponse('bob task turn'),   // bob's wake executes the retried task
+  ])
+  const s = await stack(adapter, [BASE], false, 'escape', { maxAutoWakesPerChain: 1 })
+  await s.ctx.sessionLinks.link('r18-pair', [s.alice.id, s.bob.id], { kind: 'human' }, {
+    autoWakeSessionIds: [s.alice.id, s.bob.id],
+  })
+  const sent = await exec(s, 'session_send_session_message', {
+    session_id: s.bob.id, message: 'r18 task on a missing model', provider: 'mock', model: A,
+  }, 'r18-send')
+  expect(sent.isError).not.toBe(true)
+  expect((sent as { value?: { outcome?: string } }).value?.outcome).toBe('needs_decision')
+  const { taskIdFor, mintTaskMessageId } = await import('../src/index.ts')
+  const taskId = taskIdFor(s.alice.id, 'r18-send')
+  const waiting = s.ctx.sessionLinkTasks.getRow(taskId)!
+  expect(waiting.taskState).toBe('waiting_decision')
+  /* R18 core: the root minted at FIRST intent admission — durable BEFORE any
+   * binding exists (this task never bound) — and exactly the attempt-1
+   * delivery identity the wire layer derives. */
+  const root = waiting.notificationRoot.rootMessageId
+  expect(root).toBeDefined()
+  expect(root).toBe(mintTaskMessageId(taskId, 'r18-send'))
+  // Report 1 lands and wakes alice once (the chain's single wake).
+  const reportsOf = () => {
+    const table = (s.ctx.sessionLinks as unknown as {
+      messages: { entries(): Iterable<[string, { taskStatus?: { taskId: string }; inReplyTo?: string; wakesUsed: number; status: string }]> };
+    }).messages
+    const found: { id: string; wakesUsed: number; inReplyTo?: string }[] = []
+    for (const [id, record] of table.entries()) {
+      if (record.taskStatus?.taskId === String(taskId)) {
+        found.push({ id, wakesUsed: record.wakesUsed, ...(record.inReplyTo === undefined ? {} : { inReplyTo: record.inReplyTo }) })
+      }
+    }
+    return found
+  }
+  await vi.waitFor(() => expect(reportsOf().length).toBeGreaterThanOrEqual(1))
+  const first = reportsOf()
+  expect(first[0]!.wakesUsed).toBe(1)
+  expect(first[0]!.inReplyTo).toBe(String(root))
+  // Explicit retry on an available route: the row re-admits and executes.
+  const decided = await exec(s, 'session_resolve_task', {
+    task_id: taskId, expected_revision: waiting.revision, action: 'retry', provider: 'mock', model: BASE,
+  }, 'r18-decision')
+  expect(decided.isError).not.toBe(true)
+  await s.bob.whenIdle().catch(() => {})
+  // Reports 2 (retry decision) + 3 (turn finished) queue behind the spent chain.
+  await vi.waitFor(() => expect(reportsOf().length).toBe(3))
+  const reports = reportsOf()
+  const wakesSpent = reports.reduce((sum, report) => sum + report.wakesUsed, 0)
+  // The whole task lifecycle consumed exactly ONE wake: never [1,1,0].
+  expect(wakesSpent).toBe(1)
+  expect(reports.filter(report => report.wakesUsed > 0)).toHaveLength(1)
+  // Every report threads the SAME root minted at intent admission.
+  for (const report of reports) expect(report.inReplyTo).toBe(String(root))
+  // The root survived the retry unchanged (attempt-scoped delivery identity
+  // minted fresh; the budget chain authority did not move).
+  const settled = s.ctx.sessionLinkTasks.getRow(taskId)!
+  expect(settled.notificationRoot.rootMessageId).toBe(root)
+  expect(settled.execution.messageId).toBeDefined()
+  const ledgerRow = (s.ctx.sessionLinks as unknown as {
+    readLedgers(): { wakes: Record<string, { day: string; wakes: number }> };
+  }).readLedgers?.() ?? { wakes: {} }
+  // The sender's day ledger agrees with the per-message facts: exactly one.
+  expect(ledgerRow.wakes[String(s.alice.id)]?.wakes ?? 1).toBe(1)
+})
+
+it('R18 mint continuity: saveTaskIntent carries the root from admission and attachBinding never re-mints a bound task\'s root', async () => {
+  const adapter = new MockAdapter([textResponse('ok')])
+  const s = await stack(adapter)
+  await s.ctx.sessionLinks.link('r18m-pair', [s.alice.id, s.bob.id], { kind: 'human' })
+  const tasks = s.ctx.sessionLinkTasks
+  const { SessionLinkMessageId, taskIdFor, mintTaskMessageId } = await import('../src/index.ts')
+  const policy = {
+    scope: 'task' as const,
+    candidates: [{ provider: 'mock', model: A }],
+    ifExhausted: 'notify_sender' as const,
+    usesSessionDefault: false,
+  }
+  await tasks.saveTaskIntent({
+    callerId: s.alice.id,
+    request: { kind: 'send', callId: 'r18-mint', text: 'minted-root task', targetSessionId: s.bob.id },
+    policy,
+    tracked: true,
+  })
+  const taskId = taskIdFor(s.alice.id, 'r18-mint')
+  const minted = tasks.getRow(taskId)!
+  // Root present at FIRST intent admission — before ANY binding exists.
+  expect(minted.notificationRoot.rootMessageId).toBe(mintTaskMessageId(taskId, 'r18-mint'))
+  const ghost = SessionLinkMessageId('session-link-message-r18-ghost')
+  await tasks.attachBinding(taskId, 1, { messageId: ghost, sessionId: s.bob.id, admittedAs: 'queued' })
+  /* A binding that is NOT the minted identity (a legacy/forged realm) never
+   * re-mints; the intent-time root is the single budget authority. */
+  expect(tasks.getRow(taskId)!.notificationRoot.rootMessageId).toBe(mintTaskMessageId(taskId, 'r18-mint'))
+})
+
+it('R14: capacity-freeing delivery re-pumps the refused outbox with no new task mutation', async () => {
+  /* Reviewer repro: maxPendingPerTarget=2, the notification target's mailbox
+   * is FULL of two pending peer mails, the status report is refused
+   * MAILBOX_FULL and stays pending; the human wake consumes the two mails →
+   * the outbox MUST reach the mailbox without any new task mutation. Pre-fix
+   * no pump trigger observed the freed capacity, so the event rotted pending. */
+  const adapter = new MockAdapter([
+    textResponse('alice human turn'),
+    textResponse('bob task turn'),
+  ])
+  const s = await stack(adapter, [BASE], false, 'escape', { maxPendingPerTarget: 2 })
+  await s.ctx.sessionLinks.link('r14-pair', [s.alice.id, s.bob.id], { kind: 'human' }, {
+    autoWakeSessionIds: [s.bob.id],
+  })
+  // Fill alice's mailbox with two PENDING peer mails from bob (no auto-wake on
+  // alice, so they queue without inserting).
+  for (const callKey of ['r14-fill-1', 'r14-fill-2']) {
+    const filled = await s.ctx.sessionLinks.send(s.bob, s.alice.id, {
+      targetId: s.alice.id, text: `fill ${callKey}`, idempotencyKey: callKey,
+    })
+    expect(filled.status).toBe('queued')
+  }
+  // The tracked call fails precheck; the pump's report hits MAILBOX_FULL.
+  const sent = await exec(s, 'session_send_session_message', {
+    session_id: s.bob.id, message: 'r14 task on a missing model', provider: 'mock', model: A,
+  }, 'r14-send')
+  expect(sent.isError).not.toBe(true)
+  const { taskIdFor } = await import('../src/index.ts')
+  const taskId = taskIdFor(s.alice.id, 'r14-send')
+  const pendingNow = () => s.ctx.sessionLinkTasks.getRow(taskId)!.outbox.map(event => event.status)
+  expect(pendingNow()).toEqual(['pending'])
+  // No task mutation here: wake alice HUMANLY so the two queued mails deliver.
+  s.alice.followup({ content: [{ type: 'text', text: 'human wakes alice' }], source: { kind: 'user' } } as never)
+  await s.alice.whenIdle().catch(() => {})
+  /* The freed capacity itself re-pumped the outbox (delivery transition is
+   * the trigger — never a timer, never another task call): the report is
+   * admitted to the mailbox. */
+  await vi.waitFor(() => expect(s.ctx.sessionLinkTasks.getRow(taskId)!.outbox[0]!.status).not.toBe('pending'))
+  const admittedEvent = s.ctx.sessionLinkTasks.getRow(taskId)!.outbox[0]!
+  expect(['admitted', 'delivered']).toContain(admittedEvent.status)
+  expect(admittedEvent.notifiedMessageId).toBeDefined()
+  const report = s.ctx.sessionLinks.message(admittedEvent.notifiedMessageId!)
+  expect(report).toBeDefined()
+  expect(['pending', 'delivered']).toContain(report!.status)
+})
+
+it('markRetried window: reconcile re-drives the retired-delivery marking a restart lost', async () => {
+  /* A restart between the retry decision commit and markLegacyDelivery's
+   * settle leaves the predecessor's ORIGINAL idempotency key adoptable.
+   * The decision now records the retired delivery durably; reconcile's
+   * classification re-drives marking and drops the ledger entry once the
+   * mailbox fact is observed. We simulate the lost marking by restoring the
+   * original key after the decision's hook settled, then reconcile. */
+  const B2 = 'model-b'
+  class FailThenOk extends MockAdapter {
+    constructor() { super([]) }
+    override async *stream(options: GenerateOptions) {
+      this.requests.push(options)
+      if (this.requests.length === 1) throw new HarnessError('first attempt down', 'PROVIDER_UNAVAILABLE')
+      for (const chunk of textResponse('second attempt ok')) yield chunk
+    }
+  }
+  const adapter = new FailThenOk()
+  const s = await stack(adapter, [BASE, A, B2])
+  await s.ctx.sessionLinks.link('mrr-pair', [s.alice.id, s.bob.id], { kind: 'human' }, {
+    autoWakeSessionIds: [s.bob.id],
+  })
+  const sent = await exec(s, 'session_send_session_message', {
+    session_id: s.bob.id, message: 'window task body', provider: 'mock', model: A,
+  }, 'mrr-send')
+  expect(sent.isError).not.toBe(true)
+  const { taskIdFor } = await import('../src/index.ts')
+  const taskId = taskIdFor(s.alice.id, 'mrr-send')
+  await vi.waitFor(() => {
+    expect(s.ctx.sessionLinkTasks.getRow(taskId)?.taskState).toBe('waiting_decision')
+  })
+  const failed = s.ctx.sessionLinkTasks.getRow(taskId)!
+  const firstMessageId = failed.execution.messageId!
+  const decided = await exec(s, 'session_resolve_task', {
+    task_id: taskId, expected_revision: failed.revision, action: 'retry', provider: 'mock', model: B2,
+  }, 'mrr-decision')
+  expect(decided.isError).not.toBe(true)
+  // The decision's own hook settles (normal-process marking)...
+  await vi.waitFor(() => {
+    expect(s.ctx.sessionLinks.message(firstMessageId)?.idempotencyKey).toBe('mrr-send/consumed')
+  })
+  /* ...then the restart-loss realm: the predecessor's original key is
+   * adoptable again (the marking never landed in the surviving process's
+   * durable media). The durable retired-delivery ledger still names it. */
+  const table = s.ctx.sessionLinks as unknown as {
+    messages: {
+      get(id: never): { idempotencyKey?: string } | undefined
+      put(id: never, value: unknown): Promise<void>
+    }
+  }
+  const stored = table.messages.get(firstMessageId as never)!
+  await table.messages.put(firstMessageId as never, { ...stored, idempotencyKey: 'mrr-send' })
+  expect(s.ctx.sessionLinks.message(firstMessageId)?.idempotencyKey).toBe('mrr-send')
+  // Reconcile (the mount-time classification) re-drives the marking.
+  await s.ctx.sessionLinkTasks.reconcile()
+  await vi.waitFor(() => {
+    expect(s.ctx.sessionLinks.message(firstMessageId)?.idempotencyKey).toBe('mrr-send/consumed')
+  })
+  /* ...and completes the durable ledger once the mailbox fact is observed
+   * (the completion drop rides the NEXT classification pass). */
+  await s.ctx.sessionLinkTasks.reconcile()
+  await vi.waitFor(() => {
+    const row = s.ctx.sessionLinkTasks.getRow(taskId)!
+    expect(row.retiredDeliveries ?? []).toHaveLength(0)
+  })
+})
+
+/* --------------------------------------------------------------------------
  * Task 3 grips (MODEL_ROUTING_FIX_PLAN admission-gate cluster):
  *  R03 cancel revocation, R08 retry delivery identity ×2, R09 full payload,
  *  R10 attempt-fixed selection, R11 missing-delivery repair, R13 default
