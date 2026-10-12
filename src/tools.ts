@@ -38,7 +38,7 @@ import { installTaskNotifications } from './task-notifications.ts'
 import type { TaskNotificationPump } from './task-notifications.ts'
 import { ensureTaskHostLazy } from './task-host-lazy.ts'
 import { installTaskRuntime, precheckFailureOf, requestedRouteOf } from './task-runtime.ts'
-import { taskIdFor } from './tasks.ts'
+import { TaskInvariantError, taskIdFor } from './tasks.ts'
 import type { CreateTaskIntentInput, SavedTaskIntent, TaskEventInput } from './tasks.ts'
 import type { SessionLinkTaskRecordData } from './task-spec.ts'
 import { mountPerPresetAgent, PresetScopeConfig, resolvePresets } from './scope.ts'
@@ -1303,14 +1303,26 @@ async function failCapabilityAdmission(
  * once, walk the concrete candidates in policy order, and select the first
  * available route. `session_default` sentinels stay opaque (resolved at
  * activation, never sampled here).
- * @returns the selected route when one passes.
+ *
+ * R10/R13 (MODEL_ROUTING_FIX_PLAN Task 3): returns the selected route WITH
+ * its index inside `policy.candidates`, so the admission can fix that fact
+ * durably onto the attempt row and activation can start the walk from the
+ * FIXED position instead of silently re-deriving from `candidates[0]`
+ * (pre-fix that re-executed the rejected primary). R13: a policy with NO
+ * catalog-available concrete route but at least one `session_default`
+ * sentinel passes as `route: undefined` (default-resolvable at activation);
+ * the precheck rejects only when a concrete route failed with no further
+ * candidates to try.
+ * @returns the selected route + candidate index (route undefined only for
+ *   an R13 default-resolvable pass).
  * @throws {@link ModelRoutingError} CATALOG_UNAVAILABLE when the read fails,
- *   or {@link PrecheckExhausted} when every concrete candidate rejected.
+ *   or {@link PrecheckExhausted} when every candidate is unavailable with
+ *   no default to resolve.
  */
 async function runPrecheck(
   ctx: Context,
   policy: ModelRoutingPolicy,
-): Promise<ModelRouteSelection> {
+): Promise<{ route: ModelRouteSelection | undefined; index: number }> {
   let catalog: ModelCatalogLike
   try {
     catalog = await readModelCatalog(() => ctx.sessionController.modelCatalog() as Promise<ModelCatalogLike>)
@@ -1320,14 +1332,85 @@ async function runPrecheck(
   }
   const outcome = checkCandidateRoutes(policy, catalog)
   if (outcome.selected !== undefined) {
-    let selected: ModelRouteSelection | undefined
+    // The selected CHECK names the route; its index within the policy's own
+    // candidates is the fact the attempt row fixes (R10). The check trail
+    // preserves policy order, so the selected route is the first `ok`.
     for (const check of outcome.checks) {
-      if (check.ok) { selected = check.route; break }
+      if (!check.ok) continue
+      const index = policy.candidates.findIndex(candidate =>
+        !('use' in candidate)
+        && candidate.provider === check.route.provider
+        && candidate.model === check.route.model
+        && candidate.reasoningEffort === check.route.reasoningEffort)
+      return { route: check.route, index: index === -1 ? 0 : index }
     }
-    if (selected !== undefined) return selected
-    return outcome.selected
+  }
+  /* R13: the default sentinel is resolvable at activation through the
+   * unified baseline snapshot chain (Task 2), so a policy whose every
+   * concrete candidate failed but which carries a default PASSES the
+   * precheck as default-resolvable. The activation resolves and freezes the
+   * baseline honestly; the exhaustion trail still names the concrete
+   * failures when the default itself cannot resolve. */
+  if (outcome.unresolvedDefaults > 0) {
+    return { route: undefined, index: policy.candidates.findIndex(candidate => 'use' in candidate) }
   }
   throw new PrecheckExhausted([...outcome.checks])
+}
+
+/**
+ * Resolve an R13 default-resolvable admission's route honestly: the TARGET's
+ * effective baseline snapshot (Task 2's unified owner) or, when it shows no
+ * explicit selection yet, the deployment default the catalog advertises.
+ * A catalog that ALSO cannot answer refuses the admission as catalog-gone
+ * (the needs_decision path records NO fabrication).
+ */
+async function resolveDefaultPrecheckRoute(
+  ctx: Context,
+  catalogDefault?: ModelRouteSelection,
+): Promise<ModelRouteSelection | undefined> {
+  try {
+    const catalog = await readModelCatalog(() => ctx.sessionController.modelCatalog() as Promise<ModelCatalogLike>)
+    return catalog.default ?? catalogDefault
+  } catch {
+    return catalogDefault
+  }
+}
+
+/** The TARGET's own effective baseline snapshot, when the host carries one. */
+function snapshotDefaultForHost(host: { readBaseline(): { effective: ModelRouteSelection | null } }):
+  ModelRouteSelection | undefined {
+  const effective = host.readBaseline().effective
+  return effective === null ? undefined : effective
+}
+
+/**
+ * R11: project one EXISTING durable row honestly at replay time. The row's
+ * own committed facts answer; a `queued` claim whose delivery the mailbox
+ * does NOT contain is NEVER reported — the half-write is heralded for repair
+ * and the replay surfaces the needs_decision shape the caller resolves.
+ */
+async function replayTrackedRow(
+  ctx: Context,
+  caller: Agent,
+  taskId: ReturnType<typeof taskIdFor>,
+  existing: SessionLinkTaskRecordData,
+): Promise<TrackedWire> {
+  const tasks = taskServiceOf(ctx)
+  if (existing.taskState === 'waiting_decision') return needsDecisionResult(existing)
+  if (existing.execution.messageId !== undefined) {
+    const message = ctx.sessionLinks.message(existing.execution.messageId)
+    if (message === undefined) {
+      /* The delivered-then-lost realm: the durable binding names a message
+       * the mailbox does not hold. Project repair, never `queued`. */
+      const heralded = await tasks.markDeliveryMissing(taskId, existing.execution.messageId)
+      return needsDecisionResult(heralded ?? existing)
+    }
+    return admittedResult(existing, {
+      messageId: existing.execution.messageId,
+      status: message.status === 'delivered' ? 'accepted' : 'queued',
+    }, undefined)
+  }
+  return needsDecisionResult(existing)
 }
 
 
@@ -1389,34 +1472,26 @@ async function trackedSend(
       policy: request.policy,
       tracked: true,
     }, pumpSchedule)
-    if (existing.taskState === 'waiting_decision') return needsDecisionResult(existing)
-    if (existing.execution.messageId !== undefined) {
-      const message = ctx.sessionLinks.message(existing.execution.messageId)
-      return admittedResult(existing, {
-        messageId: existing.execution.messageId,
-        status: message?.status === 'delivered' ? 'accepted' : 'queued',
-      }, undefined)
-    }
-    return needsDecisionResult(existing)
+    return await replayTrackedRow(ctx, caller, staleTaskId, existing)
   }
   await requireTaskHost(ctx, caller)
   // Precheck races nothing: it runs only on FIRST sight so a later catalog
   // change never reroutes this same task (plan: replay never re-runs precheck).
-  let selected: ModelRouteSelection
+  let precheck: { route: ModelRouteSelection | undefined; index: number } | undefined
   let precheckError: ModelRoutingError | undefined
   try {
-    selected = await runPrecheck(ctx, request.policy)
+    precheck = await runPrecheck(ctx, request.policy)
   } catch (error: unknown) {
     if (!(error instanceof ModelRoutingError)) throw error
     precheckError = error
-    selected = requestedRouteOf(request.policy)
   }
   const { saved } = await saveIntent(ctx, {
     callerId: caller.id,
     request: { kind: 'send', callId: request.callId, text: request.text, targetSessionId: targetId },
     policy: request.policy,
     tracked: true,
-    ...(precheckError === undefined ? {} : { precheckFailure: precheckFailureWire(request.policy, precheckError) }),
+    ...(precheckError !== undefined ? { precheckFailure: precheckFailureWire(request.policy, precheckError) } : {}),
+    ...(precheck === undefined || precheck.index === -1 ? {} : { selectedCandidateIndex: precheck.index }),
   }, pumpSchedule)
   const row = saved.row
   if (precheckError !== undefined) {
@@ -1430,7 +1505,7 @@ async function trackedSend(
   // intent (brief 4d): the SAME messageId drives both write chains by being
   // derived up front.
   const host = await hostForTarget(ctx, targetId)
-  const messageId = mintTaskMessageId(caller.id, request.callId)
+  const messageId = mintTaskMessageId(taskId, request.callId)
   /* F-C1a (final review): when the durable model binding CANNOT be made
    * before the mailbox admission (capability unavailable for the target —
    * host.recordTurnIntent impossible), the task is NOT admitted as a bare
@@ -1440,6 +1515,21 @@ async function trackedSend(
    * outbox event (reason vocabulary per the needs_decision contract) and the
    * caller receives the honest needs_decision shape. */
   if (host === undefined) {
+    return await failCapabilityAdmission(ctx, taskId, row, pumpSchedule,
+      stored => stored.targetSessionId === undefined
+        ? undefined
+        : ctx.sessionLinks.list(caller.id).find(link => link.memberIds.includes(stored.targetSessionId!))?.id)
+  }
+  /* R13: a default-resolvable precheck (route undefined) records the intent
+   * against the TARGET's unified baseline snapshot — the Task-2 owner's
+   * effective baseline when it carries one, else the deployment default —
+   * never the sender's and never re-sampled later (activation freezes the
+   * durable `defaultFrozenRoute`; this intent only carries the activation-
+   * time resolution for the FIRST turn's route). A baseline that also
+   * cannot answer refuses honestly below. */
+  const selected = precheck?.route
+    ?? await snapshotDefaultForHost(host) ?? await resolveDefaultPrecheckRoute(ctx)
+  if (selected === undefined) {
     return await failCapabilityAdmission(ctx, taskId, row, pumpSchedule,
       stored => stored.targetSessionId === undefined
         ? undefined
@@ -1542,25 +1632,16 @@ async function trackedSpawn(
       policy: request.policy,
       tracked: true,
     }, pumpSchedule)
-    if (existing.taskState === 'waiting_decision') return needsDecisionResult(existing)
-    if (existing.execution.messageId !== undefined) {
-      const message = ctx.sessionLinks.message(existing.execution.messageId)
-      return admittedResult(existing, {
-        messageId: existing.execution.messageId,
-        status: message?.status === 'delivered' ? 'accepted' : 'queued',
-      }, undefined)
-    }
-    return needsDecisionResult(existing)
+    return await replayTrackedRow(ctx, caller, staleTaskId, existing)
   }
   await requireTaskHost(ctx, caller)
-  let selected: ModelRouteSelection
+  let precheck: { route: ModelRouteSelection | undefined; index: number } | undefined
   let precheckError: ModelRoutingError | undefined
   try {
-    selected = await runPrecheck(ctx, request.policy)
+    precheck = await runPrecheck(ctx, request.policy)
   } catch (error: unknown) {
     if (!(error instanceof ModelRoutingError)) throw error
     precheckError = error
-    selected = requestedRouteOf(request.policy)
   }
   const spawnIntent = {
     cwd: request.cwd,
@@ -1580,95 +1661,208 @@ async function trackedSpawn(
     },
     policy: request.policy,
     tracked: true,
-    ...(precheckError === undefined ? {} : { precheckFailure: precheckFailureWire(request.policy, precheckError) }),
+    ...(precheckError !== undefined ? { precheckFailure: precheckFailureWire(request.policy, precheckError) } : {}),
+    ...(precheck === undefined || precheck.index === -1 ? {} : { selectedCandidateIndex: precheck.index }),
   }, pumpSchedule)
   const row = saved.row
   if (precheckError !== undefined) return needsDecisionResult(row)
   const taskId = taskIdFor(caller.id, request.callKey)
-  const created = await ctx.sessionController.create({ cwd: request.cwd, sessionId: derived })
+  const target = await ensureSpawnSession(ctx, caller, taskId, saved.row)
+  const payload = saved.row.originalRequest.payloadText ?? request.task
+  const admitted = await admitTrackedDelivery(ctx, caller, taskId, target, {
+    payload,
+    callKey: request.callKey,
+    policy: request.policy,
+    ...(precheck?.route === undefined ? {} : { digestCheckedSelection: precheck.route }),
+    ...(request.signal === undefined ? {} : { signal: request.signal }),
+  }, pumpSchedule)
+  if ('refusal' in admitted) return { ...admitted.refusal, sessionId: String(target), linkId: String(admitted.linkId) }
+  return admittedResult(tasks.getRow(taskId) ?? admitted.row, admitted.sent, admitted.selected)
+}
+
+/**
+ * The ORIGINAL spawn's create/link/rename sequence, idempotent under the
+ * spawn ledger (R08(2) reuses it for the precheck-failed retry: the durable
+ * row's spawn intent re-derives the same Session, re-arms the same group,
+ * and renames honestly — the replay ledger absorbs every repeat).
+ */
+async function ensureSpawnSession(
+  ctx: Context,
+  caller: Agent,
+  taskId: ReturnType<typeof taskIdFor>,
+  row: SessionLinkTaskRecordData,
+): Promise<SessionId> {
+  const spawn = row.spawn
+  if (spawn === undefined) {
+    // A send-kind row never re-creates; its target already exists.
+    const target = row.targetSessionId ?? row.execution.sessionId
+    if (target === undefined) throw new TaskInvariantError(`task "${taskId}" carries no spawn intent and no target`)
+    return target
+  }
+  const created = await ctx.sessionController.create({ cwd: spawn.cwd, sessionId: spawn.targetSessionId })
   const target = created.sessionId
-  let linkId: SessionLinkId
   try {
-    linkId = await ctx.sessionLinks.claimSpawnLink(
-      caller.id, target, request.callKey, request.title,
-      request.autoAwake, request.wakeCaller ?? request.autoAwake,
+    await ctx.sessionLinks.claimSpawnLink(
+      caller.id, target, spawn.callKey, spawn.title ?? row.originalRequest.summary.title ?? 'linked-session',
+      spawn.autoAwake, spawn.wakeCaller ?? spawn.autoAwake,
     )
   } catch (error: unknown) {
     if (error instanceof SessionLinkError && error.code === 'LINK_REVOKED') {
-      throw new Error(unlinkedReplay(request.callKey, target))
+      throw new Error(unlinkedReplay(spawn.callKey, target))
     }
-    throw new Error(`session ${target} was created in ${request.cwd} but could not be linked: ${reason(error)}. `
+    throw new Error(`session ${target} was created in ${spawn.cwd} but could not be linked: ${reason(error)}. `
       + 'It holds no task; tell the human so they can link it with /session-link add or archive it.')
   }
-  try {
-    await ctx.sessionController.rename({ sessionId: target, title: request.title })
-  } catch (error: unknown) {
-    ctx.logger.warn(`session-link: renaming spawned session "${target}" failed: ${reason(error)}`)
+  const title = spawn.title ?? row.originalRequest.summary.title
+  if (title !== undefined) {
+    try {
+      await ctx.sessionController.rename({ sessionId: target, title })
+    } catch (error: unknown) {
+      ctx.logger.warn(`session-link: renaming spawned session "${target}" failed: ${reason(error)}`)
+    }
   }
-  const host = await hostForTarget(ctx, target)
-  const messageId = mintTaskMessageId(caller.id, request.callKey)
-  /* F-C1a (final review): the capability for the freshly created target is
-   * unavailable — refuse honestly instead of admitting a bare managed
-   * message that would execute on the deployment's default model. The
-   * created Session itself is durable state the wire honestly names (it
-   * exists; the task simply was not admitted); a retry decision re-arms the
-   * SAME derived Session through the replay ledger. */
+  return target
+}
+
+interface AdmitTrackedInput {
+  /** The FULL task body (durable payloadText) — never an excerpt. */
+  readonly payload: string
+  /** The attempt-scoped idempotency identity (`<callKey>` original; `<callKey>/attempt-<N>` retries). */
+  readonly callKey: string
+  readonly policy: ModelRoutingPolicy
+  /** The digest-checked precheck selection when one ran; undefined resolves through R13/default. */
+  readonly digestCheckedSelection?: ModelRouteSelection
+  readonly signal?: AbortSignal
+}
+
+/**
+ * The shared tracked admission tail (R08): host gate → intent record →
+ * attachBinding → recordTurnIntent → mailbox send under the attempt-scoped
+ * identity. Used by first-sight spawn and the retry re-admission alike; the
+ * task row's `preparing` state and the attempt-scoped idempotency key make a
+ * repeat safe (re-admission under the SAME key adopts the stored delivery).
+ */
+async function admitTrackedDelivery(
+  ctx: Context,
+  caller: Agent,
+  taskId: ReturnType<typeof taskIdFor>,
+  targetId: SessionId,
+  input: AdmitTrackedInput,
+  pumpSchedule: () => void,
+): Promise<{ row: SessionLinkTaskRecordData; sent: SessionLinkSendResult; selected: ModelRouteSelection; linkId?: SessionLinkId }
+  | { refusal: NeedsDecisionWire; linkId?: SessionLinkId }> {
+  const tasks = taskServiceOf(ctx)
+  const row = tasks.getRow(taskId)
+  if (row === undefined) throw new TaskInvariantError(`task "${taskId}" is not durable`)
+  const linkId = row.execution.linkId ?? ctx.sessionLinks.list(caller.id).find(link => link.memberIds.includes(targetId))?.id
+  const host = await hostForTarget(ctx, targetId)
   if (host === undefined) {
     const refusal = await failCapabilityAdmission(ctx, taskId, row, pumpSchedule)
-    return { ...refusal, sessionId: String(target), linkId: String(linkId) }
+    return { refusal, ...(linkId === undefined ? {} : { linkId }) }
   }
-  let intentId: string | undefined
-  try {
-    const intent = host.recordTurnIntent({
-      taskId,
-      attemptId: row.currentAttemptId,
-      messageId: messageId as unknown as MessageId,
-      route: { selection: selected },
-      persistOnSuccess: request.policy.scope === 'session',
-    })
-    await host.claimTurnIntent(intent.intentId).catch(() => { /* the gate claims it at activation */ })
-    intentId = intent.intentId
-  } catch {
+  /* R13: default-resolvable or absent precheck selection resolves through
+   * the unified snapshot chain (host baseline, then deployment default). */
+  const selected = input.digestCheckedSelection
+    ?? await snapshotDefaultForHost(host) ?? await resolveDefaultPrecheckRoute(ctx)
+  if (selected === undefined) {
     const refusal = await failCapabilityAdmission(ctx, taskId, row, pumpSchedule)
-    return { ...refusal, sessionId: String(target), linkId: String(linkId) }
+    return { refusal, ...(linkId === undefined ? {} : { linkId }) }
   }
-  // Binding BEFORE the mailbox admission (same brief-4d ordering as send):
-  // the spawned first-task wake claims the delivery synchronously inside
-  // `send` and its first request must already see the durable row + intent.
-  const boundPre = await tasks.attachBinding(taskId, row.revision, {
+  /* R08: the new attempt's delivery identity derives from the CURRENT
+   * attempt ordinal — attempt-scoped, never the consumed identity the
+   * previous attempt's consumed mailbox row occupied. The ORIGINAL call's
+   * key stays `<callKey>`; its notification ROOT binds at attachBinding and
+   * rides the task row's `notificationRoot` thereafter, so the chain wake
+   * budget never mints a second root. */
+  const messageId = mintTaskMessageId(String(taskId) as never, input.callKey)
+  /* Re-entrant admission: a racing copy of this same attempt admission may
+   * have already recorded the intent (the durable identity is attempt-
+   * scoped and deterministic); adopt it instead of recording a duplicate
+   * the host rightfully refuses ("live claim exists"). The recorded
+   * attemptId must match this admission's attempt — a stale same-key hold
+   * belongs to a different attempt and stays an honest refusal below. */
+  const attemptId = row.currentAttemptId
+  let intentId: string | undefined
+  const already = host.getTurnIntentByMessageId(messageId as unknown as MessageId)
+  if (already !== undefined && already.attemptId === attemptId && already.taskId === taskId
+    && (already.status === 'claimed' || already.status === 'started')) {
+    intentId = already.intentId
+  } else {
+    try {
+      const intent = host.recordTurnIntent({
+        taskId,
+        attemptId,
+        messageId: messageId as unknown as MessageId,
+        route: { selection: selected },
+        persistOnSuccess: input.policy.scope === 'session',
+      })
+      await host.claimTurnIntent(intent.intentId).catch(() => { /* the gate claims it at activation */ })
+      intentId = intent.intentId
+    } catch {
+      const refusal = await failCapabilityAdmission(ctx, taskId, row, pumpSchedule)
+      return { refusal, ...(linkId === undefined ? {} : { linkId }) }
+    }
+  }
+  /* The binding writes ride the row's own CAS: a pump/decision marker may
+   * have advanced the revision past this function's entry read, so re-read
+   * and retry the SAME deterministic identity — a second distinct binding
+   * stays the honest refusal the service throws. */
+  let boundPre: SessionLinkTaskRecordData | undefined
+  for (let attempt = 0; attempt < 3 && boundPre === undefined; attempt += 1) {
+    const live = tasks.getRow(taskId) ?? row
+    if (live.execution.messageId === messageId
+      && (live.execution.turnIntentId === undefined || live.execution.turnIntentId === intentId)) {
+      boundPre = live
+      break
+    }
+    try {
+      boundPre = await tasks.attachBinding(taskId, live.revision, {
+        messageId,
+        sessionId: targetId,
+        ...(linkId === undefined ? {} : { linkId }),
+        admittedAs: 'queued',
+      })
+    } catch (error: unknown) {
+      if (error instanceof Error && 'code' in error && (error as { code?: string }).code === 'TASK_STALE_REVISION') continue
+      throw error
+    }
+  }
+  if (boundPre === undefined) throw new Error(`task "${taskId}" binding could not attach within three CAS retries`)
+  if (intentId !== undefined && boundPre.execution.turnIntentId !== intentId) {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const live = tasks.getRow(taskId) ?? boundPre
+      if (live.execution.turnIntentId === intentId) break
+      try {
+        await tasks.recordTurnIntent(taskId, live.revision, { turnIntentId: intentId, messageId })
+        break
+      } catch (error: unknown) {
+        if (error instanceof Error && 'code' in error && (error as { code?: string }).code === 'TASK_STALE_REVISION') continue
+        throw error
+      }
+    }
+  }
+  const sent = await ctx.sessionLinks.send(caller, targetId, {
+    targetId,
+    text: input.payload,
+    idempotencyKey: input.callKey,
     messageId,
-    sessionId: target,
-    linkId,
-    admittedAs: 'queued',
+    ...(input.signal === undefined ? {} : { signal: input.signal }),
   })
-  if (host !== undefined && intentId !== undefined) {
-    await tasks.recordTurnIntent(taskId, boundPre.revision, {
-      turnIntentId: intentId,
-      messageId,
-    })
-  }
-  let sent: SessionLinkSendResult
-  try {
-    sent = await ctx.sessionLinks.send(caller, target, {
-      targetId: target,
-      text: request.task,
-      idempotencyKey: request.callKey,
-      messageId,
-      signal: request.signal,
-    })
-  } catch (error: unknown) {
-    throw new Error(`session ${target} was created and linked (${linkId}), but its tracked task was not delivered and will not be: `
-      + `${reason(error)}. Resend the task with session_send_session_message; it still starts the new Session.`)
-  }
-  let recorded = await tasks.getRow(taskId) ?? boundPre
+  const boundRow = tasks.getRow(taskId) ?? boundPre
+  let recorded = boundRow
   if (sent.status === 'accepted' && recorded.execution.turnIntentId !== undefined) {
     recorded = await tasks.attachBinding(taskId, recorded.revision, {
       messageId: sent.messageId,
-      sessionId: target,
+      sessionId: targetId,
       admittedAs: 'accepted',
     }).catch(() => recorded)
   }
-  return admittedResult(tasks.getRow(taskId) ?? recorded, sent, selected)
+  return {
+    row: tasks.getRow(taskId) ?? recorded,
+    sent,
+    selected,
+    ...(linkId === undefined ? {} : { linkId }),
+  }
 }
 
 /** Resolve (or lazily install, single-flighted) the HOST capability of the
@@ -1703,14 +1897,23 @@ function ownerOfScope(ctx: Context, scoped: Context): Agent | undefined {
 }
 
 /**
- * Derive the mailbox message identity a tracked admission will use: stable
- * across replay of the same (caller, callId) pair so the cloned Session's
- * re-admission re-uses the SAME identity, and unique per (caller, original
- * callId) so every task owns exactly one durable delivery identity.
+ * Derive the mailbox message identity one tracked ADMISSION will use
+ * (R08(1)): deterministic per (attempt-scope, attempt idempotency key). The
+ * original attempt passes its taskId + raw callId and mints the SAME value
+ * every replay of that call answers; each retry attempt passes
+ * `<callKey>/attempt-<N>` and mints a FRESH identity — the re-admission of
+ * a delivered-task retry never reuses the consumed mailbox delivery its
+ * predecessor owned, while the taskId + notification-root budget chain the
+ * task row carries stay continuous across attempts.
  */
-function mintTaskMessageId(callerId: SessionId, callId: string): ReturnType<typeof SessionLinkMessageId> {
-  const hex = createHash('sha256').update(`task-msg\0${callerId}\0${callId}`).digest('hex')
+function mintTaskMessageId(taskScope: string, callKey: string): ReturnType<typeof SessionLinkMessageId> {
+  const hex = createHash('sha256').update(`task-msg\0${taskScope}\0${callKey}`).digest('hex')
   return SessionLinkMessageId(`session-link-message-${hex.slice(0, 32)}`)
+}
+
+/** The attempt-scoped idempotency key: original = callId, retry = callId/attempt-N. */
+function attemptCallKey(callId: string, ordinal: number): string {
+  return ordinal === 1 ? callId : `${callId}/attempt-${ordinal}`
 }
 
 /* --------------------------------------------------------------------------
@@ -1853,6 +2056,16 @@ async function resolveTaskWire(
     throw new SessionLinkError('only the original sender Session may resolve a task', 'LINK_CALLER_NOT_MEMBER')
   }
 
+  /* R11: a retry/reopen decision against a task whose bound delivery the
+   * mailbox does NOT contain is heraled FIRST — the row's `queued`-projection
+   * is a phantom the caller must not resolve blindly. The herald drops the
+   * task into waiting_decision/not_started (retry's required realm) with the
+   * missingDelivery reason; the stale token only re-reads after the mark. */
+  if (args.action === 'retry' && row.execution.messageId !== undefined
+    && ctx.sessionLinks.message(row.execution.messageId) === undefined) {
+    await tasks.markDeliveryMissing(taskId, row.execution.messageId)
+  }
+
   // continue: only the sender; the service enforces waiting_decision+partial
   // + a host-confirmed resumable checkpoint. today's host capability reports
   // EVERY turn intent non-resumable (pause/resume fail closed honestly — Task
@@ -1957,50 +2170,18 @@ async function resolveTaskWire(
 }
 
 /**
- * The retry re-admission's honest capability refusal: a `preparing` task
- * whose target cannot carry a durable intent drops back to
- * `waiting_decision`/`not_started` with ONE model_unavailable event. Best
- * effort under stale revisions — the row's own CAS guards repeat runs, and
- * the pump's dedupe keeps the notification single.
- */
-async function reAdmitRefuseCapability(
-  tasks: Context['sessionLinkTasks'],
-  taskId: SessionLinkTaskId,
-  policy: ModelRoutingPolicy,
-): Promise<void> {
-  for (let attempt = 0; attempt < 3; attempt += 1) {
-    const live = tasks.getRow(taskId)
-    if (live === undefined || live.taskState !== 'preparing') return
-    try {
-      await tasks.requestStateChange(taskId, live.revision, {
-        toState: 'waiting_decision',
-        executionState: 'not_started',
-        reason: 'model_unavailable',
-        events: [{
-          kind: 'model_unavailable',
-          executionState: 'not_started',
-          reason: 'model_unavailable',
-          requestedModel: requestedRouteOf(policy),
-          attempts: live.attempts.at(-1)?.results.length ?? 0,
-          decisionRequired: true,
-          resumable: true,
-        }],
-      })
-      return
-    } catch (error: unknown) {
-      if (error instanceof Error && 'code' in error && (error as { code?: string }).code === 'TASK_STALE_REVISION') continue
-      return
-    }
-  }
-}
-
-/**
- * Re-admit a successfully retried task through the tracked mailbox path:
- * fresh candidate precheck against the task's CURRENT policy snapshot,
- * re-record the host turn intent on the SAME deterministic messageId, and
- * re-send through the mailbox under the ORIGINAL idempotency key. The task
- * identity the re-admission names is the ORIGINAL task's — retry keeps the
- * original taskId, spawn callKey, and message semantics by design.
+ * Re-admit a successfully retried task through the SAME tracked admission
+ * machinery the original call used (R08). The retry binds a FRESH attempt-
+ * scoped delivery identity (R08(1): the previous attempt's consumed mailbox
+ * delivery is never adopted — the new messageId mints from the current
+ * attempt ordinal, the task row's notificationRoot keeps the chain budget),
+ * re-runs the candidate precheck against the DECIDED policy snapshot, and
+ * re-arms the ORIGINAL spawn flow idempotently for a precheck-not-created
+ * spawn (R08(2): the spawn intent's original callKey re-derives the same
+ * Session, the ledger claim re-arms its group, and the rename honestly
+ * repeats). The payload the retry admits is the durable `payloadText`
+ * (R09) — the FULL body, recovered from the bound predecessor message for
+ * pre-R09 rows — never the bounded textExcerpt the pre-fix path re-sent.
  */
 async function reAdmitRetriedTask(
   ctx: Context,
@@ -2016,14 +2197,13 @@ async function reAdmitRetriedTask(
 
   // Apply the DECIDED policy snapshot (resolveTask already swapped it in).
   const policy = row.policy
-  let selected: ModelRouteSelection
+  let precheck: { route: ModelRouteSelection | undefined; index: number } | undefined
   let precheckError: ModelRoutingError | undefined
   try {
-    selected = await runPrecheck(ctx, policy)
+    precheck = await runPrecheck(ctx, policy)
   } catch (error: unknown) {
     if (!(error instanceof ModelRoutingError)) throw error
     precheckError = error
-    selected = requestedRouteOf(policy)
   }
   if (precheckError !== undefined) {
     // Fresh precheck failure on the new policy: project waiting_decision with
@@ -2045,85 +2225,37 @@ async function reAdmitRetriedTask(
     return
   }
 
-  // Spawn-kind tasks re-create the SAME derived Session; the ledger's claim
-  // keeps the original group. Send-kind tasks use the existing pair.
-  const messageId = mintTaskMessageId(caller.id, row.callId)
-  const host = await hostForTarget(ctx, targetId as never)
-  /* F-C1a on the decision path: a retried task whose target capability is
-   * unavailable NEVER re-admits a bare managed message — it drops back to
-   * waiting_decision with ONE model_unavailable event, exactly like the
-   * first-sight admission. The sender decides again honestly. */
-  let intentId: string | undefined
-  if (host === undefined) {
-    await reAdmitRefuseCapability(tasks, taskId, policy)
-    pumpSchedule()
-    return
-  }
-  try {
-    const intent = host.recordTurnIntent({
-      taskId,
-      attemptId: row.currentAttemptId,
-      messageId: messageId as unknown as MessageId,
-      route: { selection: selected },
-      persistOnSuccess: policy.scope === 'session',
-    })
-    await host.claimTurnIntent(intent.intentId).catch(() => { /* the gate claims it at activation */ })
-    intentId = intent.intentId
-  } catch {
-    await reAdmitRefuseCapability(tasks, taskId, policy)
-    pumpSchedule()
-    return
-  }
-  const linkId = row.execution.linkId ?? ctx.sessionLinks.list(caller.id).find(link => link.memberIds.includes(targetId))?.id
-  /* The decision and the outbox pump both moved the revision since the read
-   * at function entry: attachBinding must run against the LIVE revision. A
-   * stale CAS here is safe to retry ONCE against the fresh row — the same
-   * deterministic messageId and idempotency key still bind this exact flow,
-   * and a second binding attempt would throw the LINK_ALREADY_LINKED abort
-   * below before any duplicate could commit. */
-  let revision = (tasks.getRow(taskId) ?? row).revision
-  let bound = tasks.getRow(taskId) ?? row
-  for (let attempt = 0; attempt < 3; attempt += 1) {
-    try {
-      bound = await tasks.attachBinding(taskId, revision, {
-        messageId,
-        sessionId: targetId,
-        ...(linkId === undefined ? {} : { linkId }),
-        admittedAs: 'queued',
-      })
-      break
-    } catch (error: unknown) {
-      if (error instanceof Error && 'code' in error && (error as { code?: string }).code === 'TASK_STALE_REVISION') {
-        const fresh = tasks.getRow(taskId)
-        if (fresh === undefined) throw error
-        revision = fresh.revision
-        bound = fresh
-        continue
-      }
-      // The ONE legitimate abort shapes: resolveTask's own state guarantee
-      // already proved the flow is safe to re-admit; a binding conflict
-      // means the original delivery still exists and awaits the task's own
-      // turn — never admit a duplicate.
-      if (error instanceof SessionLinkError && error.code === 'LINK_ALREADY_LINKED') return
-      throw error
-    }
-  }
-  if (host !== undefined && intentId !== undefined) {
-    await tasks.recordTurnIntent(taskId, bound.revision, { turnIntentId: intentId, messageId })
-  }
-  const sent = await ctx.sessionLinks.send(caller, targetId as never, {
-    targetId: targetId as never,
-    text: row.originalRequest.summary.textExcerpt ?? '',
-    idempotencyKey: row.callId,
-    messageId,
+  /* R08(2): a precheck-failed spawn's retry runs the FULL create/link/rename
+   * sequence the original admission ran (the derived Session it names is the
+   * SAME one the original callKey mints — the replay ledger absorbs the
+   * repeat); a send-kind retry's target already exists and re-arms through
+   * the same path. */
+  const target = await ensureSpawnSession(ctx, caller, taskId, row)
+
+  /* R09: prefer the durable full payload; recover a pre-R09 row's body from
+   * the bound predecessor message when the row only carries the excerpt. */
+  const payload = row.originalRequest.payloadText ?? (() => {
+    const bound = row.notificationRoot.rootMessageId ?? row.execution.messageId
+    const text = bound === undefined ? undefined : ctx.sessionLinks.message(bound)?.text
+    return text ?? row.originalRequest.summary.textExcerpt ?? ''
+  })()
+
+  const current = tasks.getRow(taskId) ?? row
+  const attempt = current.attempts.find(candidate => candidate.attemptId === current.currentAttemptId)
+  const ordinal = attempt?.ordinal ?? 1
+  const admitted = await admitTrackedDelivery(ctx, caller, taskId, target, {
+    payload,
+    callKey: attemptCallKey(row.callId, ordinal),
+    policy,
+    ...(precheck?.route === undefined ? {} : { digestCheckedSelection: precheck.route }),
+  }, pumpSchedule).catch(async error => {
+    if (error instanceof SessionLinkError && error.code === 'LINK_ALREADY_LINKED') return
+    throw error
   })
-  const after = tasks.getRow(taskId)
-  if (after !== undefined && sent.status === 'accepted' && after.execution.turnIntentId !== undefined) {
-    await tasks.attachBinding(taskId, after.revision, {
-      messageId: sent.messageId,
-      sessionId: targetId,
-      admittedAs: 'accepted',
-    }).catch(() => after)
+  if (admitted === undefined) return
+  if ('refusal' in admitted) {
+    pumpSchedule()
+    return
   }
   pumpSchedule()
 }

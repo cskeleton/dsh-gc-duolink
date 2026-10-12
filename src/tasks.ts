@@ -92,11 +92,25 @@ export const TASK_WRITE_FAILED: TaskErrorCode = 'TASK_WRITE_FAILED'
  */
 export class SessionLinkTaskError extends Error {
   constructor(
-    readonly code: TaskErrorCode | typeof TASK_STALE_REVISION,
+    readonly code: TaskErrorCode | typeof TASK_STALE_REVISION | 'TASK_ROW_EXISTS',
     message: string,
   ) {
     super(message)
     this.name = 'SessionLinkTaskError'
+  }
+}
+
+/**
+ * R15 (MODEL_ROUTING_FIX_PLAN Task 3): a first-create `saveTaskIntent` raced
+ * an existing row for the same task identity inside the atomic
+ * insert-if-absent (the fast-path read missed it, two first-creates queued).
+ * Never silently overwritten — the caller re-reads the stored row and
+ * adopts-or-conflicts on the digest instead.
+ */
+export class TaskRowExistsError extends SessionLinkTaskError {
+  constructor(readonly stored: SessionLinkTaskRecordData) {
+    super('TASK_ROW_EXISTS', `task row "${taskIdFor(stored.callerId, stored.callId)}" already exists`)
+    this.name = 'TaskRowExistsError'
   }
 }
 
@@ -156,6 +170,13 @@ export interface CreateTaskIntentInput {
     /** Per-candidate precheck outcomes, appended immutably onto attempt 1. */
     readonly results: readonly { route: ModelRouteSelection; code: string; message?: string }[]
   }
+  /**
+   * R10 (MODEL_ROUTING_FIX_PLAN Task 3): when the sync precheck PASSED, the
+   * index within `policy.candidates` it selected, fixed durably onto the new
+   * attempt 1. Absent on a precheck failure (no candidate was selected) and
+   * on pre-R10 rows.
+   */
+  readonly selectedCandidateIndex?: number
 }
 
 /** Outcome of saving an intent. */
@@ -261,10 +282,36 @@ export interface TaskLinksProbe {
   pairLinked(linkId: SessionLinkId, first: SessionId, second: SessionId): boolean
 }
 
+/**
+ * R08(1): wire-layer hook the service calls while opening a task's retry
+ * attempt — mark the PREVIOUS attempt's consumed/absent mailbox delivery so
+ * the NEW attempt's admission can never adopt it as the task's own delivery.
+ * Best-effort as far as the decision itself is concerned: a throw is logged
+ * by the caller and the decision still commits (the new messageId path no
+ * longer needs the marker).
+ */
+export type MarkLegacyDeliveryFn = (messageId: SessionLinkMessageId, taskId: SessionLinkTaskId) => void
+
+/**
+ * R03 (MODEL_ROUTING_FIX_PLAN Task 3): the wire layer revokes a cancelled
+ * task's un-consumed mailbox delivery (pending → cancelled) and cancels its
+ * durable host turn intent. Wired from the tools row because only it can
+ * reach the link service and the lazy host capability; invoked fire-and-
+ * forget from the cancel decision — the decision itself NEVER blocks on the
+ * revocation, because the activation gates read the terminal row and hard-
+ * refuse regardless. The row handed over is the PRE-DECISION snapshot (its
+ * execution binding still names the delivery/intent to revoke).
+ */
+export type RevokeDeliveryFn = (taskId: SessionLinkTaskId, row: SessionLinkTaskRecordData) => void
+
 /** Service construction options; none of them add I/O or timers. */
 export interface SessionLinkTaskServiceOptions {
   /** Mailbox/link facts; required for `reconcile` consistency checks and notification recipient guards. */
   readonly links?: TaskLinksProbe
+  /** R08(1): marks a retry's previous-attempt legacy delivery (see {@link MarkLegacyDeliveryFn}). */
+  readonly markLegacyDelivery?: MarkLegacyDeliveryFn
+  /** R03: revoke a task's un-consumed pending delivery + host intent on a cancel decision. */
+  readonly revokeDelivery?: RevokeDeliveryFn
   /** Host turn-intent facts per target Session, for orphan checks. */
   readonly hostFor?: (sessionId: SessionId) => HostTaskHostCapability | undefined
   /** Injectable clock for deterministic tests. */
@@ -291,16 +338,34 @@ function attemptIdFor(taskId: SessionLinkTaskId, ordinal: number): string {
 }
 
 /**
- * Bounded deterministic digest of the original request: kind + spawn/target
- * identity + the normalized policy + a bounded slice of the task text. Replay
- * of the same call compares digests; different params demand
- * `session_resolve_task`, never a replay replacement. Not a secret store:
- * the slice is bounded and the full body lives in the mailbox message once
- * bound.
+ * Deterministic digest of the original request: kind + spawn/target identity
+ * + the normalized policy + the FULL task text. Replay of the same call
+ * compares digests; different params demand `session_resolve_task`, never a
+ * replay replacement. Not a secret store — the digest is a 64-bit fingerprint
+ * and the full body itself lives durably on the row (`payloadText`) and in
+ * the bound mailbox message.
+ *
+ * R16 (MODEL_ROUTING_FIX_PLAN Task 3): the digest version bumped `v:1 → v:2`
+ * and now hashes the complete `text` instead of the bounded
+ * `TASK_DIGEST_MAX_TEXT` slice — the pre-R16 truncation silently accepted a
+ * replay whose tail diverged past 2048 UTF-16 units as the SAME call. The
+ * legacy digest remains available through {@link legacyRequestDigest} so a
+ * pre-R16 durable row still recognizes its own replays exactly (digest
+ * equality stays byte-for-byte identity, never cross-version forgiveness).
  */
 export function requestDigest(input: OriginalRequestInput, policy: ModelRoutingPolicy): string {
-  const material = JSON.stringify({
-    v: 1,
+  return `fnv1a-64:${hexHash(digestMaterial(input, policy, 2))}`
+}
+
+/** The PRE-R16 digest: the bounded 2048-unit text slice under format v1. */
+export function legacyRequestDigest(input: OriginalRequestInput, policy: ModelRoutingPolicy): string {
+  return `fnv1a-64:${hexHash(digestMaterial(input, policy, 1))}`
+}
+
+/** The JSON material one digest version fingerprints (pure identity mapping). */
+function digestMaterial(input: OriginalRequestInput, policy: ModelRoutingPolicy, version: 1 | 2): string {
+  return JSON.stringify({
+    v: version,
     kind: input.kind,
     spawnCwd: input.spawn?.cwd,
     spawnTitle: input.spawn?.title,
@@ -309,9 +374,8 @@ export function requestDigest(input: OriginalRequestInput, policy: ModelRoutingP
     target: input.kind === 'send' ? input.targetSessionId : input.spawn?.targetSessionId,
     policy,
     title: input.title,
-    text: input.text.slice(0, TASK_DIGEST_MAX_TEXT),
+    text: version === 1 ? input.text.slice(0, TASK_DIGEST_MAX_TEXT) : input.text,
   })
-  return `fnv1a-64:${hexHash(material)}`
 }
 
 /** FNV-1a 64-bit over UTF-8, hex-encoded: deterministic across processes, needs no crypto module. */
@@ -386,6 +450,8 @@ export class SessionLinkTaskService extends Service {
 
   private tasks!: KvTable<SessionLinkTaskId, SessionLinkTaskRecordData>
   private readonly probe?: TaskLinksProbe
+  private readonly markLegacyDelivery?: MarkLegacyDeliveryFn
+  private readonly revokeDelivery?: RevokeDeliveryFn
   private readonly hostFor?: (sessionId: SessionId) => HostTaskHostCapability | undefined
   private readonly now: () => Date
   private disposed = false
@@ -393,6 +459,8 @@ export class SessionLinkTaskService extends Service {
   constructor(ctx: Context, options: SessionLinkTaskServiceOptions = {}) {
     super(ctx, 'sessionLinkTasks')
     this.probe = options.links
+    this.markLegacyDelivery = options.markLegacyDelivery
+    this.revokeDelivery = options.revokeDelivery
     this.hostFor = options.hostFor
     this.now = options.now ?? (() => new Date())
   }
@@ -549,17 +617,18 @@ export class SessionLinkTaskService extends Service {
     }
     const taskId = taskIdFor(input.callerId, input.request.callId)
     const existing = this.tasks.get(taskId)
-    if (existing !== undefined) {
-      const digest = requestDigest(input.request, input.policy)
-      if (digest === existing.originalRequest.digest) {
-        // Recreate protection: the same original call returns the stored row.
-        return { taskId, row: existing }
+    if (existing !== undefined) return { taskId, row: this.adoptOrConflict(taskId, existing, input) }
+    /* R10: a first-create intent carries the SYNC-precheck's selected index
+     * ONLY when the precheck truly ran. A `waiting_decision` save (precheck
+     * failure) selects nothing; an R13 default-resolvable pass may carry the
+     * default sentinel's index. */
+    if (input.selectedCandidateIndex !== undefined) {
+      const index = input.selectedCandidateIndex
+      if (input.precheckFailure !== undefined || !Number.isInteger(index) || index < 0 || index >= input.policy.candidates.length) {
+        throw new TaskInvariantError(
+          `selectedCandidateIndex ${index} is not valid for task "${taskId}" (precheck=${input.precheckFailure === undefined ? 'passed' : 'failed'}, candidates=${input.policy.candidates.length})`,
+        )
       }
-      throw new SessionLinkError(
-        `task "${taskId}" already exists with different parameters; use session_resolve_task — `
-        + 'the original call must not be replayed with changed parameters',
-        'LINK_ALREADY_LINKED',
-      )
     }
     const digest = requestDigest(input.request, input.policy)
     const now = this.clock()
@@ -575,6 +644,7 @@ export class SessionLinkTaskService extends Service {
         ...(result.message === undefined ? {} : { message: result.message }),
       })),
       openedAt: now,
+      ...(input.selectedCandidateIndex === undefined ? {} : { selectedCandidateIndex: input.selectedCandidateIndex }),
     }
     const precheck = input.precheckFailure
     const outbox: SessionLinkTaskOutboxEvent[] = []
@@ -606,6 +676,8 @@ export class SessionLinkTaskService extends Service {
             : input.request.spawn?.title === undefined ? {} : { title: input.request.spawn.title }),
           ...(input.request.text === '' ? {} : { textExcerpt: input.request.text.slice(0, 160) }),
         },
+        // R09: the full payload is durable on the intent row from creation.
+        payloadText: input.request.text,
       },
       tracked: input.tracked,
       policy: clonePolicy(input.policy),
@@ -632,8 +704,20 @@ export class SessionLinkTaskService extends Service {
       updatedAt: now,
     }
     try {
-      await this.tasks.put(taskId, row as SessionLinkTaskRecordData)
+      /* R15: the first-create is ATOMIC against concurrent same-taskId first
+       * saves. `put` is a blind insert-or-overwrite — two racing first
+       * creates (the fast-path read above missed both) would last-writer-wins
+       * silently. The domain table's atomic read-modify-write chain cannot
+       * create a missing key, so the write happens as a SAME-CHAIN queued put
+       * whose slot check re-reads the authoritative state AT ITS TURN, not at
+       * call time: `chainedInsert` throws the exist-before sentinel when a
+       * row landed first, and that error maps to adopt-or-conflict — never
+       * an overwrite. */
+      await this.atomicInsert(taskId, row as SessionLinkTaskRecordData)
     } catch (error: unknown) {
+      if (error instanceof TaskRowExistsError) {
+        return { taskId, row: this.adoptOrConflict(taskId, error.stored, input) }
+      }
       // Write-ahead failure: NO intent is durable and nothing may proceed —
       // the task-table write failing must never dispatch any model.
       throw new SessionLinkTaskError(
@@ -642,6 +726,64 @@ export class SessionLinkTaskService extends Service {
       )
     }
     return { taskId, row }
+  }
+
+  /**
+   * The digest-driven replay rule for an EXISTING row: identical parameters
+   * adopt the stored row verbatim; ANY difference refuses with the
+   * resolve_task conflict — a replay never retargets, never rewrites policy,
+   * and never silently overwrites. R16 migration: a row written before the
+   * full-body digest carries the legacy (bounded-slice) digest; its genuine
+   * replays recompute THAT same legacy digest and adopt, while the conflict
+   * frontier moved to the (still correct, only coarser) legacy comparison —
+   * new rows hash the full body.
+   */
+  private adoptOrConflict(
+    taskId: SessionLinkTaskId,
+    existing: SessionLinkTaskRecordData,
+    input: CreateTaskIntentInput,
+  ): SessionLinkTaskRecordData {
+    const digest = requestDigest(input.request, input.policy)
+    if (digest === existing.originalRequest.digest) return existing
+    if (legacyRequestDigest(input.request, input.policy) === existing.originalRequest.digest) return existing
+    throw new SessionLinkError(
+      `task "${taskId}" already exists with different parameters; use session_resolve_task — `
+      + 'the original call must not be replayed with changed parameters',
+      'LINK_ALREADY_LINKED',
+    )
+  }
+
+  /**
+   * Insert-if-absent on the task table: the existence decision happens at a
+   * serialized point every competing first-create observes. A storage layer
+   * exposing {@link KvTable.insertIfAbsent} decides AT the domain write
+   * chain's queue slot; an older one (no native primitive) falls back to
+   * this service's own single-flight insert chain: every fallback job runs
+   * strictly after the previous one's domain write settled, at which point
+   * the authoritative in-memory table reflects it, and the check never
+   * trusts a caller-time read. Either way a row that landed ahead throws
+   * {@link TaskRowExistsError} — NEVER a silent overwrite.
+   */
+  private insertChain: Promise<unknown> = Promise.resolve()
+
+  private async atomicInsert(taskId: SessionLinkTaskId, row: SessionLinkTaskRecordData): Promise<void> {
+    const table = this.tasks as KvTable<SessionLinkTaskId, SessionLinkTaskRecordData> & {
+      insertIfAbsent?: (key: SessionLinkTaskId, value: SessionLinkTaskRecordData) => Promise<{ existing: boolean }>
+    }
+    if (typeof table.insertIfAbsent === 'function') {
+      const outcome = await table.insertIfAbsent(taskId, row)
+      if (outcome.existing) throw new TaskRowExistsError(this.tasks.get(taskId) ?? row)
+      return
+    }
+    const run = this.insertChain.then(async () => {
+      const existing = this.tasks.get(taskId)
+      if (existing !== undefined) throw new TaskRowExistsError(existing)
+      await this.tasks.put(taskId, row)
+    })
+    // The chain never jams on one insert's failure: later inserts run after
+    // the rejecting job SETTLED (its own caller still receives the throw).
+    this.insertChain = run.then(() => undefined, () => undefined)
+    await run
   }
 
   /* ----------------------------------------------------------------------
@@ -853,6 +995,51 @@ export class SessionLinkTaskService extends Service {
         updatedAt: now,
       }
     })
+  }
+
+  /* ----------------------------------------------------------------------
+   * R11: missing-delivery herald
+   * -------------------------------------------------------------------- */
+
+  /**
+   * Herald a half-written delivery the caller's own replay RECOGNIZED as
+   * missing (R11): a bound-or-bound-again identity the mailbox does NOT
+   * contain marks the task durably (`missingDelivery: messageId` as the
+   * reason) so the resolve path — and any operator reading the row — sees
+   * the repair need instead of a phantom `queued` admission. The state
+   * itself is NOT moved (the caller decides retry/cancel with full facts);
+   * reconcile independently classifies the same gap from the links probe.
+   * Idempotent: an already-heralded task absorbs the marker without a write.
+   */
+  async markDeliveryMissing(
+    taskId: SessionLinkTaskId,
+    messageId: SessionLinkMessageId,
+  ): Promise<SessionLinkTaskRecordData | undefined> {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const live = this.tasks.get(taskId)
+      if (live === undefined) return undefined
+      if (['turn_finished', 'cancelled', 'failed', 'running'].includes(live.taskState)) return live
+      if (live.reason === `missingDelivery:${messageId}`) return live
+      try {
+        return await this.requestStateChange(taskId, live.revision, {
+          toState: 'waiting_decision',
+          executionState: 'not_started',
+          reason: `missingDelivery:${messageId}`,
+          events: [{
+            kind: 'model_unavailable',
+            executionState: 'not_started',
+            reason: 'repair_delivery_missing',
+            requestedModel: defaultRequestedRoute(live.policy),
+            decisionRequired: true,
+            resumable: true,
+          }],
+        })
+      } catch (error: unknown) {
+        if (error instanceof SessionLinkTaskError && error.code === TASK_STALE_REVISION) continue
+        return live
+      }
+    }
+    return this.tasks.get(taskId)
   }
 
   /* ----------------------------------------------------------------------
@@ -1106,6 +1293,10 @@ export class SessionLinkTaskService extends Service {
   ): Promise<{ row: SessionLinkTaskRecordData; decision: SessionLinkTaskDecisionRecord; outcome: 'applied' }> {
     const taskId = input.taskId
     const now = this.clock()
+    /** The canonical identity (never caller-supplied raw strings) for hooks. */
+    let resolvedTaskId: SessionLinkTaskId = taskId
+    /** R08(1): the previous attempt's delivery identity, captured pre-clear. */
+    const legacyMessageId = input.action === 'retry' ? row.execution.messageId : undefined
 
     // Validate against the current authoritative row BEFORE building the write.
     if (input.action === 'cancel') {
@@ -1173,6 +1364,9 @@ export class SessionLinkTaskService extends Service {
       }
       attempts = [...row.attempts, newAttempt]
       currentAttemptId = newAttempt.attemptId
+      /* A new attempt's precheck re-selects honestly (the retry admission
+       * runs the full rule again); never inherit attempt 1's fixed index —
+       * the catalog snapshot that produced it is not this attempt's. */
       events.push({
         kind: input.action === 'retry' ? 'model_unavailable' : 'interrupted',
         reason: input.action === 'retry' ? 'retry_decision_applied' : 'continue_decision_applied',
@@ -1198,11 +1392,13 @@ export class SessionLinkTaskService extends Service {
       const change: TaskChange = { toState, events: [] }
       const base = applyChange(current, taskId, change, builtEvents, nextRevision, now)
       if (input.action === 'cancel') {
+        resolvedTaskId = taskIdFor(current.callerId, current.callId)
         return { ...base, decisions: [...current.decisions, decision] }
       }
       // retry/continue: clear the execution binding for the new attempt; the
       // ORIGINAL spawn callKey/send admission replays and attaches a fresh
       // binding (notificationRoot survives — the chain never resets).
+      resolvedTaskId = taskIdFor(current.callerId, current.callId)
       return {
         ...base,
         attempts,
@@ -1212,6 +1408,19 @@ export class SessionLinkTaskService extends Service {
         decisions: [...current.decisions, decision],
       }
     })
+    /* Post-commit side facts, best-effort and strictly AFTER the durable
+     * decision: R03's cancel revocation (mailbox pending → cancelled + host
+     * intent cancel) and R08(1)'s legacy-delivery marker ride the injected
+     * wire-layer hooks; a hook failure can never un-commit the decision,
+     * and the activation gates read the terminal row independently. The
+     * cancel hook receives the PRE-decision snapshot — the applied row no
+     * longer names the delivery it must revoke. */
+    if (input.action === 'cancel' && this.revokeDelivery !== undefined) {
+      try { this.revokeDelivery(resolvedTaskId, row) } catch { /* gates are the authority */ }
+    }
+    if (input.action === 'retry' && legacyMessageId !== undefined && this.markLegacyDelivery !== undefined) {
+      try { this.markLegacyDelivery(legacyMessageId, resolvedTaskId) } catch { /* marker is advisory */ }
+    }
     return { row: updated, decision: built!, outcome: 'applied' }
   }
 
@@ -1340,12 +1549,20 @@ export class SessionLinkTaskService extends Service {
         needsBindingRepair.push(row)
         continue
       }
-      // Cross-domain consistency: the bound mailbox message must agree on the pair.
+      // Cross-domain consistency: the bound mailbox message must exist for a
+      // task that is not yet terminal-in-execution (R11), AND must agree on
+      // the pair. An ABSENT message while the task projects any interest in
+      // the delivery (claimable/admitted states) is a half-written binding;
+      // repair it honestly instead of reporting a phantom `queued`.
       if (this.probe !== undefined) {
         const message = this.probe.message(row.execution.messageId!)
         if (message !== undefined
           && (message.senderId !== row.callerId
             || (row.targetSessionId !== undefined && message.targetId !== row.targetSessionId))) {
+          needsBindingRepair.push(row)
+          continue
+        }
+        if (message === undefined && ['queued', 'running'].includes(row.taskState)) {
           needsBindingRepair.push(row)
           continue
         }
@@ -1390,6 +1607,12 @@ export class SessionLinkTaskService extends Service {
       if (current === undefined) return false
       if (current.outbox.some(isRepairNoticePending)) return false
       if (current.taskState === 'waiting_decision') return false
+      /* R11: distinguish the missing-DELIVERY repair (the row binds a
+       * messageId the mailbox does not contain) from the missing-BINDING
+       * repair; the reasons stay separate so the caller can tell a phantom
+       * delivery from a host-side half-write. */
+      const deliveryMissing = row.execution.messageId !== undefined && row.execution.turnIntentId !== undefined
+      const reasonCode = deliveryMissing ? 'repair_delivery_missing' : 'repair_binding_missing'
       try {
         const updated = await this.update(taskId, current.revision, mutating => {
           if (mutating.outbox.some(isRepairNoticePending)) return mutating
@@ -1398,7 +1621,7 @@ export class SessionLinkTaskService extends Service {
           const event = this.buildEvent(taskId, nextRevision, {
             kind: 'model_unavailable',
             executionState: 'not_started',
-            reason: 'repair_binding_missing',
+            reason: reasonCode,
             requestedModel: defaultRequestedRoute(mutating.policy),
             attempts: 0,
             decisionRequired: true,
@@ -1408,14 +1631,15 @@ export class SessionLinkTaskService extends Service {
             ...mutating,
             taskState: 'waiting_decision',
             executionState: 'not_started',
-            reason: 'repair_binding_missing',
+            reason: reasonCode,
             outbox: [...mutating.outbox, event],
             revision: nextRevision,
             updatedAt: this.clock(),
           }
         })
         return updated.revision !== current.revision && updated.outbox.some(event =>
-          event.reason === 'repair_binding_missing' && event.revision === updated.revision)
+          (event.reason === 'repair_binding_missing' || event.reason === 'repair_delivery_missing')
+          && event.revision === updated.revision)
       } catch (error: unknown) {
         if (error instanceof SessionLinkTaskError && error.code === TASK_STALE_REVISION) continue
         // A durability failure on THIS row skips it; the next reconcile pass
@@ -1453,7 +1677,8 @@ export class SessionLinkTaskService extends Service {
 
 /** Whether a repair notification intent is still owed delivery for one task row. */
 function isRepairNoticePending(event: SessionLinkTaskOutboxEvent): boolean {
-  return event.reason === 'repair_binding_missing' && (event.status === 'pending' || event.status === 'admitted')
+  return (event.reason === 'repair_binding_missing' || event.reason === 'repair_delivery_missing')
+    && (event.status === 'pending' || event.status === 'admitted')
 }
 
 /** Clone the candidate snapshot so a stored attempt never shares mutable structure with caller input. */

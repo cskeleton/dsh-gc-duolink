@@ -840,6 +840,32 @@ export class SessionLinkService extends TypertRemoteService {
   }
 
   /**
+   * R08(1) (MODEL_ROUTING_FIX_PLAN Task 3): adopt an ALREADY-CONSUMED tracked
+   * delivery's next-attempt identity. The SOLE effect is renaming the stored
+   * record's idempotency key `<callKey> → <callKey>/consumed` so the wire
+   * layer's replay of the ORIGINAL call key never re-admits this delivery as
+   * the new attempt's own. Status, target, and delivery facts stay exactly
+   * what the mailbox already recorded — a consumed (delivered) message stays
+   * delivered; the consumed namespace prevents phantom `queued` projections
+   * without letting any new identity silently disappear either.
+   *
+   * Best-effort caller contract: the caller invokes this only for messages
+   * that are NOT pending (delivered/cancelled terminal realms); a pending
+   * record is left untouched (its honest cancellation is the R03 path).
+   * @param messageId - the stored delivery the new attempt supersedes.
+   * @param aliasKey - the consumed-namespace key (`<callKey>/consumed`).
+   */
+  async markRetried(messageId: SessionLinkMessageId, aliasKey: string): Promise<void> {
+    await this.chain(async () => {
+      const record = this.messages.get(messageId)
+      if (record === undefined) return
+      if (record.status === 'pending') return
+      if (record.idempotencyKey === aliasKey) return
+      await this.messages.put(messageId, { ...record, idempotencyKey: aliasKey })
+    })
+  }
+
+  /**
    * Deliver every pending message addressed to one Session if its Agent is
    * live, in admission order. Call after any operation that may have resumed
    * the target — including the endpoint's own prompt run — so queued peer

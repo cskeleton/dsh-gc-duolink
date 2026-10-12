@@ -689,8 +689,46 @@ async function activate(
   }
   const attempt = fresh.attempts.find(candidate => candidate.attemptId === fresh.currentAttemptId)
   const candidates: readonly ModelRouteCandidate[] = attempt?.candidates ?? fresh.policy.candidates
-  const concrete = candidates.find((candidate): candidate is ModelRouteSelection => !('use' in candidate))
-  const currentRoute: ModelRouteSelection = concrete ?? { provider: 'session', model: 'session_default' }
+  /* R10 (MODEL_ROUTING_FIX_PLAN Task 3): the sync precheck fixed its SELECTED
+   * candidate onto the attempt row (selectedCandidateIndex). Activation
+   * starts the walk at THAT index and re-validates the fixed candidate
+   * against the durable host intent's route (the binding truth — its
+   * selection IS the precheck's choice when the admission request truly
+   * selected a concrete route); a fixed concrete route whose own candidate
+   * disappeared from the row falls to the next candidate honestly rather
+   * than silently re-deriving `candidates[0]` (the pre-fix behavior the
+   * R10 review probe caught executing the rejected primary). A pre-R10 row
+   * (absent index) keeps its pre-fix search from the first concrete route.
+   * The host intent's recorded route is the authorized SELECTION for this
+   * delivery — when it names a concrete entry the walk aligns its index to
+   * it so `currentRoute` is the precheck's selection, not candidates[0]. */
+  let candidateIndex = 0
+  let currentRoute: ModelRouteSelection
+  if (attempt?.selectedCandidateIndex !== undefined) {
+    candidateIndex = Math.min(attempt.selectedCandidateIndex, candidates.length - 1)
+    const fixed = candidates[candidateIndex]
+    if (fixed !== undefined && !('use' in fixed)) {
+      currentRoute = { provider: fixed.provider, model: fixed.model, ...(fixed.reasoningEffort === undefined ? {} : { reasoningEffort: fixed.reasoningEffort }) }
+    } else {
+      /* The fixed position is a default sentinel: the same unified-snapshot
+       * chain the fallback switch resolves through reads the displaced
+       * baseline; a R13 first-turn default resolves from that snapshot (the
+       * host intent's recorded route selection authoritative FIRST). */
+      const intentRoute = host.getTurnIntent(intentId)?.route.selection
+      currentRoute = intentRoute === undefined
+        ? { provider: 'session', model: 'session_default' }
+        : { provider: intentRoute.provider, model: intentRoute.model, ...(intentRoute.reasoningEffort === undefined ? {} : { reasoningEffort: intentRoute.reasoningEffort }) }
+    }
+  } else {
+    const intentRoute = host.getTurnIntent(intentId)?.route.selection
+    const concrete = candidates.find((candidate): candidate is ModelRouteSelection => !('use' in candidate))
+    if (intentRoute !== undefined && concrete !== undefined) {
+      const aligned = candidates.findIndex(candidate => !('use' in candidate)
+        && candidate.provider === intentRoute.provider && candidate.model === intentRoute.model)
+      if (aligned !== -1) candidateIndex = aligned
+    }
+    currentRoute = intentRoute ?? concrete ?? { provider: 'session', model: 'session_default' }
+  }
   // Snapshot the effective baseline BEFORE the frozen header displaces it:
   // the fallback resolver (`session_default`) reads this snapshot, never the
   // fold's lastUsed mid-run. Baseline ownership and its post-close restore
@@ -714,7 +752,7 @@ async function activate(
     attemptId: fresh.currentAttemptId,
     policy: fresh.policy,
     candidates,
-    candidateIndex: 0,
+    candidateIndex,
     currentRoute,
     intentId,
     lease,

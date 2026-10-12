@@ -99,6 +99,18 @@ export const taskAttemptSchema = z.strictObject({
   defaultFrozenRoute: taskModelRouteSchema.optional(),
   results: z.array(taskCandidateResultSchema),
   openedAt: z.string(),
+  /**
+   * R10 (MODEL_ROUTING_FIX_PLAN Task 3): the SYNC-PRECHECK's selected
+   * candidate INDEX within `candidates`, fixed onto the attempt the moment
+   * the admission precheck passes. Activation starts the candidate walk at
+   * THIS index (re-validating the fixed route against the catalog, honest
+   * fallthrough when it went stale) instead of unconditionally re-deriving
+   * from `candidates[0]` — which pre-fix silently executed the rejected
+   * primary every time the precheck had fallen to a later candidate.
+   * Absent on rows durably written before R10; activation of such a row
+   * falls back to the first concrete candidate (their pre-fix behavior).
+   */
+  selectedCandidateIndex: z.number().int().nonnegative().optional(),
 })
 
 /** The spawn intent for a spawn-created task; a send-created task omits it entirely. */
@@ -208,6 +220,16 @@ export const sessionLinkTaskSchema = z.object({
       messageId: messageId.optional(),
       textExcerpt: z.string().optional(),
     }),
+    /**
+     * R09 (MODEL_ROUTING_FIX_PLAN Task 3): the FULL original task text,
+     * durable on the task row. Pre-R09 rows carry only the bounded
+     * `textExcerpt` display slice; their true body lives in the bound
+     * mailbox message — the retry/admission recovery reads
+     * `payloadText ?? <bound message body>` and NEVER admits the excerpt as
+     * the payload again. Additive and backward-compatible: rows written
+     * before this field read it as absent.
+     */
+    payloadText: z.string().optional(),
   }),
   /** True when the caller supplied model-routing params on the original call. */
   tracked: z.boolean(),
