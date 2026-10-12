@@ -51,7 +51,7 @@ import {
   MODEL_NOT_FOUND,
 } from './model-policy.ts'
 import type { ModelRouteCandidate, ModelRouteSelection, ModelRoutingPolicy } from './model-policy.ts'
-import { resolveTaskHost } from './host-capability.ts'
+import { parkManagedInputLazy, resolveTaskHost } from './host-capability.ts'
 import type {
   HostModelSelection,
   HostTaskHostCapability,
@@ -101,9 +101,10 @@ interface ActiveClaim {
   /** Turn this claim owns on the target Agent. */
   readonly turn: number
   closed: boolean
-  /** Baseline displaced by this claim's frozen header; restored onto the next
-   * no-claim request so the temporary route NEVER becomes the de-facto
-   * session baseline. */
+  /** Pre-freeze effective baseline snapshot: the fallback resolver reads this
+   * so the frozen task route parked in the fold can never misinform
+   * `session_default` mid-run. Pure read snapshot; the durable baseline
+   * ownership itself is fully the host's after Task 2. */
   displacedBaseline?: ModelRouteSelection | null
   /** The replayable identity the host record binds to (session-link message id). */
   readonly messageId: SessionLinkMessageId
@@ -118,25 +119,12 @@ interface AgentRuntime {
    * claimed event precedes the durable binding (brief 4d ordering), so the
    * first `agent/request` for that turn gates just-in-time. */
   claimedPending?: Map<number, SessionLinkMessageId>
-  /** Baseline displaced by a just-closed (non-persisted) task turn; restored
-   * onto the next no-claim request so a temporary route NEVER becomes the
-   * de-facto session baseline. */
-  displacedBaseline?: ModelRouteSelection | null
   /**
-   * F2: the turn number the current (or most recent) route freeze owned.
-   * The baseline restore reads it: requests of turns started AFTER the
-   * freeze began (follow-ups queued through the frozen turn) are not
-   * pre-existing no-claim work and must not drain the parked baseline.
-   */
-  freezeTurn?: number
-  /**
-   * IMPORTANT-2: a turn the pre-step gate REFUSED to activate (mixed
-   * batch). The host capability already bound its own per-turn lease when
-   * the tracked message claimed (the admission pre-claim), so its request /
-   * prompt waterfalls would still freeze this turn's HUMAN steps onto the
-   * task route. The runtime — registered BEFORE the capability and thus
-   * outermost in every waterfall — restores the session baseline on this
-   * turn's requests and prompt, strictly for the one refused turn.
+   * IMPORTANT-2 (final review): a turn the pre-step gate REFUSED to activate
+   * (mixed batch). Under the unified host owner, the original-owner yield is
+   * durable-fact-driven (a finished/cancelled claim never yields), so the
+   * human steps of this turn CANNOT inherit the task route; this marker now
+   * only records the refusal for observability, never to own a restore.
    */
   mixedDeniedTurn?: number
   /** Seeded provider/model the Agent declared at creation, used as the baseline
@@ -260,13 +248,13 @@ export function installTaskRuntime(
     schedulePump: pumpNow,
   }
   /**
-   * The capability MUST be resolvable at mount on a capable host. The tool
-   * layer's lazy factory installs it at admission time before any turn bound
-   * to it can claim; a host that never fabricates/claims stays gated OFF so
-   * legacy untracked Agents keep zero per-agent listeners. Every later
-   * resolution path (`hostRecordFor`, claim, commit, fallback) reads through
-   * this accessor so a later-installed capability still wires before it is
-   * first used.
+   * The capability MUST be resolvable at mount on a capable host. The host
+   * installs it on every controller-created/resumed Agent (Task 2 unified
+   * ownership); the plugin's lazy factory only arms Agents the controller
+   * never adopted (legacy/plugin-adopted path). Both paths publish the SAME
+   * cordis-visible instance, so route ownership never splits. A host without
+   * the factory yields undefined and the message stays unmanaged (legacy
+   * honesty).
    */
   const cap = (): HostTaskHostCapability | undefined => options.host ?? resolveTaskHost(agent.ctx)
   /**
@@ -283,12 +271,14 @@ export function installTaskRuntime(
   }
 
   /* ------------------------------------------------------------------
-   * Runtime-owned request + prompt freeze. The host capability freezes the
-   * claimed route once per claim; fallback switches re-claim a NEW intent and
-   * this waterfall (registered after the host's listeners — cordis append
-   * order) redirects the CURRENT active claim's route after `next()`
-   * resolved, so the loop's same-step retry picks the fresh candidate.
-   * Claim-gated: human turns and unmanaged messages are never rewritten.
+   * JIT activation listener (request-time, activation ONLY): the first
+   * request of a turn that claimed session-link mail activates against the
+   * durable binding. The runtime NEVER rewrites `agent/request` output or
+   * `system-prompt/assemble` output — route ownership is the HOST's unified
+   * task-host freeze, so two waterfalls can no longer compete over one turn
+   * (R02). F2/IMPORTANT-2 mixed-batch honesty and the displaced-baseline
+   * restore moved into the host capability, which is mounted for every
+   * controller-created and plugin-adopted Agent.
    * ---------------------------------------------------------------- */
   ctx.on('agent/request', async (payload, next) => {
     // Just-in-time activation: the first request of a turn that claimed
@@ -318,94 +308,9 @@ export function installTaskRuntime(
         }
       }
     }
-    const resolved = await next()
-    const active = runtime.active
-    /* IMPORTANT-2: the pre-step gate refused to activate this turn (mixed
-     * batch), but the host capability's own claim-bound lease froze the
-     * turn's route at claim time. The runtime is the OUTERMOST waterfall on
-     * this context (mounted before the lazily created capability), so it
-     * restores the session baseline on the refused turn's requests —
-     * strictly human steps; the task's own solo turn is not denied. */
-    if (runtime.mixedDeniedTurn === payload.turn
-      && (active === undefined || active.closed || active.turn !== payload.turn)) {
-      const host = cap()
-      const seeded = runtime.seededOptions
-      const baseline = host?.readBaseline().effective ?? (
-        seeded !== undefined && seeded.provider !== undefined && seeded.model !== undefined
-          ? { provider: seeded.provider, model: seeded.model, ...(seeded.reasoningEffort === undefined ? {} : { reasoningEffort: seeded.reasoningEffort }) }
-          : null
-      )
-      if (baseline !== null
-        && (resolved.provider !== baseline.provider || resolved.model !== baseline.model)) {
-        const { reasoningEffort: _dropped, ...rest } = resolved
-        return {
-          ...rest,
-          provider: baseline.provider,
-          model: baseline.model,
-          ...(baseline.reasoningEffort === undefined ? {} : { reasoningEffort: baseline.reasoningEffort }),
-        } as typeof resolved
-      }
-      return resolved
-    }
-    if (active !== undefined && !active.closed && payload.turn === active.turn) {
-      const { reasoningEffort: _dropped, ...rest } = resolved
-      return {
-        ...rest,
-        provider: active.currentRoute.provider,
-        model: active.currentRoute.model,
-        ...(active.currentRoute.reasoningEffort === undefined ? {} : { reasoningEffort: active.currentRoute.reasoningEffort }),
-      } as typeof resolved
-    }
-    // No-claim request: restore a baseline displaced by a just-closed
-    // non-persisted task turn so its temporary route NEVER becomes the
-    // de-facto session baseline. F2: the restore gates on the request's
-    // turn EXISTING BEFORE the freeze — a turn started while the frozen
-    // turn ran (follow-ups queued through it) is NOT a pre-existing
-    // no-claim turn and must not drain the parked baseline.
-    if (runtime.displacedBaseline !== undefined) {
-      const gatedAt = runtime.freezeTurn
-      if (gatedAt !== undefined && payload.turn > gatedAt) return resolved
-      const displaced = runtime.displacedBaseline
-      runtime.displacedBaseline = undefined
-      if (displaced !== null
-        && (resolved.provider !== displaced.provider || resolved.model !== displaced.model)) {
-        const { reasoningEffort: _dropped, ...rest } = resolved
-        return {
-          ...rest,
-          provider: displaced.provider,
-          model: displaced.model,
-          ...(displaced.reasoningEffort === undefined ? {} : { reasoningEffort: displaced.reasoningEffort }),
-        } as typeof resolved
-      }
-    }
-    return resolved
+    return await next()
   })
 
-  /* ------------------------------------------------------------------
-   * IMPORTANT-2 prompt mirror: the host capability's prompt waterfall freezes
-   * the provider/model template variables onto its claim-bound lease route;
-   * on a DENIED mixed turn the visible prompt must match the restored
-   * baseline header (the runtime's own request waterfall above). Registered
-   * before the capability exists, so this rewrite is outermost. */
-  ctx.on('system-prompt/assemble', async (_assembly, _context, next) => {
-    const assembled = await next()
-    if (runtime.mixedDeniedTurn === undefined) return assembled
-    const active = runtime.active
-    if (active !== undefined && !active.closed) return assembled
-    const host = cap()
-    const seeded = runtime.seededOptions
-    const baseline = host?.readBaseline().effective ?? (
-      seeded !== undefined && seeded.provider !== undefined && seeded.model !== undefined
-        ? { provider: seeded.provider, model: seeded.model }
-        : null
-    )
-    if (baseline === null) return assembled
-    if (assembled.variables.provider === baseline.provider && assembled.variables.model === baseline.model) return assembled
-    return {
-      ...assembled,
-      variables: { ...assembled.variables, provider: baseline.provider, model: baseline.model },
-    }
-  })
 
   /* ------------------------------------------------------------------
    * Claimed-message gate: the delivered session-link message just entered a
@@ -434,10 +339,19 @@ export function installTaskRuntime(
       return
     }
     const record = hostRecordFor(payload.message as { source?: unknown }, host)
-    const messageId = record === undefined
+    const rawMessageId = record === undefined
       ? messageIdOf(payload.message as { source?: unknown })
       : record.messageId as unknown as SessionLinkMessageId
-    if (messageId === undefined) return
+    if (rawMessageId === undefined) return
+    /* IMPORTANT-2 re-activation: a CANCELLED record (the mixed refusal withdrew
+     * the pre-claim's intent to unfreeze its human batch) is not a routing
+     * denial — the durable task row behind it stays `queued`. Park the turn so
+     * the PRE-STEP gate re-records the intent and activates the SOLO turn;
+     * everything else about the claim lifecycle is unchanged. A record in any
+     * other status parks exactly as before. */
+    const messageId = (record?.status === 'cancelled'
+      ? messageIdOf(payload.message as { source?: unknown }) ?? rawMessageId
+      : rawMessageId) as SessionLinkMessageId
 
     /* F2 (Task-5 review) + IMPORTANT-2 (final review): the PRE-STEP gate
      * below is the ONLY control point that may activate a claimed delivery —
@@ -485,17 +399,67 @@ export function installTaskRuntime(
     if (host === undefined) return await next()
     const tracked: { message: UserMessage; record: NonNullable<ReturnType<typeof hostRecordFor>> }[] = []
     for (const message of payload.messages) {
-      const record = hostRecordFor(message as { source?: unknown }, host)
+      let record = hostRecordFor(message as { source?: unknown }, host)
+      const mid = messageIdOf(message as { source?: unknown })
+      if (mid === undefined) continue
+      /* Mixed-refusal re-activation (IMPORTANT-2): the refusal cancelled the
+       * pre-claim's intent so its human batch could unfreeze; the task row
+       * still names the cancelled intent. Re-record a fresh intent against
+       * the same row's policy, atomically rebind the row onto it, and re-park
+       * the turn so the SOLO activation below claims the fresh intent — the
+       * re-activated task never reuses a cancelled durable fact. */
+      if (record !== undefined && record.status === 'cancelled') {
+        const row = findRowByBinding(resolveTasks(), mid, record.intentId)
+        if (row === undefined || !['queued', 'preparing'].includes(row.taskState)) continue
+        const attempt = row.attempts.find(candidate => candidate.attemptId === row.currentAttemptId)
+        const candidates = attempt?.candidates ?? row.policy.candidates
+        const concrete = candidates.find((candidate): candidate is ModelRouteSelection => !('use' in candidate))
+        const route: HostTaskRoute = concrete === undefined
+          ? {}
+          : { selection: { provider: concrete.provider, model: concrete.model, ...(concrete.reasoningEffort === undefined ? {} : { reasoningEffort: concrete.reasoningEffort }) } }
+        const fresh = host.recordTurnIntent({
+          taskId: taskIdOf(row),
+          attemptId: row.currentAttemptId,
+          messageId: mid as never,
+          route,
+          persistOnSuccess: row.policy.scope === 'session',
+        })
+        try {
+          await resolveTasks().rebindTurnIntent(taskIdOf(row), row.revision, { from: record.intentId, to: fresh.intentId })
+        } catch { /* a concurrent rebind won; read whoever the row now names */ }
+        record = host.getTurnIntent(fresh.intentId) ?? record
+      }
       if (record === undefined || (record.status !== 'claimed' && record.status !== 'started')) continue
       const messageId = record.messageId as unknown as SessionLinkMessageId
-      if (![...pending.values()].includes(messageId)) continue
+      if (![...pending.values()].includes(messageId)) {
+        /* A cancelled-record re-activation earns the turn's park slot
+         * honestly even when the claimed gate saw the earlier cancelled
+         * record and parked nothing. */
+        if (record.status === 'claimed') pending.set(payload.turn, messageId)
+        else continue
+      }
       tracked.push({ message, record })
     }
     if (tracked.length === 0) return await next()
     if (payload.messages.length > tracked.length) {
-      // Mixed batch: re-append the tracked messages behind everything this
-      // batch carries, and let the remainder claim this step on baseline.
-      for (const { message } of tracked) agent.inbox.append('next-turn', message)
+      /* Mixed batch refusal (F2 + IMPORTANT-2): re-append the tracked
+       * messages behind everything this batch carries AND settle the parked
+       * live claim the admission layer pre-claimed for each. A merely re-
+       * queued message leaves its claim `started` on THIS turn, so the host's
+       * durable yield keeps rewriting the batch's HUMAN steps onto the task
+       * route — the exact freeze the refusal exists to prevent. The host owns
+       * the transition end-to-end (`parkManagedInput`): re-queue the managed
+       * input AND cancel the still-unstarted claim, closing the yield window;
+       * the intent re-records when its SOLO later turn activates (admission
+       * already treats re-send of a finished/cancelled message as a new
+       * intent), and the task row stays honestly `queued` until then. */
+      for (const { message } of tracked) {
+        const parked = await parkManagedInputLazy(agent as never, message as never)
+        if (!parked) agent.inbox.append('next-turn', message)
+      }
+      /* IMPORTANT-2 wake fix: the re-queue is host-owned (`parkManagedInput`)
+       * and its wake travels through the host's own re-delivery send path;
+       * the plugin never wakes manual inboxes. */
       /* IMPORTANT-2 (final review): the re-appended messages leave THIS
        * turn's batch, so they must leave THIS turn's parked claims too —
        * otherwise the human step's first agent/request of the same turn
@@ -508,8 +472,8 @@ export function installTaskRuntime(
           if (parked === dropped) pending.delete(turn)
         }
       }
-      // IMPORTANT-2: counter the host capability's own per-turn freeze this
-      // claim already bound (admission pre-claim): this turn stays human-owned.
+      // IMPORTANT-2: marker only — the durable yield no longer yields this
+      // turn (the parked claim just cancelled), so no restore owner is needed.
       runtime.mixedDeniedTurn = payload.turn
       const rest = payload.messages.filter(message => !tracked.some(entry => entry.message === message))
       const decision = await next()
@@ -613,6 +577,13 @@ export function installTaskRuntime(
     if (failure.code === undefined || !RETRYABLE_FAILURE_CODES.has(failure.code)) return await next()
     const host = cap()
     if (host === undefined) return await next()
+    /* R12: the host tracks output substance durably (any chunk observed, a
+     * committed assistant/message, or a dispatched tool). When any is true
+     * automatic fallback is BARRED — the user already saw partial output, so
+     * a silent route switch is no longer honest; the terminal projection
+     * surfaces partial/unknown. */
+    const verdict = host.evaluateRetry(active.intentId)
+    if (verdict.automaticFallbackAllowed === false) return await next()
     const switched = await switchCandidate(resolveTasks(), host, runtime, active)
     if (!switched) return await next()
     return { kind: 'retry' }
@@ -721,10 +692,12 @@ async function activate(
   const concrete = candidates.find((candidate): candidate is ModelRouteSelection => !('use' in candidate))
   const currentRoute: ModelRouteSelection = concrete ?? { provider: 'session', model: 'session_default' }
   // Snapshot the effective baseline BEFORE the frozen header displaces it:
-  // on close, a non-persisting task restores this onto the next no-claim
-  // request so its temporary route never becomes the de-facto baseline.
-  // The projection may read null while the Agent's own declared route stands
-  // (nothing explicitly selected yet): fall back to that seeded route.
+  // the fallback resolver (`session_default`) reads this snapshot, never the
+  // fold's lastUsed mid-run. Baseline ownership and its post-close restore
+  // belong fully to the host; this snapshot reads only this claim's fallback
+  // decision. The projection may read null while the Agent's own declared
+  // route stands (nothing explicitly selected yet): fall back to the seeded
+  // route.
   const baselineSnapshot = host.readBaseline().effective ?? (() => {
     const options = runtime.seededOptions
     const snap = options?.provider !== undefined && options.model !== undefined
@@ -759,9 +732,6 @@ async function activate(
   try {
     tasks.assertBindingDurable(taskId)
     await tasks.requestStateChange(taskId, fresh.revision, { toState: 'running', currentRoute })
-    // F2: the freeze owns this turn; later turns are not pre-existing
-    // no-claim work for the displaced-baseline restore.
-    runtime.freezeTurn = turn
   } catch (error: unknown) {
     runtime.active = undefined
     lease.release()
@@ -926,27 +896,44 @@ async function switchCandidate(
   }
 
   const previousIntentId = active.intentId
-  try {
-    await host.cancelTurnIntent(previousIntentId, 'route-availability switch')
-  } catch {
-    return false
-  }
   const hostRecordSource = host.getTurnIntent(previousIntentId)
   const messageId = hostRecordSource?.messageId ?? (active.messageId as never)
   const attempt = currentAttempt(tasks, active)
   const route = routeForHost(nextRoute, active.candidates, nextIndex, attempt)
-  const fresh = host.recordTurnIntent({
-    taskId: active.taskId,
-    attemptId: active.attemptId,
-    messageId,
-    route,
-    persistOnSuccess: active.policy.scope === 'session',
-  })
-  let lease: HostTurnLease
+  /* Unified-owner switch (R02/Task 2): the HOST owns the route swap end-to-end
+   * — it re-checks the durable output-substance flag barrier, journals the
+   * failure on the old intent, records + claims the fresh intent on the SAME
+   * messageId, and re-aims the live lease onto the fresh route under the same
+   * turn BEFORE returning. The plugin-side cancel→record→claim order the old
+   * code used produced a fresh intent whose live claim never bound to this
+   * turn's lease (only the agent/inbox/claimed listener can bind one, and it
+   * already fired for the original), so the retried same-step request fell
+   * back to the pre-task baseline instead of the new route. The plugin keeps
+   * ONLY the durable row rebind (below) after the host commits the fresh
+   * intent. */
+  let fresh: { intent: ReturnType<HostTaskHostCapability['getTurnIntent']> & object; intentId: string }
   try {
-    lease = await host.claimTurnIntent(fresh.intentId)
+    fresh = await host.switchRoute({
+      previousIntentId,
+      route,
+      persistOnSuccess: active.policy.scope === 'session',
+      ...(active.lastFailureCode === undefined ? {} : {
+        failure: { code: active.lastFailureCode, message: active.lastFailureMessage ?? '' } as never,
+      }),
+      taskId: active.taskId,
+      attemptId: active.attemptId,
+      messageId: messageId as never,
+    })
   } catch {
     return false
+  }
+  /* The lease the runtime hands onward. The host already bound the fresh
+   * intent to this turn's freeze; this lease wrapper only needs to RELEASE
+   * honestly at close (the host's own turnLease owns the revoke). */
+  const lease: HostTurnLease = {
+    intent: fresh.intent as never,
+    route: fresh.intent?.route.selection,
+    release: () => { /* owned by the host's turnLease; the close path finishes it */ },
   }
   /* IMPORTANT-4 (final review): the durable row must reference the LIVE
    * intent, not the cancelled one — a post-restart fold would otherwise

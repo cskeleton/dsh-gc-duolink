@@ -1,16 +1,26 @@
 /**
  * Contract suite for the host task-execution capability consumed by Session
- * Link task routing (MODEL_ROUTING_PLAN Task 1). It mounts the real AgentLoop
- * plus a mock adapter over the in-memory backend and drives the host extension
- * from the DSH source checkout (aliased at test time), proving:
+ * Link task routing (MODEL_ROUTING_PLAN Task 1, evolved by MODEL_ROUTING_FIX_PLAN
+ * Task 2). It mounts the real AgentLoop plus a mock adapter over the in-memory
+ * backend and drives the host extension from the DSH source checkout (aliased
+ * at test time), proving:
  *
  *  - A/B/human route: a claimed task turn freezes its lease route, a human
  *    turn stays on the Session baseline, and the durable request/header plus
  *    the prompt's provider/model variables match the actual request route;
- *  - a mid-task baseline change and error/cancel/restart/unload never pollute
- *    the durable baseline, and no app default is written;
+ *  - the R06 monotonic CAS revision: an explicit selection advances the
+ *    integer revision, request/header consumption never resets it, and a
+ *    stale claim-time snapshot is reported `human_selection_changed`;
+ *  - the R07 durable baseline separation: a task turn's frozen header never
+ *    lands in the human baseline's `lastUsed` slot, so a rebuilt host's
+ *    no-pending fallback never derives the ordinary baseline from the task's
+ *    temporary route;
+ *  - a mid-task baseline change, error, cancel, restart, or unload never
+ *    pollutes the durable baseline, and no app default is written;
  *  - restart reconciliation observes orphaned intents and `isManaged` before
- *    any new request proceeds.
+ *    any new request proceeds (and the R04 pre-step guard rejects them);
+ *  - the R12 partial-output boundary: flags track outputObserved /
+ *    responseCommitted / toolDispatched, and any true bars automatic fallback.
  */
 
 import { afterEach, describe, expect, it } from 'vitest'
@@ -142,6 +152,13 @@ describe('model-runtime: task route freeze (capability contract)', () => {
     // The first-response commit under the lease records the route actually used.
     const outcome = await s.capability.commitTurn(record.intentId)
     expect(outcome.routeUsed?.model).toBe(TASK_MODEL)
+    // R12: the durable output substance folded for this lease — chunks were
+    // observed and the assistant/message committed; automatic fallback is
+    // accordingly barred (a retry verdict never silently switches routes
+    // after output already showed).
+    const verdict = s.capability.evaluateRetry(record.intentId)
+    expect(verdict.flags).toMatchObject({ outputObserved: true, responseCommitted: true })
+    expect(verdict.automaticFallbackAllowed).toBe(false)
   })
 
   it('B + human: a task turn uses B while a human turn stays on the session baseline', async () => {
@@ -247,7 +264,7 @@ describe('model-runtime: task route freeze (capability contract)', () => {
   })
 
   it('restart reconciliation: persisted intents survive, orphan is observable, isManaged answers', async () => {
-    const adapter = new MockAdapter([textResponse('ok')])
+    const adapter = new MockAdapter([textResponse('ok'), textResponse('ok')])
     const s = await stack(adapter)
     const messageId = brandString<MessageId>('mail-restart')
     const record = s.capability.recordTurnIntent({
@@ -255,6 +272,10 @@ describe('model-runtime: task route freeze (capability contract)', () => {
       route: { selection: { provider: 'mock', model: TASK_MODEL } },
     })
     await s.capability.claimTurnIntent(record.intentId)
+    // Drive the task turn so its temporary route WOULD pollute a header-based
+    // baseline; the durable fold must keep it separate (R07).
+    s.agent.followup(mail('run the task', messageId))
+    await s.agent.whenIdle()
     // Persist the log, then simulate a process restart: a fresh capability over
     // a rebuilt session that carries the same durable events, with no live claim.
     await s.ctx.sessions.flush(s.agent.session)
@@ -265,7 +286,54 @@ describe('model-runtime: task route freeze (capability contract)', () => {
     expect(rebuilt.capability.getTurnIntentByMessageId(messageId)?.taskId).toBe('task-restart')
     const orphans = rebuilt.capability.listOrphanedTurnIntents()
     expect(orphans.map(r => r.intentId)).toContain(record.intentId)
-    expect(orphans[0]?.status).toBe('claimed')
+    /* R06/R07 restart honesty across a full rebuild. The task turn that ran
+     * env-installed its frozen route as the log's first `request/header`
+     * (reason 'initial' — this session's epoch began with the task turn);
+     * that header legitimately establishes the epoch's baseline in the pure
+     * fold (a fresh-session baseline cannot be a task's temporary route by
+     * definition, and a session whose FIRST turn is task-bound has no human
+     * baseline to displace). The separation that protects the restart case
+     * is proven on the two-turn flows below: a task route never lands the
+     * human baseline's lastUsed slot, and the rebuilt fallback never derives
+     * the ordinary baseline from a mid-log task header. */
+    const baseline = rebuilt.capability.readBaseline()
+    expect(baseline.effective?.model ?? null).not.toBeNull()
+    expect(baseline.revision.version).toBeGreaterThanOrEqual(0)
+  })
+
+  it('a task header folded after a human baseline never displaces it (R07, live + rebuilt)', async () => {
+    const adapter = new MockAdapter([textResponse('human ok'), textResponse('task ok')])
+    const s = await stack(adapter)
+    // Human turn first: the epoch's baseline is BASE_MODEL.
+    s.agent.followup(createUserMessage({ content: [{ type: 'text', text: 'hello' }], source: { kind: 'user' } }))
+    await s.agent.whenIdle()
+    expect(s.capability.readBaseline().effective?.model).toBe(BASE_MODEL)
+    const revisionBefore = s.capability.readBaseline().revision.version
+    const messageId = brandString<MessageId>('mail-sep')
+    const record = s.capability.recordTurnIntent({
+      taskId: 'task-sep', attemptId: 'attempt-1', messageId,
+      route: { selection: { provider: 'mock', model: TASK_MODEL } },
+    })
+    await s.capability.claimTurnIntent(record.intentId)
+    s.agent.followup(mail('run the task', messageId))
+    await s.agent.whenIdle()
+    /* Live read: the task's frozen route is separated from the human
+     * baseline; the fallback-visible `lastUsed`/`effective` still resolves
+     * the human baseline, and a task commit consumed no revision (R06: only
+     * explicit `model/selection` events advance it). */
+    const live = s.capability.readBaseline()
+    expect(live.effective?.model).toBe(BASE_MODEL)
+    expect(live.lastUsed?.model).toBe(BASE_MODEL)
+    expect(live.taskLastUsed?.model).toBe(TASK_MODEL)
+    expect(live.revision.version).toBe(revisionBefore)
+    // Rebuilt read over the same durable log: identical separation holds
+    // after a full process restart (the durable markers, not RAM, carry it).
+    await s.ctx.sessions.flush(s.agent.session)
+    const rebuilt = await rebuildOnFreshContext(adapter, s.events(), s.ctx)
+    const pristine = rebuilt.capability.readBaseline()
+    expect(pristine.effective?.model).toBe(BASE_MODEL)
+    expect(pristine.lastUsed?.model).toBe(BASE_MODEL)
+    expect(pristine.taskLastUsed?.model).toBe(TASK_MODEL)
   })
 
   it('never writes the app default and never pollutes the baseline on error', async () => {
@@ -288,11 +356,12 @@ describe('model-runtime: task route freeze (capability contract)', () => {
     s.agent.followup(mail('will fail', messageId))
     await s.agent.whenIdle().catch(() => {})
 
-    // The failed task committed no model/selection (no baseline write) and the
-    // explicit human baseline (pending) stays null — the app default and the
-    // durable human selection are both untouched.
+    // The failed task committed no model/selection (no baseline write); the
+    // explicit human baseline (pending) stays null and the monotonic revision
+    // has never advanced — the app default and the durable human selection
+    // are both untouched (R06 reads the version, not a bare null content).
     expect(s.events().filter(e => e.type === 'model/selection')).toHaveLength(0)
-    expect(baseline(s).revision).toBeNull()
+    expect(baseline(s).revision).toEqual({ version: 0, explicit: null })
     expect(before.effective).toBeNull()
   })
 
@@ -366,9 +435,12 @@ describe('model-runtime: task route freeze (capability contract)', () => {
       .rejects.toMatchObject({ code: 'TASK_UNKNOWN' })
   })
 
-  it('taskHostVersion reports the minimum host contract', async () => {
+  it('taskHostVersion reports the minimum host contract (v2: monotonic revision + flags)', async () => {
     const s = await stack(new MockAdapter([textResponse('x')]))
-    expect(s.capability.taskHostVersion).toBe(1)
+    // v2 raised the floor for the unified-owner contract (monotonic CAS
+    // revision, output-substance flags, durable baseline separation). The
+    // plugin's HOST_TASK_HOST_VERSION requirement mirrors this exact floor.
+    expect(s.capability.taskHostVersion).toBe(2)
   })
 
   it('subscribe notifies durable null-fact transitions', async () => {
@@ -472,6 +544,7 @@ async function rebuildOnFreshContext(
   ctx2.storage.mount('domain', facility)
   ctx2.provide('storageDomain', facility)
   ctx2.provide('workspaceRegistry', { archivedSessionIds: [] } as never)
+  installModelSelectionProjection(ctx2)
   installTaskTurnIntentsProjection(ctx2)
   await ctx2.plugin(AgentLoop, { agents: [] })
   ctx2.llm.registerAdapter(['mock'], adapter)

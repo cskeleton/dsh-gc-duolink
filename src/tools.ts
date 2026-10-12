@@ -565,16 +565,26 @@ export function apply(ctx: Context, config: Config = {}): void {
      * or the mount-time list above) with DURABLE managed work already naming
      * it is armed eagerly through the SAME single-flight lazy install the
      * admission path uses — concurrent arming joins one flight and never
-     * duplicates the capability's listeners. Agents with no durable binding
-     * stay unarmed until a tracked admission or the runtime's own claim
-     * backstop (pre-step `ensureHost`) arms them, so unrelated Agents keep a
-     * clean capability surface. */
+     * duplicates the capability's listeners. Task-2 addition: an Agent that
+     * shares a tracked link channel (an auto-wake grant names it, or a task
+     * row does) is armed equally — the host's managed-input guard and the
+     * claim freeze must exist BEFORE any managed mail can claim, so a
+     * cancelled/orphaned delivery can never execute as ordinary mail (R04).
+     * Agents with no durable binding and no channel stay unarmed until a
+     * tracked admission or the runtime's own claim backstop (pre-step
+     * `ensureHost`) arms them, so unrelated Agents keep a clean capability
+     * surface. */
     void (async () => {
       let needsArm = false
       try {
         needsArm = taskServiceOf(rootCtx).listRows().some(row =>
           row.targetSessionId === agent.id && row.execution.messageId !== undefined)
       } catch { /* a deployment without the task service never arms eagerly */ }
+      if (!needsArm) {
+        try {
+          needsArm = (rootCtx.sessionLinks.list(agent.id) as readonly unknown[]).length > 0
+        } catch { /* no link service; the admission time arming still applies */ }
+      }
       if (needsArm) await ensureTaskHostLazy(agent)
     })()
     installTaskRuntime(agent.ctx, agent, () => taskServiceOf(rootCtx), {

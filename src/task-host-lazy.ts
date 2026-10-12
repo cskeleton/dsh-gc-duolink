@@ -3,13 +3,16 @@
  * (`ctx.taskHost`) onto live Agents, shared by the admission layer and the
  * task runtime (MODEL_ROUTING_PLAN final review, IMPORTANT-1 + F-C1b).
  *
- * Two concurrent tracked admissions to the SAME live target previously both
- * ran the capability factory: duplicate route-freeze listeners landed on the
- * Agent context, and the loser's live claims became invisible to the winner.
- * Every creation now joins ONE in-flight Promise per Agent: the factory runs
- * at most once per unresolved capability, every caller receives the SAME
- * instance, and any exception releases the flight so a later caller retries
- * honestly. A host without the factory yields undefined.
+ * Under the post-Task-2 unified owner, the SESSION CONTROLLER itself mounts
+ * this capability (plus the durable managed-input guard) on every Agent it
+ * creates/resumes; this lazy path remains for plugin-adopted live Agents the
+ * controller never composed (tests, and legacy/headless hosts). Both paths
+ * publish the SAME context-visible instance: two concurrent tracked
+ * admissions to the SAME live target previously each ran the factory, so
+ * every creation now joins ONE in-flight Promise per Agent — the factory
+ * runs at most once per unresolved capability, every caller receives the
+ * SAME instance, and any exception releases the flight so a later caller
+ * retries honestly. A host without the factory yields undefined.
  * @module dsh-session-link/task-host-lazy
  */
 
@@ -33,7 +36,17 @@ async function createTaskHostLazy(
 ): Promise<HostTaskHostCapability | undefined> {
   const mod = await import('@deepseek-ai/dsh-api-session-controller') as Record<string, unknown>
   const factory = mod.createTaskHost as ((ctx: Context, agent: Agent) => HostTaskHostCapability) | undefined
-  return factory === undefined ? undefined : factory(ctx, agent)
+  if (factory === undefined) return undefined
+  const capability = factory(ctx, agent)
+  /* R04: the lazy path is for Agents the SESSION CONTROLLER never composed,
+   * so its own guard installation already ran. Plugin-adopted Agents get the
+   * same durable managed-input guard here, so an orphan/cancelled task mail
+   * can never execute as ordinary mail even on a controller-less host. The
+   * function is idempotent-safe (a second guard adds a second pre-step
+   * filter, not a competing owner). */
+  const guard = mod.installManagedInputGuard as ((agent: Agent) => () => void) | undefined
+  guard?.(agent)
+  return capability
 }
 
 /**
