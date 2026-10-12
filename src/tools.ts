@@ -152,17 +152,18 @@ function requireCaller(ctx: Context, exec: { agent?: Agent }): Agent {
   return agent
 }
 
-/** The durable task service, resolved through cordis' inject-gated accessor so a
- * stack without SessionLinkTaskService (e.g. legacy tool tests) yields undefined
- * instead of failing the whole tool mount. Tracked admission refuses honestly. */
+/** The durable task service, resolved through cordis' service registry —
+ * the SAME injection the production assembly publishes (the `dsh-session-link/tasks`
+ * sub-plugin service registers `sessionLinkTasks` into the shared store), but
+ * read WITHOUT a hard inject edge: this row must stay mounted on old hosts so
+ * the untracked tools keep working while tracked parameters refuse honestly.
+ * The removed test escape (`ctx.__sessionLinkTasks`) is never consulted. */
 function taskServiceOf(ctx: Context): Context['sessionLinkTasks'] {
-  try {
-    return ctx.sessionLinkTasks
-  } catch {
-    const escape = (ctx as unknown as { __sessionLinkTasks?: Context['sessionLinkTasks'] }).__sessionLinkTasks
-    if (escape !== undefined) return escape
+  const service = ctx.get('sessionLinkTasks') as Context['sessionLinkTasks'] | undefined
+  if (service === undefined) {
     throw new Error('HOST_CAPABILITY_UNAVAILABLE: the task service is not mounted on this deployment')
   }
+  return service
 }
 
 /** Human-facing label for one linked peer row. */

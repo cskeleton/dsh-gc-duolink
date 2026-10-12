@@ -38,10 +38,10 @@ import {
 } from '@deepseek-ai/dsh-api-session-controller'
 import SessionLinkService, {
   SessionLinkId,
-  SessionLinkTaskService,
   taskIdFor,
 } from '../src/index.ts'
 import * as toolPlugin from '../src/tools.ts'
+import * as tasksPlugin from '../src/service-tasks.ts'
 import { MemoryMediaPool, MemoryStorageBackend } from './helpers/memory-backend.ts'
 import { MockAdapter, textResponse, toolCallResponse } from './helpers/mock-adapter.ts'
 
@@ -112,20 +112,11 @@ async function stack(options: {
   await ctx.plugin(AgentLoop, { agents: [] })
   ctx.llm.registerAdapter(['mock'], options.adapter ?? new MockAdapter([textResponse('ok')]))
   await ctx.plugin(SessionLinkService, options.links ?? {})
-  // Task service mounts BEFORE the tool row but cordis inject-gates the root
-  // context the tools were defined on; the test stack publishes it through the
-  // documented escape hatch the accessor honors.
-  const taskFiber = await ctx.plugin(SessionLinkTaskService, {
-    links: {
-      message: messageId => ctx.sessionLinks.message(messageId),
-      pairLinked: (linkId, first, second) =>
-        ctx.sessionLinks.list(first).some(link => link.id === linkId && link.memberIds.includes(second)),
-    },
-  })
-  Object.defineProperty(ctx, '__sessionLinkTasks', { value: ctx.sessionLinkTasks })
-  // Retain the service fiber's settlement promise so the runtime's intent-side
-  // CAS never runs before the service initializes.
-  await taskFiber.await()
+  // R01: mount the task service the production way (raw-loader sub-plugin +
+  // cordis inject); the test escape hatch is gone. Awaiting the sub-plugin's
+  // own fiber settles its inner service fiber too, so the runtime's
+  // intent-side CAS never runs before the service initializes.
+  await ctx.plugin(tasksPlugin)
   const alice = await ctx.agentLoop.create(SessionId('session-alice'), { provider: 'mock', model: BASE_MODEL })
   const bob = await ctx.agentLoop.create(SessionId('session-bob'), { provider: 'mock', model: BASE_MODEL })
   const carol = await ctx.agentLoop.create(SessionId('session-carol'), { provider: 'mock', model: BASE_MODEL })

@@ -20,8 +20,9 @@ import {
   installModelSelectionProjection,
   installTaskTurnIntentsProjection,
 } from '@deepseek-ai/dsh-api-session-controller'
-import SessionLinkService, { SessionLinkTaskService } from '../../src/index.ts'
+import SessionLinkService from '../../src/index.ts'
 import * as toolPlugin from '../../src/tools.ts'
+import * as tasksPlugin from '../../src/service-tasks.ts'
 import { MemoryMediaPool, MemoryStorageBackend } from './memory-backend.ts'
 import { MockAdapter } from './mock-adapter.ts'
 
@@ -76,14 +77,9 @@ export async function bootStack(
   await ctx.plugin(AgentLoop, { agents: [] })
   ctx.llm.registerAdapter(['mock'], options.adapter ?? new MockAdapter([]))
   await ctx.plugin(SessionLinkService, options.links ?? {})
-  await ctx.plugin(SessionLinkTaskService, {
-    links: {
-      message: messageId => ctx.sessionLinks.message(messageId),
-      pairLinked: (linkId, first, second) =>
-        ctx.sessionLinks.list(first).some(link => link.id === linkId && link.memberIds.includes(second)),
-    },
-  })
-  Object.defineProperty(ctx, '__sessionLinkTasks', { value: ctx.sessionLinkTasks })
+  // R01: the task service mounts the production way (raw-loader sub-plugin +
+  // cordis inject); the test escape hatch is gone.
+  await ctx.plugin(tasksPlugin)
   const aliceId = options.sessionIds?.alice ?? SessionId('session-alice')
   const bobId = options.sessionIds?.bob ?? SessionId('session-bob')
   const carolId = options.sessionIds?.carol ?? SessionId('session-carol')

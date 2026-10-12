@@ -20,6 +20,10 @@
       "types": "./lib/types/command.d.ts",
       "default": "./lib/command.js"
     },
+    "./tasks": {
+      "types": "./lib/types/service-tasks.d.ts",
+      "default": "./lib/tasks.js"
+    },
     "./types": {
       "types": "./lib/types/types.d.ts",
       "default": "./lib/types/types.js"

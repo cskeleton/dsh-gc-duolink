@@ -5,3 +5,5 @@
       name: dsh-session-link/tools
     - id: command-session-link
       name: dsh-session-link/command
+    - id: tasks-session-link
+      name: dsh-session-link/tasks
