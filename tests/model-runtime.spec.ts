@@ -286,18 +286,17 @@ describe('model-runtime: task route freeze (capability contract)', () => {
     expect(rebuilt.capability.getTurnIntentByMessageId(messageId)?.taskId).toBe('task-restart')
     const orphans = rebuilt.capability.listOrphanedTurnIntents()
     expect(orphans.map(r => r.intentId)).toContain(record.intentId)
-    /* R06/R07 restart honesty across a full rebuild. The task turn that ran
-     * env-installed its frozen route as the log's first `request/header`
-     * (reason 'initial' — this session's epoch began with the task turn);
-     * that header legitimately establishes the epoch's baseline in the pure
-     * fold (a fresh-session baseline cannot be a task's temporary route by
-     * definition, and a session whose FIRST turn is task-bound has no human
-     * baseline to displace). The separation that protects the restart case
-     * is proven on the two-turn flows below: a task route never lands the
-     * human baseline's lastUsed slot, and the rebuilt fallback never derives
-     * the ordinary baseline from a mid-log task header. */
+    /* R06/R07 restart honesty across a full rebuild (round-1 Important 3):
+     * the task turn that ran env-installed its frozen route as the log's
+     * first `request/header` (reason 'initial'), and the FIXED fold stages
+     * and settles it against the open task-turn facts exactly like any later
+     * header — so it lands `taskLastUsed`, NEVER the human baseline's
+     * `lastUsed` slot, and a task-first epoch keeps an EMPTY human baseline
+     * (fail-closed cold: no baseline was ever established). */
     const baseline = rebuilt.capability.readBaseline()
-    expect(baseline.effective?.model ?? null).not.toBeNull()
+    expect(baseline.taskLastUsed?.model).toBe(TASK_MODEL)
+    expect(baseline.lastUsed).toBeNull()
+    expect(baseline.effective).toBeNull()
     expect(baseline.revision.version).toBeGreaterThanOrEqual(0)
   })
 
