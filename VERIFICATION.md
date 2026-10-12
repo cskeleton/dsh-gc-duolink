@@ -24,8 +24,8 @@ This section is the truthful post-review status of the model-routing feature lin
 | `pnpm run test:policy` | PASS — 32 tests / 1 file |
 | `pnpm run test:client` | PASS — 55 tests / 5 files (client-turn 16, client-panel 17, client-state 8, client-registration 3, scope 11) |
 | `pnpm test` | PASS — `test:client` + `test:policy` + `test:contracts` (requires `build` first) |
-| `DSH_SOURCE_ROOT=/Users/gc/Dev/Opensource/deepseek-harness pnpm run test:host` | PASS — **271 tests / 10 files** (`link` 59, `remote` 17, `tool-session-link` 33, `command-session-link` 16, `model-runtime` 20, `task-routing` 30, `tasks` 38, `task-notifications` 16, `task-runtime-mixed` 2, **`review-fixes` 40**) |
-| `DSH_SOURCE_ROOT=… pnpm exec vitest run` (root, all suites incl. client+policy) | PASS — **358 tests / 16 files, 0 failures** (the previous single RED — the reviewer probe's "shipped assembly (absent)" case — disappeared with the migration below; its honest replacement is the green old-host grip `R01 old host`) |
+| `DSH_SOURCE_ROOT=/Users/gc/Dev/Opensource/deepseek-harness pnpm run test:host` | PASS — **272 tests / 10 files** (`link` 59, `remote` 17, `tool-session-link` 33, `command-session-link` 16, `model-runtime` 20, `task-routing` 30, `tasks` 38, `task-notifications` 16, `task-runtime-mixed` 2, **`review-fixes` 41**) — final2 wave added the F2-final Important-1 grip |
+| `DSH_SOURCE_ROOT=… pnpm exec vitest run` (root, all suites incl. client+policy) | PASS — **359 tests / 16 files, 0 failures** (the previous single RED — the reviewer probe's "shipped assembly (absent)" case — disappeared with the migration below; its honest replacement is the green old-host grip `R01 old host`) |
 | `DSH_SOURCE_ROOT=… pnpm exec vitest run --config artifacts/review/vitest.config.ts` | Expected RED remains — **7 passed / 1 failed**: the frozen historical probe file still contains the pre-R01 "absent assembly must admit" case, intentionally not re-executed/registered anywhere (historical artifact untouched) |
 | `BROWSER_EXECUTABLE_PATH='/Applications/Brave Browser.app/Contents/MacOS/Brave Browser' pnpm run test:integration` | PASS — packed tarball installed into an isolated Web profile, browser exercised; result JSON: `{"result":"PASS","dshVersion":"0.2.0-rc.2","modelCalls":0,…}` |
 
@@ -47,7 +47,7 @@ Every confirmed round-2 defect and its grip test. Grip tests live in `tests/revi
 | R08 | Retry re-admitted the consumed delivery identity; retry of precheck-failed spawn didn't ride the original identity | `b8bf3d1` | `R08(1): retrying a claimed-failed task mints a NEW delivery identity and executes a real new request`; `R08(2): a precheck-failed spawn retry runs the full idempotent create/link/rename/admit path` |
 | R09 | Tracked intent stored/re-sent the 160-char excerpt, not the full payload | `b8bf3d1` | `R09: the tracked intent stores and re-sends the FULL payload, never the 160-char excerpt` |
 | R10 | Activation re-derived `candidates[0]` instead of the precheck-selected candidate | `b8bf3d1` | `R10: the precheck-selected candidate is fixed onto the attempt and activation uses it`; probe `R10 probe` |
-| R11 | Bound-but-missing mailbox delivery replayed as admitted/queued | `b8bf3d1` | `R11: a bound-but-missing mailbox delivery is heraled as repair, never replayed as admitted` |
+| R11 | Bound-but-missing mailbox delivery replayed as admitted/queued | `b8bf3d1` | `R11: a bound-but-missing mailbox delivery is heralded as repair, never replayed as admitted` |
 | R12 | Partial streamed output allowed automatic fallback | `e3c76c1` | `R12: partial streamed output bars automatic fallback`; probe `R12 probe` |
 | R13 | `session_default`-only fallback rejected at precheck | `b8bf3d1` | `R13: a default-only fallback admits and executes on the baseline route`; probe `R13 probe` |
 | R14 | MAILBOX_FULL-refused outbox event had no retry-condition trigger | `f76ed28` | `R14: capacity-freeing delivery re-pumps the refused outbox with no new task mutation` |
@@ -57,6 +57,16 @@ Every confirmed round-2 defect and its grip test. Grip tests live in `tests/revi
 | R18 | Unbound tasks' notifications minted fresh wake chains per event | `f76ed28` | `R18: a precheck-failed task's notifications ride ONE wake-budget chain across the retry`; `R18 mint continuity` |
 
 Round-1 review layer (the same overall review's needs-fixes tier): C1 (modelSelection row not plain JSON → checkpoint cache threw), I2 (prompt owner rewrote the frozen task route), I3 (initial-reason task header settled as human), I4 (mid-task-turn checkpoint classification diverged) — fixed in `2aab41e` with grips `Checkpoint v4: …snapshotJsonValue accepts it`, `Checkpoint v4 replay: checkpoint+tail and full replay classify identically, including mid-task-turn`, `Task prompt invariant: …prompt variables carry the frozen task route`, and `R07-initial`.
+
+### Final2 (round-2 final review) fix wave
+
+| ID | Finding (final2 review) | Fix commit | Grip test |
+| --- | --- | --- | --- |
+| F2-final Important-1 | Mixed-batch-refusal SOLO re-record built the fresh intent's route from the first *concrete* candidate only; a default-only policy (single `session_default` sentinel) re-recorded `route: {}`, so activation named the literal `session`/`session_default` placeholder in `execution.currentRoute` and commitTurn skipped session-scope persist (`routeUsed === undefined`) | `b6cb23a` | `F2-final Important-1: a default-only policy re-recorded after a mixed-batch refusal carries the CONCRETE baseline route` (fail-first verified: RED pre-fix with `route.selection` undefined; GREEN after) |
+
+Fix mechanism: the re-record now honors the attempt's fixed candidate (`selectedCandidateIndex`), and a sentinel resolves through the SAME unified snapshot chain R13 admission uses — the TARGET host's effective baseline first, the deployment catalog default second (`resolveCatalogDefault`, wired from the tools layer's `sessionController.modelCatalog()`), never the sender's; when neither answers the row projects `waiting_decision` (`catalog_unavailable`, `not_started`) instead of ever recording an empty-route intent.
+
+Same-wave minors in `b6cb23a`: the `R01 old host` grip's "four legacy tools" claim now has tool-level coverage (added `session_list_links` + `session_cancel_session_message` invocations to the fixture); the R11 grip-name typo `heraled` → `heralded` (this matrix and the tools.ts R11 comment follow); the pre-R08(1) "one deterministic messageId" docstring at the retry re-admission corrected to the attempt-scoped delivery-identity description; trailing blank line at the end of `tests/review-fixes.spec.ts` removed.
 
 ### The three flagged-but-unconfirmed risks — outcomes (this round's Task 5)
 
