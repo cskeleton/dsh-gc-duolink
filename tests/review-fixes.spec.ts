@@ -271,6 +271,32 @@ it('R01 old host: tracked params refuse HOST_CAPABILITY_UNAVAILABLE; the four le
     arguments: { cwd: '/tmp/r01-old-legacy', task: 'legacy untracked spawn' },
   })
   expect(spawned.isError).not.toBe(true)
+  /* Final2 wave (Important-1 minors): the "four legacy tools" claim now has
+   * tool-level coverage — session_list_links reports the link the service
+   * created, and session_cancel_session_message cancels a still-pending
+   * legacy send; both ride the legacy paths the old host always had. */
+  const listed = await s.ctx.tools.execute({
+    signal: new AbortController().signal, callId: ToolCallId('r01-old-list'),
+    name: 'session_list_links', agent: s.alice,
+    arguments: {},
+  })
+  expect(listed.isError).not.toBe(true)
+  expect(JSON.stringify((listed as { value?: unknown }).value)).toContain('r01-old-pair')
+  const pendingSend = await s.ctx.tools.execute({
+    signal: new AbortController().signal, callId: ToolCallId('r01-old-send-2'),
+    name: 'session_send_session_message', agent: s.alice,
+    arguments: { session_id: s.bob.id, message: 'legacy untracked to cancel' },
+  })
+  expect(pendingSend.isError).not.toBe(true)
+  const pendingId = (pendingSend as { value?: { messageId?: string } }).value?.messageId
+  expect(pendingId).toBeDefined()
+  const cancelled = await s.ctx.tools.execute({
+    signal: new AbortController().signal, callId: ToolCallId('r01-old-cancel'),
+    name: 'session_cancel_session_message', agent: s.alice,
+    arguments: { message_id: pendingId },
+  })
+  expect(cancelled.isError).not.toBe(true)
+  expect((cancelled as { value?: { status?: string } }).value?.status).toBe('cancelled')
   await s.bob.whenIdle().catch(() => {})
 })
 
@@ -1224,7 +1250,7 @@ it('R10: the precheck-selected candidate is fixed onto the attempt and activatio
   expect(adapter.requests.map(r => r.model)).toEqual([B2])
 })
 
-it('R11: a bound-but-missing mailbox delivery is heraled as repair, never replayed as admitted', async () => {
+it('R11: a bound-but-missing mailbox delivery is heralded as repair, never replayed as admitted', async () => {
   // Forge the half-write realm: a queued task whose execution binding names
   // a messageId the mailbox does not contain. reconcile classifies it as
   // needing repair; a replay of the same callId answers needs_decision, not
@@ -1284,6 +1310,139 @@ it('R13: a default-only fallback admits and executes on the baseline route', asy
   expect(adapter.requests.length).toBeGreaterThanOrEqual(1)
   expect(adapter.requests.at(-1)!.model).toBe(BASE)
 })
+
+it('F2-final Important-1: a default-only policy re-recorded after a mixed-batch refusal carries the CONCRETE baseline route', async () => {
+  /* Final2 review Important-1 (src/task-runtime.ts mixed-refusal re-record):
+   * the re-record built the fresh intent's route ONLY from the first concrete
+   * candidate. A default-only policy (single `session_default` sentinel) has
+   * none, so the fresh intent carried `route: {}`; activation then named the
+   * literal `{provider:'session', model:'session_default'}` placeholder in
+   * `execution.currentRoute`, and commitTurn skipped the session-scope
+   * persist (routeUsed undefined). The fix resolves the sentinel through the
+   * SAME unified chain R13 admission uses (host effective baseline first,
+   * catalog default second), so the re-recorded intent names a concrete
+   * route. This grip saves the literal single-sentinel policy the reviewer
+   * names (the tool schema always requires a concrete primary, so the save
+   * rides the service the way a retry-decided policy can) and drives the
+   * mixed batch exactly like the IMPORTANT-2 fixture (inbox.splice). */
+  let releaseBusy!: () => void
+  const busyGate = new Promise<void>(resolve => { releaseBusy = resolve })
+  class Gated extends MockAdapter {
+    constructor() { super([]) }
+    private gated = true
+    override async *stream(options: Parameters<MockAdapter['stream']>[0]) {
+      this.requests.push(options)
+      if (this.gated) {
+        this.gated = false
+        await busyGate
+        for (const chunk of textResponse('busy human answer')) yield chunk as never
+        return
+      }
+      for (const chunk of textResponse(this.requests.length === 2 ? 'human step answer' : 'task answer')) yield chunk as never
+    }
+  }
+  const adapter = new Gated()
+  const s = await stack(adapter, [BASE])
+  await s.ctx.sessionLinks.link('f2f-pair', [s.alice.id, s.bob.id], { kind: 'human' }, {
+    autoWakeSessionIds: [s.bob.id],
+  })
+  const tasks = s.ctx.sessionLinkTasks
+  const { taskIdFor, mintTaskMessageId } = await import('../src/index.ts')
+  const { ensureTaskHostLazy } = await import('../src/task-host-lazy.ts')
+
+  // The literal default-only policy the review names: ONE session_default
+  // sentinel, no concrete candidate at all.
+  const policy = {
+    scope: 'session' as const,
+    candidates: [{ use: 'session_default' as const }],
+    ifExhausted: 'notify_sender' as const,
+    usesSessionDefault: true,
+  }
+  await tasks.saveTaskIntent({
+    callerId: s.alice.id,
+    request: { kind: 'send', callId: 'f2f-default', text: 'default-only task body', targetSessionId: s.bob.id },
+    policy,
+    tracked: true,
+    selectedCandidateIndex: 0,
+  })
+  const taskId = taskIdFor(s.alice.id, 'f2f-default')
+  const row = tasks.getRow(taskId)!
+  // Mirror the R13 admission's own resolution for the FIRST intent (the part
+  // admission already does right): the TARGET's effective baseline snapshot
+  // when the projection has one, else the deployment catalog default (a cold
+  // target's projection reads null until its first turn runs).
+  const host = await ensureTaskHostLazy(s.bob)
+  expect(host).toBeDefined()
+  const admittedRoute = host!.readBaseline().effective ?? { provider: 'mock' as const, model: BASE }
+  const messageId = mintTaskMessageId(taskId, 'f2f-default')
+  const first = host!.recordTurnIntent({
+    taskId,
+    attemptId: row.currentAttemptId,
+    messageId: messageId as never,
+    route: { selection: { provider: admittedRoute.provider, model: admittedRoute.model } },
+    persistOnSuccess: true,
+  })
+  await host!.claimTurnIntent(first.intentId).catch(() => {})
+  const boundPre = await tasks.attachBinding(taskId, row.revision, {
+    messageId, sessionId: s.bob.id, admittedAs: 'queued',
+  })
+  await tasks.recordTurnIntent(taskId, boundPre.revision, { turnIntentId: first.intentId, messageId })
+
+  // Bob starts a BUSY human turn whose first request parks on the gate; the
+  // managed delivery THEN lands durably in bob's next-turn inbox mid-turn
+  // (the F2/IMPORTANT-2 construction order — sending first would wake an
+  // idle bob into a clean solo claim and never reach the mixed refusal).
+  s.bob.followup({ content: [{ type: 'text', text: 'busy human question' }], source: { kind: 'user' } } as never)
+  await vi.waitFor(() => { expect(adapter.requests.length).toBe(1) })
+  const sent = await s.ctx.sessionLinks.send(s.alice, s.bob.id, {
+    targetId: s.bob.id, text: 'default-only task body', idempotencyKey: 'f2f-default', messageId,
+  })
+  expect(sent.status).toBe('accepted')
+  expect(sent.messageId).toBe(messageId)
+  await vi.waitFor(() => {
+    expect(s.bob.inbox.nextTurn.some(message =>
+      (message as { source?: { messageId?: string } }).source?.messageId === messageId)).toBe(true)
+  })
+  // The literal mixed batch: move the managed delivery from next-turn into
+  // next-step beside a human message so both claim together; the pre-step
+  // gate refuses the tracked entry (parkManagedInput cancels its claim), the
+  // human step runs BASE, and the managed message re-claims SOLO next turn —
+  // where the cancelled-record re-record is what this grip observes.
+  const trackedMessage = s.bob.inbox.nextTurn.find(message =>
+    (message as { source?: { messageId?: string } }).source?.messageId === messageId)
+  expect(trackedMessage).toBeDefined()
+  s.bob.inbox.splice('next-turn', 0, s.bob.inbox.nextTurn.length, [])
+  s.bob.inbox.append('next-step', trackedMessage!)
+  s.bob.inbox.append('next-step', { content: [{ type: 'text', text: 'human step beside' }], source: { kind: 'user' } } as never)
+  releaseBusy()
+
+  await s.bob.whenIdle()
+  await vi.waitFor(() => {
+    expect(tasks.getRow(taskId)?.taskState).toBe('turn_finished')
+  }, { timeout: 8000 })
+
+  // Every request ran BASE: the human busy turn, the refused human step, and
+  // the task's SOLO turn on the resolved concrete baseline — never A, never
+  // the literal session/session_default placeholder.
+  expect(adapter.requests.map(request => request.model)).toEqual([BASE, BASE, BASE])
+
+  // The re-recorded intent (the row's live binding after the solo activation)
+  // names the CONCRETE baseline route, not an empty route object.
+  const settled = tasks.getRow(taskId)!
+  const liveIntentId = settled.execution.turnIntentId!
+  expect(liveIntentId).not.toBe(first.intentId)
+  const reRecord = host!.getTurnIntent(liveIntentId)!
+  expect(reRecord).toBeDefined()
+  expect(reRecord.route.selection).toEqual({ provider: 'mock', model: BASE })
+  // Activation's currentRoute is the concrete route — never the placeholder.
+  expect(settled.execution.currentRoute).toEqual({ provider: 'mock', model: BASE })
+  // routeUsed committed (the persist gate the review names), and the session-
+  // scope intent was free to persist (persistOnSuccess carried through).
+  expect(reRecord.routeUsed).toEqual({ provider: 'mock', model: BASE })
+  expect(reRecord.persistOnSuccess).toBe(true)
+  const finished = settled.outbox.find(event => event.kind === 'turn_finished')
+  expect(finished?.actualModel?.model).toBe(BASE)
+}, 20000)
 
 it('R15: concurrent first-creates of one taskId adopt-or-conflict, never silently overwrite', async () => {
   // Two racing first saves with DIFFERENT payloads: exactly one becomes the
@@ -1720,4 +1879,3 @@ it('Risk-1 durable-failure arm: a terminal projection whose row write fails dura
     localContexts.clear()
   }
 })
-

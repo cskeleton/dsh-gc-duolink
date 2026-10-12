@@ -223,6 +223,12 @@ export type TaskServiceResolver = () => SessionLinkTaskService
  *   claimed gates call it when no capability resolves yet, so a cold target
  *   that became live without the row's arming is armed before claim instead
  *   of dropping the managed message onto the baseline.
+ * @param options.resolveCatalogDefault - the deployment catalog's default
+ *   route (R13 chain tail): the mixed-refusal re-record resolves a bare
+ *   `session_default` sentinel through host-baseline FIRST and this catalog
+ *   fallback second, mirroring `admitTrackedDelivery`'s precheck default
+ *   resolution; undefined answer projects waiting_decision rather than ever
+ *   recording an empty-route intent (final2 review Important-1).
  */
 export function installTaskRuntime(
   ctx: Context,
@@ -233,6 +239,7 @@ export function installTaskRuntime(
     host?: HostTaskHostCapability
     schedulePump?: () => void
     ensureHost?: () => Promise<HostTaskHostCapability | undefined>
+    resolveCatalogDefault?: () => Promise<ModelRouteSelection | undefined>
   } = {},
 ): void {
   const resolveTasks = typeof tasks === 'function' ? tasks : () => tasks
@@ -413,10 +420,40 @@ export function installTaskRuntime(
         if (row === undefined || !['queued', 'preparing'].includes(row.taskState)) continue
         const attempt = row.attempts.find(candidate => candidate.attemptId === row.currentAttemptId)
         const candidates = attempt?.candidates ?? row.policy.candidates
-        const concrete = candidates.find((candidate): candidate is ModelRouteSelection => !('use' in candidate))
-        const route: HostTaskRoute = concrete === undefined
-          ? {}
-          : { selection: { provider: concrete.provider, model: concrete.model, ...(concrete.reasoningEffort === undefined ? {} : { reasoningEffort: concrete.reasoningEffort }) } }
+        /* F2-final Important-1 (final2 review): a default-only policy (the
+         * R13 single `session_default` sentinel — and any admission whose
+         * precheck fixed `selectedCandidateIndex` ONTO the sentinel) has no
+         * honest concrete route to claim from `candidates.find`; recording
+         * the fresh intent with `route: {}` would let activation fall to the
+         * literal `session`/`session_default` placeholder the ledger then
+         * reports as if it were a real provider/model pair. Resolve the
+         * sentinel through the SAME unified snapshot chain R13 admission
+         * uses — the TARGET host's effective baseline FIRST, then the
+         * deployment catalog default, never the sender's. When NEITHER
+         * answers, never record an empty-route intent: project the row to
+         * waiting_decision honestly (catalog-gone, not_started) and let this
+         * message run unmanaged on the session baseline. */
+        const fixed = attempt?.selectedCandidateIndex === undefined
+          ? undefined
+          : candidates[Math.min(attempt.selectedCandidateIndex, candidates.length - 1)]
+        const concrete = fixed !== undefined && !('use' in fixed)
+          ? fixed
+          : fixed === undefined
+            ? candidates.find((candidate): candidate is ModelRouteSelection => !('use' in candidate))
+            : undefined
+        let resolved: ModelRouteSelection | undefined = concrete === undefined
+          ? undefined
+          : { provider: concrete.provider, model: concrete.model, ...(concrete.reasoningEffort === undefined ? {} : { reasoningEffort: concrete.reasoningEffort }) }
+        if (resolved === undefined) {
+          const baseline = host.readBaseline().effective
+          resolved = baseline === null ? await options.resolveCatalogDefault?.() : baseline
+          if (resolved === undefined) {
+            await projectWait(resolveTasks(), host, runtime, row, 'catalog_unavailable', 'not_started', true)
+              .catch(() => { /* a concurrent projection already landed */ })
+            continue
+          }
+        }
+        const route: HostTaskRoute = { selection: resolved }
         const fresh = host.recordTurnIntent({
           taskId: taskIdOf(row),
           attemptId: row.currentAttemptId,

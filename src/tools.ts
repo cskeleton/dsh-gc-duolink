@@ -614,6 +614,19 @@ export function apply(ctx: Context, config: Config = {}): void {
        * managed claim arrived, the gate arms it on the spot (still the same
        * single flight) instead of letting the message run unmanaged. */
       ensureHost: () => ensureTaskHostLazy(agent),
+      /* Final2 review Important-1: the mixed-refusal re-record resolves a bare
+       * `session_default` sentinel through the SAME unified chain R13
+       * admission uses (host effective baseline first, then this deployment
+       * catalog default — never the sender's), so the fresh intent always
+       * names a concrete route (or the row projects waiting_decision). */
+      resolveCatalogDefault: async () => {
+        try {
+          const catalog = await readModelCatalog(() => rootCtx.sessionController.modelCatalog() as Promise<ModelCatalogLike>)
+          return catalog.default ?? undefined
+        } catch {
+          return undefined
+        }
+      },
     })
   }
 }
@@ -2063,7 +2076,7 @@ async function resolveTaskWire(
   }
 
   /* R11: a retry/reopen decision against a task whose bound delivery the
-   * mailbox does NOT contain is heraled FIRST — the row's `queued`-projection
+   * mailbox does NOT contain is heralded FIRST — the row's `queued`-projection
    * is a phantom the caller must not resolve blindly. The herald drops the
    * task into waiting_decision/not_started (retry's required realm) with the
    * missingDelivery reason; the stale token only re-reads after the mark. */
@@ -2140,15 +2153,18 @@ async function resolveTaskWire(
   }
 
   /* Applied retry: re-admit the ORIGINAL flow through the SAME tracked
-   * machinery the original call used — one deterministic messageId (same
-   * task identity semantics), a fresh candidate precheck only against the
-   * (possibly new) policy, and NO new Session/text. The task row's
-   * `preparing` state guarantees resolveTask's own precondition that the
-   * task never executed; the ORIGINAL delivery was either never admitted
-   * (precheck failure) or never claimed (mailbox alone may still hold it
-   * pending) — tracked re-admission re-attaches the binding under the same
-   * deterministic message identity the original task owns, so the mailbox
-   * never holds a duplicate. */
+   * machinery the original call used — a deterministic ATTEMPT-SCOPED
+   * messageId (R08(1): the new attempt's own `mintTaskMessageId(taskId,
+   * attemptCallKey(callId, N))` — the per-attempt delivery identity, not the
+   * intent-minted notification root that never moves), a fresh candidate
+   * precheck only against the (possibly new) policy, and NO new Session/text.
+   * The task row's `preparing` state guarantees resolveTask's own
+   * precondition that the task never executed; the ORIGINAL delivery was
+   * either never admitted (precheck failure) or never claimed (mailbox alone
+   * may still hold it pending) — tracked re-admission re-attaches the binding
+   * under the attempt's own deterministic message identity, and the retired
+   * predecessor's original idempotency key is marked consumed
+   * (`markRetried`), so the mailbox never holds a duplicate. */
   if (args.action === 'retry') {
     await reAdmitRetriedTask(ctx, caller, taskId, pumpSchedule).catch((error: unknown) => {
       // A pump pass that raced the decision may have flipped another outbox
