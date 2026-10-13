@@ -29,13 +29,6 @@ export const sessionLinkRecordSchema = z.object({
   }),
 })
 
-/** Durable shape of one concrete model route carried by a task-status report. */
-const taskStatusRouteSchema = z.strictObject({
-  provider: z.string().min(1),
-  model: z.string().min(1),
-  reasoningEffort: z.string().min(1).optional(),
-})
-
 /** Durable shape of one mailbox record at the medium boundary. */
 export const sessionLinkMessageSchema = z.object({
   linkId,
@@ -62,37 +55,9 @@ export const sessionLinkMessageSchema = z.object({
   seq: z.number().int().positive().optional(),
   /** Set before the message is handed to the target; such a message is never made terminal. */
   inserted: z.boolean().optional(),
-  /**
-   * Present only on INTERNAL host-generated task-status reports (Task 5 of
-   * the model-routing plan). Optional so every v1 row predating the marker
-   * reads as a peer message; the service never strips it once stamped.
-   */
-  statusKind: z.literal('task-status').optional(),
-  /** Structured task facts the status report carries (never an instruction). */
-  taskStatus: z.strictObject({
-    taskId: z.string().min(1),
-    attemptId: z.string().min(1),
-    eventId: z.string().min(1),
-    revision: z.number().int().nonnegative(),
-    kind: z.union([
-      z.literal('model_fallback_selected'),
-      z.literal('model_unavailable'),
-      z.literal('turn_finished'),
-      z.literal('interrupted'),
-      z.literal('cancelled'),
-    ]),
-    executionState: z.union([
-      z.literal('not_started'),
-      z.literal('partial'),
-      z.literal('unknown'),
-    ]).optional(),
-    reason: z.string().optional(),
-    requestedModel: taskStatusRouteSchema,
-    actualModel: taskStatusRouteSchema.optional(),
-    attempts: z.number().int().nonnegative(),
-    decisionRequired: z.boolean(),
-    resumable: z.boolean(),
-  }).optional(),
+  /** Legacy experimental report markers must survive decoding; 0.5 never executes them. */
+  statusKind: z.json().optional(),
+  taskStatus: z.json().optional(),
 })
 
 /** Inferred link record type, shared with the runtime module. */
@@ -139,6 +104,22 @@ export const sessionLinkSpawnLedgerSchema = z.record(
 /** The key of the only singleton record in the ledgers table. */
 export const SESSION_LINK_LEDGER_KEY = 'ledger'
 
+/** Only bootstrap facts for a new ordinary Session; runtime selection stays native. */
+export const initialModelSpawnSchema = z.object({
+  sessionId,
+  digest: z.string().regex(/^[a-f0-9]{64}$/),
+  cwd: z.string(),
+  preset: z.string().min(1),
+  title: z.string(),
+  autoWake: z.boolean(),
+  wakeCaller: z.boolean(),
+  createdAt: z.number().int().nonnegative(),
+  selection: z.object({ provider: z.string().min(1), model: z.string().min(1), reasoningEffort: z.string().min(1).optional() }),
+  headerCreated: z.boolean(),
+  seedConfirmed: z.boolean(),
+})
+export type InitialModelSpawnRecord = z.infer<typeof initialModelSpawnSchema>
+
 /**
  * One durable ledgers row: the idempotency map, the wake ledger, and the spawn
  * ledger. Rows written before the spawn ledger existed read it as empty.
@@ -147,6 +128,7 @@ export const sessionLinkLedgersSchema = z.object({
   idempotency: sessionLinkIdempotencySchema,
   wakes: sessionLinkWakeLedgerSchema,
   spawns: sessionLinkSpawnLedgerSchema.default({}),
+  initialModelSpawns: z.record(z.string(), initialModelSpawnSchema).default({}),
 })
 
 /** Inferred ledgers row type, shared with the runtime module. */

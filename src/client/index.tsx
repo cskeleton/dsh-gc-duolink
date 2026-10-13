@@ -10,14 +10,14 @@ import type {} from '@deepseek-ai/dsh-client-ui-sidebar-right/client'
 import type {} from '@deepseek-ai/dsh-client-ui-chat/client'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
 import type { SessionLinkAddRequest, SessionLinkRevokeRequest, SessionLinkWakeRequest } from '../types.ts'
-import { createLinkSource, createTaskSource, createWriteGate } from './state.ts'
+import { createLinkSource, createWriteGate } from './state.ts'
 import {
   HeaderAction, ManagedLinkTab, ManagedLinkTabTitle, RowLinkAction, RowLinkMenu,
   type LinkInjected, type LinkActions,
 } from './components.tsx'
 import { TurnCard } from './TurnCard.tsx'
 import { sessionLinkTurnDefinition } from './turn.ts'
-import { isLinkView, isTaskView } from './rpc.ts'
+import { isLinkView } from './rpc.ts'
 import { en, NS, zh } from './locales.ts'
 
 const TAB_ID = 'dsh-session-link/panel'
@@ -54,29 +54,6 @@ export function apply(ctx: Context & { readonly connection: ConnectionHandle }):
     subscribeReset: listener => ctx.on('connection/reset', listener),
   })
   ctx.effect(() => () => source.dispose(), 'session-link: view lifetime')
-  /* The read-only task projection rides the SAME Remote bridge with the SAME
-   * `request` argument as the other views (the built contract pins it). One
-   * source per managed Session: the Host filters the projection server-side,
-   * and a failed poll keeps the last-known rows exactly like the link view. */
-  const taskSources = new Map<SessionId, ReturnType<typeof createTaskSource>>()
-  const taskSourceFor = (sessionId: SessionId): ReturnType<typeof createTaskSource> => {
-    const existing = taskSources.get(sessionId)
-    if (existing !== undefined) return existing
-    const created = createTaskSource({
-      load: async signal => {
-        const value = await invoke('taskView', { request: { sessionId } }, signal)
-        if (!isTaskView(value)) throw new Error(t('panel.protocol.error'))
-        return value
-      },
-      subscribeReset: listener => ctx.on('connection/reset', listener),
-    })
-    taskSources.set(sessionId, created)
-    return created
-  }
-  ctx.effect(() => () => {
-    for (const source of taskSources.values()) source.dispose()
-    taskSources.clear()
-  }, 'session-link: task view lifetime')
   // One write at a time across header, panel, and cards; clicks during a pending write are refused.
   const gate = createWriteGate()
   const mutate = (
@@ -96,12 +73,9 @@ export function apply(ctx: Context & { readonly connection: ConnectionHandle }):
     openPanel: () => { openPanelFor(sessionId) },
     openSession: id => { ctx.uiWorkspace.openSession(id) },
   })
-  const injected = (sessionId: SessionId): LinkInjected => {
-    const taskSource = taskSourceFor(sessionId)
-    return {
-      hooks: { links: source, tasks: taskSource }, refresh: source.refresh, refreshTasks: taskSource.refresh, ...actionsFor(sessionId),
-    }
-  }
+  const injected = (sessionId: SessionId): LinkInjected => ({
+    hooks: { links: source }, refresh: source.refresh, ...actionsFor(sessionId),
+  })
   const managedInjected = (sessionId: SessionId) => ({ ...injected(sessionId), actionsFor })
   ctx.effect(() => ctx.sidebarRightTabs.register({
     id: TAB_ID, kind: TAB_KIND, title: () => t('tab.title'),

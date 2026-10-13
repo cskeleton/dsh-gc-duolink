@@ -105,6 +105,43 @@ function mailSource(agent: Agent): { kind?: string; senderId?: string; messageId
 }
 
 describe('dsh-session-link', () => {
+  it.each([
+    { statusKind: 'task-status' },
+    { taskStatus: { taskId: 'legacy-task', nested: { fact: true } } },
+    { statusKind: 'task-status', taskStatus: { taskId: 'legacy-task', kind: 'turn_finished' } },
+  ])('retains and blocks legacy report markers across restart and ordinary delivery: %j', async markers => {
+    const pool = new MemoryMediaPool()
+    const first = await stack(undefined, pool)
+    const linkId = await grantBoth(first, { autoWake: [first.bob.id] })
+    const messageId = SessionLinkMessageId('legacy-status-report')
+    const record = {
+      linkId, senderId: first.alice.id, senderTitle: 'alice', targetId: first.bob.id,
+      text: 'legacy report must not enter the model', status: 'pending' as const,
+      wakesUsed: 0, chainLength: 1, attempts: 0, createdAt: new Date().toISOString(),
+      idempotencyKey: 'legacy-report-call', seq: 1, ...markers,
+    }
+    await first.links['messages'].put(messageId, record)
+    expect(first.links.message(messageId)).toEqual(record)
+    await first.ctx.fiber.dispose()
+    contexts.delete(first.ctx)
+    const restarted = await stack(undefined, pool)
+    await restarted.links.deliverPending(restarted.bob.id)
+    expect(restarted.links.message(messageId)).toEqual(record)
+    await expect(restarted.links.send(restarted.alice, restarted.bob.id, {
+      targetId: restarted.bob.id, text: 'must not replay', idempotencyKey: 'legacy-report-call',
+    })).rejects.toMatchObject({ code: 'LEGACY_TASK_MESSAGE_BLOCKED' })
+    expect(restarted.bob.status).toBe('idle')
+    expect(mailTexts(restarted.bob)).toEqual([])
+    const ordinary = await restarted.links.send(restarted.alice, restarted.bob.id, {
+      targetId: restarted.bob.id, text: 'ordinary message still works',
+    })
+    expect(ordinary.status).toBe('accepted')
+    await restarted.bob.whenIdle()
+    expect(mailTexts(restarted.bob).some(text => text.includes('ordinary message still works'))).toBe(true)
+    expect(mailTexts(restarted.bob).some(text => text.includes('legacy report'))).toBe(false)
+    expect(restarted.links.message(messageId)).toEqual(record)
+  })
+
   it('rejects sends between Sessions that share no grant', async () => {
     const s = await stack()
     await expect(s.links.send(s.alice, s.bob.id, { targetId: s.bob.id, text: 'hi' }))

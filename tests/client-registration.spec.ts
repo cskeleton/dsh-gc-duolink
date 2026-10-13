@@ -68,30 +68,4 @@ describe('client slot registration', () => {
       expect(f.openSession).not.toHaveBeenCalled()
     } finally { f.cleanup() }
   })
-
-  it('drives the read-only task projection through the same Remote bridge with `request`', async () => {
-    const wire = vi.fn(async (_route: string, method: string, args?: unknown) => ({
-      ok: true,
-      value: method === 'sessionLinks/taskView' ? { pollIntervalMs: 30_000, tasks: [] } : undefined as unknown,
-      args,
-    }))
-    const { createTaskSource } = await import('../src/client/state.ts')
-    const { isTaskView } = await import('../src/client/rpc.ts')
-    const source = createTaskSource({
-      load: async signal => {
-        const result = await wire('/api', 'sessionLinks/taskView', { args: { request: { sessionId: PEER } } }, signal)
-        const value = (result as { ok: true; value: unknown }).value
-        if (!isTaskView(value)) throw new Error('protocol')
-        return value
-      },
-      subscribeReset: () => () => {},
-    })
-    const stop = source.subscribe(() => {})
-    expect(await source.refresh()).toBe(true)
-    expect(wire).toHaveBeenCalledWith('/api', 'sessionLinks/taskView',
-      { args: { request: { sessionId: PEER } } }, expect.anything())
-    expect(source.getSnapshot().view?.tasks).toEqual([])
-    stop()
-    source.dispose()
-  })
 })

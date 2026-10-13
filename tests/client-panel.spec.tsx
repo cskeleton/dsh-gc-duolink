@@ -5,13 +5,13 @@ import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { SnapshotSelectorHook, TranslateNS } from '@deepseek-ai/dsh-client-ui-slots'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
-import { SessionLinkId, type SessionLinkSessionView, type SessionLinkTaskViewResponse, type SessionLinkView } from '../src/types.ts'
+import { SessionLinkId, type SessionLinkSessionView, type SessionLinkView } from '../src/types.ts'
 import {
   HeaderAction, LinkTab, RowLinkAction, RowLinkMenu, ManagedLinkTab, panelOwner,
   type LinkProps,
 } from '../src/client/components.tsx'
 import type { UseSidebarRightTabInfo } from '@deepseek-ai/dsh-client-ui-sidebar-right/client'
-import { createLinkSource, createTaskSource, LinkBusyError, type LinkSnapshot, type LinkSource, type TaskSnapshot } from '../src/client/state.ts'
+import { createLinkSource, LinkBusyError, type LinkSource, type LinkSnapshot } from '../src/client/state.ts'
 import { en, type NS } from '../src/client/locales.ts'
 
 const SELF = 'session-self' as SessionId
@@ -34,11 +34,6 @@ function selector(source: LinkSource): SnapshotSelectorHook<LinkSnapshot> {
     return select(snapshot)
   }
 }
-
-function taskSelector(view: SessionLinkTaskViewResponse): SnapshotSelectorHook<TaskSnapshot> {
-  return <Value,>(select: (snapshot: TaskSnapshot) => Value): Value => select({ status: 'ready', view })
-}
-const EMPTY_TASKS: SessionLinkTaskViewResponse = { pollIntervalMs: 30_000, tasks: [] }
 
 const sources: LinkSource[] = []
 function fixture(extraSessions: SessionLinkSessionView[] = []) {
@@ -66,8 +61,7 @@ function fixture(extraSessions: SessionLinkSessionView[] = []) {
     await source.refresh()
   })
   const props: LinkProps = {
-    sessionId: SELF, useLinks: selector(source), useTasks: taskSelector(EMPTY_TASKS),
-    refresh: source.refresh, refreshTasks: vi.fn(async () => true),
+    sessionId: SELF, useLinks: selector(source), refresh: source.refresh,
     link, setWake, unlink, openPanel: vi.fn(), openSession: vi.fn(), t,
   }
   return { props, source, link, setWake, unlink }
@@ -272,115 +266,5 @@ describe('explicit management owner', () => {
     expect(f.setWake).toHaveBeenCalledWith(LINK, SELF, true)
     expect(screen.queryByText(/Return wake is off/)).toBeNull()
     expect(screen.getByRole('switch', { name: 'My messages → wake peer · Peer' }).getAttribute('aria-checked')).toBe('true')
-  })
-})
-
-/* The read-only task projection: honest labels, last-known-on-failure, and
- * needs_decision-no-Session rows never showing a fake jump. */
-
-describe('task panel section', () => {
-  function tasksView(entries: SessionLinkTaskViewResponse['tasks']): SessionLinkTaskViewResponse {
-    return { pollIntervalMs: 30_000, tasks: entries }
-  }
-  const base = {
-    taskState: 'queued', revision: 3,
-    requestedModel: { provider: 'deepseek', model: 'deepseek-chat' },
-    scope: 'task' as const, routePersisted: false, currentlyExecuting: true,
-    outbox: [], updatedAt: '2026-01-01T00:00:00Z',
-  }
-
-  it('shows requested vs actual, the temporary label, and an executing marker', async () => {
-    const f = fixture()
-    render(<LinkTab {...f.props} useTasks={taskSelector(tasksView([{
-      ...base, taskId: `task:${SELF}:call-1`, targetSessionId: PEER,
-      routeUsed: { provider: 'deepseek', model: 'deepseek-reasoner' },
-    }]))} />)
-    await settle()
-    await act(async () => { await Promise.resolve() })
-    expect(screen.getByText('Task status')).toBeTruthy()
-    expect(screen.getByText('Route scope: this turn')).toBeTruthy()
-    expect(screen.getByText('Requested route')).toBeTruthy()
-    expect(screen.getByText('Selected route')).toBeTruthy()
-    expect(screen.getByText('running')).toBeTruthy()
-  })
-
-  it('labels a persisted session-scope route and a skipped persist honestly', async () => {
-    const f = fixture()
-    render(<LinkTab {...f.props} useTasks={taskSelector(tasksView([
-      {
-        ...base, taskId: `task:${SELF}:call-persisted`, taskState: 'turn_finished',
-        scope: 'session', routePersisted: true, currentlyExecuting: false,
-        routeUsed: { provider: 'deepseek', model: 'deepseek-reasoner' },
-      },
-      {
-        ...base, taskId: `task:${SELF}:call-skipped`, taskState: 'turn_finished',
-        scope: 'session', routePersisted: false, currentlyExecuting: false,
-        reason: 'persistent_selection_skipped: human_selection_changed',
-        routeUsed: { provider: 'deepseek', model: 'deepseek-reasoner' },
-      },
-    ]))} />)
-    await settle()
-    await act(async () => { await Promise.resolve() })
-    expect(screen.getByText('Persisted as the long-term baseline')).toBeTruthy()
-    expect(screen.getByText('Not persisted: the human selection changed')).toBeTruthy()
-  })
-
-  it('renders a needs_decision row without a session jump when the task has no Session', async () => {
-    const f = fixture()
-    render(<LinkTab {...f.props} useTasks={taskSelector(tasksView([{
-      ...base, taskId: `task:${SELF}:call-none`, taskState: 'waiting_decision',
-      currentlyExecuting: false, reason: 'model_unavailable', executionState: 'not_started',
-      outbox: [{ eventId: 'e1', kind: 'model_unavailable', status: 'blocked', decisionRequired: true, resumable: true, blockedReason: 'link_revoked: gone' }],
-    }]))} />)
-    await settle()
-    await act(async () => { await Promise.resolve() })
-    expect(screen.getByText(/No Session was created/)).toBeTruthy()
-    expect(screen.getByText(/waiting_decision/)).toBeTruthy()
-    expect(screen.getByText(/Report: blocked/)).toBeTruthy()
-    expect(screen.getByText(/\(reason: link_revoked: gone\)/)).toBeTruthy()
-    const taskCard = document.querySelector('[data-session-link-task]')!
-    expect(taskCard.querySelector('button')).toBeNull()
-  })
-
-  it('opens the target Session from the task row when one exists', async () => {
-    const f = fixture()
-    render(<LinkTab {...f.props} useTasks={taskSelector(tasksView([{
-      ...base, taskId: `task:${SELF}:call-1`, targetSessionId: PEER,
-    }]))} />)
-    await settle()
-    await act(async () => { await Promise.resolve() })
-    const taskCard = document.querySelector('[data-session-link-task]')!
-    const jump = Array.from(taskCard.querySelectorAll('button'))
-      .find(button => button.textContent === 'Open session')!
-    fireEvent.click(jump)
-    expect(f.props.openSession).toHaveBeenCalledWith(PEER)
-  })
-
-  it('keeps the last-known rows when a later task poll fails', async () => {
-    let taskView: SessionLinkTaskViewResponse = tasksView([{
-      ...base, taskId: `task:${SELF}:call-1`, targetSessionId: PEER,
-    }])
-    let fail = false
-    const taskSource = createTaskSource({
-      load: async () => {
-        if (fail) throw new Error('host offline')
-        return taskView
-      },
-      subscribeReset: () => () => {},
-    })
-    const liveTasks: SnapshotSelectorHook<TaskSnapshot> = <Value,>(select: (snapshot: TaskSnapshot) => Value): Value =>
-      select(useSyncExternalStore(taskSource.subscribe, taskSource.getSnapshot, taskSource.getSnapshot))
-    const f = fixture()
-    render(<LinkTab {...f.props} useTasks={liveTasks} refreshTasks={taskSource.refresh} />)
-    await settle()
-    await act(async () => { await Promise.resolve() })
-    expect(screen.getByText('task:session-self:call-1')).toBeTruthy()
-    fail = true
-    await act(async () => { await taskSource.refresh() })
-    // The failed poll keeps the rows and surfaces the transport error, never
-    // wiping the projection the human was reading.
-    expect(screen.getByText('task:session-self:call-1')).toBeTruthy()
-    expect(screen.getByRole('alert').textContent).toContain('host offline')
-    taskSource.dispose()
   })
 })

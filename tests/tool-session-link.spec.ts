@@ -48,8 +48,6 @@ async function stack(options: {
   /** Runs after both Agents exist and before the tool row mounts. */
   beforeTools?: (alice: Agent, bob: Agent) => void
   rename?: () => Promise<unknown>
-  /** Stand-in for the Session Controller modelCatalog Remote. */
-  modelCatalog?: () => Promise<unknown>
   /** Further live Sessions handed out to spawn calls with new ids, after bob. */
   extraSessions?: SessionId[]
   /** Storage medium, shared to inject write failures. */
@@ -88,12 +86,6 @@ async function stack(options: {
       return Promise.resolve({ sessionId })
     },
     rename: options.rename ?? (() => Promise.resolve({})),
-    modelCatalog: options.modelCatalog ?? (() => Promise.resolve({
-      default: { provider: 'mock', model: 'mock' },
-      routableProviders: ['mock'],
-      groups: [{ id: 'mock', name: 'Mock', models: [{ id: 'mock', name: 'Mock Model' }] }],
-      failures: [],
-    })),
   } as never)
   options.beforeTools?.(alice, bob)
   await ctx.plugin(toolPlugin)
@@ -143,9 +135,7 @@ describe('dsh-tool-session-link', () => {
     expect(names).toContain('session_send_session_message')
     expect(names).toContain('session_cancel_session_message')
     expect(names).toContain('session_spawn_linked_session')
-    expect(names).toContain('session_list_models')
     expect(ctx.tools.schemas().map(schema => schema.name)).not.toContain('session_list_links')
-    expect(ctx.tools.schemas().map(schema => schema.name)).not.toContain('session_list_models')
   })
 
   it('never mounts the tools into a subagent-owned Agent', async () => {
@@ -475,96 +465,5 @@ describe('dsh-tool-session-link', () => {
     const result = await call(s.ctx, 'session_send_session_message', { session_id: s.alice.id, message: 'me' }, s.alice)
     expect(result.isError).toBe(true)
     expect(text(result)).toContain('itself')
-  })
-
-  it('lists models with effort metadata, the deployment default flag, and a false taskHost flag', async () => {
-    const s = await stack({
-      modelCatalog: () => Promise.resolve({
-        default: { provider: 'mock', model: 'mock-chat' },
-        routableProviders: ['mock'],
-        groups: [{ id: 'mock', name: 'Mock', models: [
-          { id: 'mock-chat' },
-          { id: 'mock-thinker', reasoning: {
-            efforts: [{ id: 'low' }, { id: 'high' }],
-            defaultEffort: 'low',
-          } },
-        ] }],
-        failures: [],
-      }),
-    })
-    const view = succeeded(await call(s.ctx, 'session_list_models', {}, s.alice)).value as {
-      taskHost: boolean
-      deploymentDefault: { provider: string; model: string }
-      providers: { id: string; models: { id: string; defaultEffort?: string; isDeploymentDefault: boolean }[] }[]
-    }
-    // The mock host has no task-host capability: the flag must report that, not guess.
-    expect(view.taskHost).toBe(false)
-    expect(view.deploymentDefault).toEqual({ provider: 'mock', model: 'mock-chat' })
-    const models = view.providers[0]!.models
-    expect(models.find(model => model.id === 'mock-chat')?.isDeploymentDefault).toBe(true)
-    expect(models.find(model => model.id === 'mock-thinker')?.defaultEffort).toBe('low')
-    expect(models.find(model => model.id === 'mock-thinker')?.isDeploymentDefault).toBe(false)
-  })
-
-  it('marks the taskHost flag when the host capability resolves for the calling Agent', async () => {
-    const s = await stack({
-      beforeTools: (alice) => {
-        Object.defineProperty(alice.ctx, 'taskHost', { value: { taskHostVersion: 1 } })
-      },
-    })
-    const view = succeeded(await call(s.ctx, 'session_list_models', {}, s.alice)).value as { taskHost: boolean }
-    expect(view.taskHost).toBe(true)
-    const without = succeeded(await call(s.ctx, 'session_list_models', {}, s.bob)).value as { taskHost: boolean }
-    expect(without.taskHost).toBe(false)
-  })
-
-  it('reports a provider-level catalog failure on its provider instead of an empty catalog', async () => {
-    const s = await stack({
-      modelCatalog: () => Promise.resolve({
-        default: { provider: 'mock', model: 'mock' },
-        routableProviders: ['mock'],
-        groups: [{ id: 'mock', name: 'Mock', models: [{ id: 'mock' }] }],
-        failures: [{ id: 'broken', name: 'Broken', message: 'creds missing' }],
-      }),
-    })
-    const view = succeeded(await call(s.ctx, 'session_list_models', {}, s.alice)).value as {
-      providers: { id: string; models: unknown[]; catalogError?: string }[]
-    }
-    const broken = view.providers.find(provider => provider.id === 'broken')
-    expect(broken?.models).toEqual([])
-    expect(broken?.catalogError).toContain('catalog_unavailable')
-    expect(view.providers.some(provider => provider.id === 'mock')).toBe(true)
-    const rendered = text(await call(s.ctx, 'session_list_models', {}, s.alice))
-    expect(rendered).toContain('CATALOG QUERY FAILED')
-  })
-
-  it('classifies a whole-catalog read failure as CATALOG_UNAVAILABLE, never as a model error', async () => {
-    const s = await stack({ modelCatalog: () => Promise.reject(new Error('transport down')) })
-    const result = await call(s.ctx, 'session_list_models', {}, s.alice)
-    expect(result.isError).toBe(true)
-    expect(text(result)).toContain('CATALOG_UNAVAILABLE')
-    expect(text(result)).not.toContain('MODEL_NOT_FOUND')
-    expect(text(result)).not.toContain('PROVIDER_NOT_FOUND')
-  })
-
-  it('requires the provider for an exact model filter, and filters by provider', async () => {
-    const s = await stack()
-    const orphan = await call(s.ctx, 'session_list_models', { model: 'mock' }, s.alice)
-    expect(orphan.isError).toBe(true)
-    expect(text(orphan)).toContain('requires the provider')
-    const filtered = succeeded(await call(s.ctx, 'session_list_models', { provider: 'absent-provider' }, s.alice)).value as {
-      providers: unknown[]
-    }
-    expect(filtered.providers).toEqual([])
-  })
-
-  it('keeps the model-less legacy tools untouched: no routing fields land in their output', async () => {
-    const s = await stack()
-    await grantBoth(s)
-    const result = succeeded(await call(s.ctx, 'session_send_session_message', {
-      session_id: s.bob.id,
-      message: 'legacy behavior',
-    }, s.alice)).value as Record<string, unknown>
-    expect(Object.keys(result).sort()).toEqual(['messageId', 'status'])
   })
 })

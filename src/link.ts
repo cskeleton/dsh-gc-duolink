@@ -4,7 +4,7 @@
  * @module dsh-session-link/link
  */
 
-import { createHash, randomUUID } from 'node:crypto'
+import { randomUUID } from 'node:crypto'
 import { Context, Service } from '@deepseek-ai/cordis'
 import { brandString } from '@deepseek-ai/dsh-brand'
 import { z as wire } from 'zod'
@@ -24,6 +24,7 @@ import type {
   SessionLinkLedgersData,
   SessionLinkMessageRecordData,
   SessionLinkRecordData,
+  InitialModelSpawnRecord,
 } from './spec.ts'
 import {
   SessionLinkError,
@@ -41,23 +42,15 @@ import type {
   SessionLinkSendResult,
   SessionLinkSpawnReplay,
   SessionLinkSummary,
-  SessionLinkTaskStatusReport,
-  SessionLinkTaskStatusSource,
-  SessionLinkTaskViewEntry,
-  SessionLinkTaskViewRequest,
-  SessionLinkTaskViewResponse,
   SessionLinkWakeRequest,
   SessionLinkView,
 } from './types.ts'
-import type { SessionLinkTaskRecordData } from './task-spec.ts'
-import { requestedRouteOf } from './task-runtime.ts'
 
 const wireSessionId = wire.string().min(1).transform(value => brandString<SessionId>(value))
 const wireLinkId = wire.string().min(1).transform(value => SessionLinkId(value))
 const addRequestSchema = wire.strictObject({ callerId: wireSessionId, peerId: wireSessionId, autoWake: wire.boolean(), autoWakeCaller: wire.boolean().optional() })
 const revokeRequestSchema = wire.strictObject({ callerId: wireSessionId, linkId: wireLinkId })
 const wakeRequestSchema = wire.strictObject({ callerId: wireSessionId, linkId: wireLinkId, peerId: wireSessionId, on: wire.boolean() })
-const taskViewRequestSchema = wire.strictObject({ sessionId: wireSessionId })
 
 /** Fully resolved deployment limits. */
 export interface SessionLinkLimits {
@@ -155,106 +148,9 @@ function chainRootOf(
   return current
 }
 
-/**
- * Human-readable body of one task-status report. Explicitly framed as a
- * host-generated STATUS — never an instruction, never the target Session
- * speaking: the receiver may quote the structured fields but nothing in the
- * text asks it to act.
- */
-export function renderTaskStatusText(request: SessionLinkTaskStatusReport, targetTitle: string): string {
-  const lines: string[] = [
-    `[任务状态回报] 宿主生成的任务状态事实（非会话「${targetTitle}」（${request.targetId}）的发言，也不是给本机的指令。`,
-    `任务：${request.taskId}（尝试 ${request.attemptId}，修订 ${request.revision}，事件 ${request.eventId}）。`,
-    `类别：${request.eventKind}；请求路由：${request.requestedModel.provider}/${request.requestedModel.model}${request.requestedModel.reasoningEffort === undefined ? '' : ` (effort ${request.requestedModel.reasoningEffort})`}${request.actualModel === undefined ? '' : `；实际路由：${request.actualModel.provider}/${request.actualModel.model}${request.actualModel.reasoningEffort === undefined ? '' : ` (effort ${request.actualModel.reasoningEffort})`}`}。`,
-    `候选尝试 ${request.attempts} 次${request.executionState === undefined ? '' : `；执行进度：${request.executionState}`}${request.reason === undefined ? '' : `；原因：${request.reason}`}。`,
-    `需要决策：${request.decisionRequired ? '是' : '否'}；可恢复：${request.resumable ? '是' : '否'}。`,
-    `详情通过 session_get_task 查询；如需决策，调用 session_resolve_task，task_id 填 ${request.taskId}。`,
-  ]
-  return lines.join('\n')
-}
-
-/**
- * Project one stored task row into the panel's read-only entry. The route
- * label stays honest: `persisted` is claimed only when `routeUsed` committed
- * (a turn that fell back before finishing shows the route it actually ran);
- * a session-scope task whose persist was skipped carries the skip reason and
- * `routePersisted: false`. Outbox events keep their own delivery lifecycle;
- * `pending`/`admitted` make no execution claim.
- * @param row - one stored task row the caller may read.
- * @returns the panel's projection line.
- */
-function taskEntryOf(row: SessionLinkTaskRecordData): SessionLinkTaskViewEntry {
-  const requested = requestedRouteOf(row.policy)
-  const routeWire = (route: { provider: string; model: string; reasoningEffort?: string } | undefined) =>
-    route === undefined ? undefined : {
-      provider: route.provider,
-      model: route.model,
-      ...(route.reasoningEffort === undefined ? {} : { reasoningEffort: route.reasoningEffort }),
-    }
-  return {
-    taskId: `task:${row.callerId}:${row.callId}`,
-    taskState: row.taskState,
-    revision: row.revision,
-    ...(row.executionState === undefined ? {} : { executionState: row.executionState }),
-    ...(row.reason === undefined ? {} : { reason: row.reason }),
-    ...(row.targetSessionId === undefined ? {} : { targetSessionId: row.targetSessionId }),
-    requestedModel: {
-      provider: requested.provider,
-      model: requested.model,
-      ...(requested.reasoningEffort === undefined ? {} : { reasoningEffort: requested.reasoningEffort }),
-    },
-    ...(routeWire(row.execution.currentRoute) === undefined ? {} : { currentRoute: routeWire(row.execution.currentRoute) }),
-    ...(routeWire(row.execution.routeUsed) === undefined ? {} : { routeUsed: routeWire(row.execution.routeUsed) }),
-    scope: row.policy.scope,
-    // Only a committed turn-finished route may claim persistence; a partial or
-    // waiting decision never shows a baseline label it did not earn.
-    routePersisted: row.taskState === 'turn_finished' && row.execution.routeUsed !== undefined,
-    currentlyExecuting: row.execution.currentlyExecuting === true,
-    ...(row.attempts.at(-1)?.results.at(-1) === undefined ? {} : {
-      latestIssue: {
-        ...(row.attempts.at(-1)!.results.at(-1)!.code === undefined ? {} : { code: row.attempts.at(-1)!.results.at(-1)!.code }),
-        ...(row.attempts.at(-1)!.results.at(-1)!.message === undefined ? {} : { message: row.attempts.at(-1)!.results.at(-1)!.message }),
-      },
-    }),
-    outbox: row.outbox.map(event => ({
-      eventId: event.eventId,
-      kind: event.kind,
-      status: event.status,
-      ...(routeWire(event.requestedModel) === undefined ? {} : { requestedModel: routeWire(event.requestedModel) }),
-      ...(routeWire(event.actualModel) === undefined ? {} : { actualModel: routeWire(event.actualModel) }),
-      decisionRequired: event.decisionRequired,
-      resumable: event.resumable,
-      ...(event.blockedReason === undefined ? {} : { blockedReason: event.blockedReason }),
-    })),
-    updatedAt: row.updatedAt,
-  }
-}
-
-declare module '@deepseek-ai/cordis' {
-  interface Events {
-    /**
-     * One durable mailbox/link fact changed so a previous refusal may now
-     * succeed: capacity freed (pending → delivered/cancelled/revoked/failed),
-     * a receiver took delivery, or an auto-wake/membership grant changed. The
-     * task-notification pump subscribes and schedules a coalesced pass;
-     * emission is strictly after the durable write, never from a timer.
-     * @mode emit
-     */
-    'session-link/mailbox'(): void
-  }
-}
-
-/**
- * R17 (MODEL_ROUTING_FIX_PLAN Task 4): the mailbox identity of one task-status
- * report derives from the FULL eventId through a stable hash — never a
- * lossy character-sanitize, so `review/a` and `review_a` (or any pair of
- * eventIds diverging only in non-identifier characters) hash to DISTINCT
- * message ids and can never overwrite each other. The full eventId already
- * includes arbitrary user-controlled callId characters; hashing absorbs them.
- */
-export function notificationMessageId(eventId: string): SessionLinkMessageId {
-  const hex = createHash('sha256').update(`task-report\0${eventId}`).digest('hex')
-  return SessionLinkMessageId(`task-report-${hex.slice(0, 32)}`)
+/** Presence of either old report marker prevents normal peer execution. */
+function legacyTaskReport(record: SessionLinkMessageRecordData): boolean {
+  return record.statusKind !== undefined || record.taskStatus !== undefined
 }
 
 /**
@@ -391,7 +287,6 @@ export class SessionLinkService extends TypertRemoteService {
       }
       await this.links.put(options.linkId, next)
       await this.revokeUndelivered(options.linkId, unique)
-      this.mailboxSettled()
       return { id: options.linkId, record: next }
     }
     if (options.requireNewPair === true) {
@@ -413,7 +308,6 @@ export class SessionLinkService extends TypertRemoteService {
       grantedBy: grant,
     }
     await this.links.put(id, record)
-    this.mailboxSettled()
     return { id, record }
   }
 
@@ -441,7 +335,6 @@ export class SessionLinkService extends TypertRemoteService {
       }
       await this.links.delete(linkId)
       await this.revokeUndelivered(linkId, [])
-      this.mailboxSettled()
     })
   }
 
@@ -523,7 +416,6 @@ export class SessionLinkService extends TypertRemoteService {
       updatedAt: new Date().toISOString(),
     }
     await this.links.put(linkId, next)
-    this.mailboxSettled()
     return { id: linkId, record: next }
   }
 
@@ -662,36 +554,6 @@ export class SessionLinkService extends TypertRemoteService {
   }
 
   /**
-   * Remote: the read-only task projection the human panel polls. Lists every
-   * durable tracked task the managing Session may read (its own tasks + those
-   * targeting it), newest first, with the route/outbox facts the cards
-   * already carry. Read-only: no wake, no decision, no outbox scan beyond
-   * the task rows' own stored events. The task service is optional in stacks
-   * without the tracked layer; its absence yields an empty projection, never
-   * an error the panel would have to special-case.
-   * @param request - the managing Session identity; callers only ever see
-   *   tasks whose caller or target matches it.
-   * @returns the projection and the configured poll interval.
-   */
-  @Remote('taskView')
-  async taskView(request: SessionLinkTaskViewRequest): Promise<SessionLinkTaskViewResponse> {
-    request = taskViewRequestSchema.parse(request)
-    let service: Context['sessionLinkTasks'] | undefined
-    try {
-      service = this.ctx.sessionLinkTasks
-    } catch {
-      service = undefined
-    }
-    if (service === undefined) return { pollIntervalMs: this.uiPollIntervalMs, tasks: [] }
-    const entries = service.listRows()
-      .filter(row => row.callerId === request.sessionId
-        || (row.targetSessionId !== undefined && row.targetSessionId === request.sessionId))
-      .map(row => taskEntryOf(row))
-      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt) || left.taskId.localeCompare(right.taskId))
-    return { pollIntervalMs: this.uiPollIntervalMs, tasks: entries }
-  }
-
-  /**
    * Read what earlier attempts of one spawn call recorded, creating and
    * linking nothing. Recognizes this version's spawn ledger and, for calls
    * made by earlier versions, the first task admitted under the call id as
@@ -714,6 +576,40 @@ export class SessionLinkService extends TypertRemoteService {
     }
     if (spawn === undefined) return undefined
     return { sessionId: spawn.sessionId, linkId: spawn.linkId, removed: this.spawnRemoved(spawn, callerId) }
+  }
+
+  /** Read the immutable bootstrap intent, without activating or changing a model. */
+  initialModelSpawn(callerId: SessionId, callKey: string): InitialModelSpawnRecord | undefined {
+    return this.readLedgers().initialModelSpawns[`${callerId}:${callKey}`]
+  }
+
+  /** Reserve the exact request before any Session write, in the existing ledger chain. */
+  async reserveInitialModelSpawn(callerId: SessionId, callKey: string, next: InitialModelSpawnRecord): Promise<InitialModelSpawnRecord> {
+    return await this.chain(async () => {
+      if (this.disposed) throw new SessionLinkError('Session Link service is disposing', 'DISPOSED')
+      const key = `${callerId}:${callKey}`
+      const ledger = this.readLedgers()
+      const prior = ledger.initialModelSpawns[key]
+      if (prior !== undefined) {
+        if (prior.digest !== next.digest) throw new Error('INITIAL_MODEL_REPLAY_CONFLICT: this call already reserved different spawn parameters')
+        return prior
+      }
+      if (this.spawnReplay(callerId, callKey) !== undefined) throw new Error('INITIAL_MODEL_REPLAY_CONFLICT: an ordinary spawn cannot be replayed with initial_model')
+      await this.writeLedgers({ ...ledger, initialModelSpawns: { ...ledger.initialModelSpawns, [key]: next } })
+      return next
+    })
+  }
+
+  /** Commit one proven bootstrap fact; never holds this chain during Agent activation. */
+  async confirmInitialModelSpawn(callerId: SessionId, callKey: string, digest: string, fact: 'headerCreated' | 'seedConfirmed'): Promise<void> {
+    await this.chain(async () => {
+      if (this.disposed) throw new SessionLinkError('Session Link service is disposing', 'DISPOSED')
+      const key = `${callerId}:${callKey}`
+      const ledger = this.readLedgers()
+      const prior = ledger.initialModelSpawns[key]
+      if (prior === undefined || prior.digest !== digest) throw new Error('INITIAL_MODEL_REPLAY_CONFLICT: bootstrap intent no longer matches')
+      await this.writeLedgers({ ...ledger, initialModelSpawns: { ...ledger.initialModelSpawns, [key]: { ...prior, [fact]: true } } })
+    })
   }
 
   /**
@@ -867,33 +763,6 @@ export class SessionLinkService extends TypertRemoteService {
         return
       }
       await this.messages.put(messageId, { ...record, status: 'cancelled' })
-      this.mailboxSettled()
-    })
-  }
-
-  /**
-   * R08(1) (MODEL_ROUTING_FIX_PLAN Task 3): adopt an ALREADY-CONSUMED tracked
-   * delivery's next-attempt identity. The SOLE effect is renaming the stored
-   * record's idempotency key `<callKey> → <callKey>/consumed` so the wire
-   * layer's replay of the ORIGINAL call key never re-admits this delivery as
-   * the new attempt's own. Status, target, and delivery facts stay exactly
-   * what the mailbox already recorded — a consumed (delivered) message stays
-   * delivered; the consumed namespace prevents phantom `queued` projections
-   * without letting any new identity silently disappear either.
-   *
-   * Best-effort caller contract: the caller invokes this only for messages
-   * that are NOT pending (delivered/cancelled terminal realms); a pending
-   * record is left untouched (its honest cancellation is the R03 path).
-   * @param messageId - the stored delivery the new attempt supersedes.
-   * @param aliasKey - the consumed-namespace key (`<callKey>/consumed`).
-   */
-  async markRetried(messageId: SessionLinkMessageId, aliasKey: string): Promise<void> {
-    await this.chain(async () => {
-      const record = this.messages.get(messageId)
-      if (record === undefined) return
-      if (record.status === 'pending') return
-      if (record.idempotencyKey === aliasKey) return
-      await this.messages.put(messageId, { ...record, idempotencyKey: aliasKey })
     })
   }
 
@@ -950,18 +819,6 @@ export class SessionLinkService extends TypertRemoteService {
     return run
   }
 
-  /**
-   * R14: announce one durable retry-condition change (capacity freed,
-   * receiver moved pending mail to delivered, grant changed). Listeners —
-   * the task outbox pump — coalesce bursts themselves; this service just
-   * reports transitions, never deciding what may retry. Emission happens
-   * strictly AFTER the durable write that settles the transition.
-   */
-  private mailboxSettled(): void {
-    if (this.disposed) return
-    this.ctx.emit('session-link/mailbox')
-  }
-
   /** Admission plus one immediate delivery leg, in one serialized chain slot. */
   private async admission(
     caller: Agent,
@@ -986,7 +843,7 @@ export class SessionLinkService extends TypertRemoteService {
     if (this.ctx.workspaceRegistry.archivedSessionIds.includes(targetId)) {
       throw new SessionLinkError(`session "${targetId}" is archived`, 'TARGET_ARCHIVED')
     }
-    const messageId = request.messageId ?? SessionLinkMessageId(`session-link-message-${randomUUID()}`)
+    const messageId = SessionLinkMessageId(`session-link-message-${randomUUID()}`)
     const senderTitle = this.titleOf(caller)
     const framed = frameSessionLinkText({ senderTitle, senderId: caller.id, messageId, text: request.text })
     if (Buffer.byteLength(framed, 'utf8') > this.resolved.maxMessageBytes) {
@@ -1045,6 +902,9 @@ export class SessionLinkService extends TypertRemoteService {
   private async deliverStored(messageId: SessionLinkMessageId, signal: AbortSignal | undefined): Promise<SessionLinkSendResult> {
     const record = this.messages.get(messageId)
     if (record === undefined) throw new SessionLinkError(`message "${messageId}" not found`, 'MESSAGE_NOT_FOUND')
+    if (legacyTaskReport(record)) {
+      throw new SessionLinkError(`legacy experimental report "${messageId}" is retained but blocked from peer delivery; inspect the old profile before migration`, 'LEGACY_TASK_MESSAGE_BLOCKED')
+    }
     try {
       await this.deliverTarget(record.targetId, { wakeFor: messageId, ...(signal === undefined ? {} : { signal }) })
     } catch (error: unknown) {
@@ -1080,7 +940,6 @@ export class SessionLinkService extends TypertRemoteService {
       const record = this.messages.get(options.wakeFor)
       if (record?.status !== 'pending' || this.mayBeHeld(options.wakeFor, record, target, recorded)) return
       await this.messages.put(options.wakeFor, { ...record, status: 'cancelled' })
-      this.mailboxSettled()
       throw signal.reason
     }
     await cancelIfAborted()
@@ -1091,7 +950,6 @@ export class SessionLinkService extends TypertRemoteService {
       if (link === undefined || !link.memberIds.includes(record.senderId) || !link.memberIds.includes(record.targetId)) {
         // The grant vanished under a message the target does not hold: tombstone rather than retry forever.
         await this.messages.put(messageId, { ...record, status: 'revoked' })
-        this.mailboxSettled()
         continue
       }
       queue.push(messageId)
@@ -1222,18 +1080,6 @@ export class SessionLinkService extends TypertRemoteService {
   private inputFor(messageId: SessionLinkMessageId): ReturnType<typeof createUserMessage> {
     const record = this.messages.get(messageId)
     if (record === undefined) throw new SessionLinkError(`message "${messageId}" not found`, 'MESSAGE_NOT_FOUND')
-    if (record.statusKind === 'task-status') {
-      if (record.taskStatus === undefined) throw new SessionLinkError(`task-status message "${messageId}" lost its status record`, 'MESSAGE_NOT_FOUND')
-      const source: SessionLinkTaskStatusSource = {
-        kind: 'session-task-status',
-        messageId,
-        linkId: record.linkId,
-        taskId: record.taskStatus.taskId as SessionLinkTaskStatusSource['taskId'],
-        targetSessionId: record.senderId,
-        attemptId: record.taskStatus.attemptId,
-      }
-      return createUserMessage({ content: [{ type: 'text', text: record.text }], source })
-    }
     const source: SessionLinkMessageSource = {
       kind: 'session-link-message',
       messageId,
@@ -1246,141 +1092,13 @@ export class SessionLinkService extends TypertRemoteService {
   }
 
   /**
-   * Trusted INTERNAL admission of one host-generated task-status report over
-   * the REAL mailbox path (Task 5 of the model-routing plan). Only this
-   * explicit entry exists; it never opens an arbitrary-senderId admission
-   * surface — the caller forwards strictly its own durable outbox facts and
-   * the task pair it owns. Everything the public `send` enforces (chain
-   * serialization, group membership, archived targets, residency, per-target
-   * pending budget, per-message wake budget, per-chain budget through the
-   * supplied inReplyTo root, daily wake ledger, admission-order delivery) is
-   * enforced here identically.
-   *
-   * Attribution: the message is stamped `statusKind: 'task-status'` and a
-   * `source.kind === 'session-task-status'` at delivery, so the receiving
-   * side attributes it honestly to the host-generated task status of the
-   * ORIGINAL task — never as the target Session speaking, never as an
-   * instruction. The body is a human-readable status text plus structured
-   * fields the receiver quotes; nothing about it asks the receiver to act.
-   *
-   * Idempotency: `eventId` is the admission key. A replay re-attempts
-   * delivery of the stored message under the recorded identity instead of
-   * admitting a second copy (restart-safe dedupe across the task row's own
-   * outbox marker in the task service and this mailbox row).
-   */
-  async admitTaskStatus(request: SessionLinkTaskStatusReport): Promise<SessionLinkSendResult> {
-    return await this.chain(() => this.admissionTaskStatus(request))
-  }
-
-  /** Serialized admission of one task-status report. */
-  private async admissionTaskStatus(request: SessionLinkTaskStatusReport): Promise<SessionLinkSendResult> {
-    if (this.disposed) throw new SessionLinkError('Session Link service is disposing', 'DISPOSED')
-    if (request.callerId === request.targetId) {
-      throw new SessionLinkError('a Session cannot report a task to itself', 'LINK_SELF')
-    }
-    const prior = this.findAdmitted(request.targetId, `task-event:${request.eventId}`)
-    if (prior !== undefined) return await this.deliverStored(prior, undefined)
-    const link = this.requireMembership(request.targetId, request.callerId)
-    const liveTarget = this.ctx.agents.get(request.callerId)
-    if (liveTarget !== undefined) this.assertOrdinaryTarget(request.callerId, liveTarget.session.header)
-    if (this.ctx.workspaceRegistry.archivedSessionIds.includes(request.callerId)) {
-      throw new SessionLinkError(`session "${request.callerId}" is archived`, 'TARGET_ARCHIVED')
-    }
-    // Compute the status body and the target attribution ONCE: both the byte
-    // budget and the durable row read the same strings (a second render would
-    // also re-resolve the title).
-    const targetTitle = this.titleOfSession(request.targetId)
-    const text = renderTaskStatusText(request, targetTitle)
-    if (Buffer.byteLength(text, 'utf8') > this.resolved.maxMessageBytes) {
-      throw new SessionLinkError(`task-status message exceeds ${this.resolved.maxMessageBytes} bytes`, 'MESSAGE_TOO_LARGE')
-    }
-    let inReplyTo: SessionLinkMessageId | undefined
-    let chainLength = 1
-    if (request.inReplyTo !== undefined) {
-      const original = this.messages.get(request.inReplyTo)
-      if (original === undefined) {
-        /* R18: the root may be a HOST-MINTED task delivery identity the
-         * mailbox never admitted — a precheck-failed task's notifications
-         * thread the root its durable intent row minted at FIRST admission
-         * (the deterministic attempt-1 delivery identity; Task 4), which no
-         * mailbox write ever reached. Thread it anyway: the root identity is
-         * not fabricated per event, it is the task's single durable root, and
-         * the per-chain wake budget keys on the root id through
-         * {@link rootIdOf} — threading is what keeps the task's whole
-         * notification lifecycle on ONE chain (chainLength stays 1: no parent
-         * chain existed to extend). */
-        inReplyTo = request.inReplyTo
-      } else if (original.targetId === request.targetId && original.senderId === request.callerId) {
-        inReplyTo = request.inReplyTo
-        chainLength = original.chainLength + 1
-      } else {
-        /* A root the mailbox recorded for a DIFFERENT pair is never threaded
-         * onto this report — the report stays admissible on its own chain
-         * rather than riding a foreign root's budget. */
-      }
-    }
-    const pendingForTarget = this.pendingFor(request.callerId).length
-    if (pendingForTarget >= this.resolved.maxPendingPerTarget) {
-      throw new SessionLinkError(
-        `session "${request.callerId}" already has ${pendingForTarget} pending peer messages`,
-        'MAILBOX_FULL',
-      )
-    }
-    const messageId = notificationMessageId(request.eventId)
-    /* R17 put-time conflict validation: the id must name THIS event. A stored
-     * row whose event differs (a genuine digest collision, or corruption)
-     * refuses loudly — NEVER overwrite one event's report with another's. The
-     * same-event replay never reaches here (the idempotency probe above
-     * adopts it), so a same-id row at put time is always a different event. */
-    const existingRow = this.messages.get(messageId)
-    if (existingRow !== undefined && existingRow.taskStatus?.eventId !== request.eventId) {
-      throw new SessionLinkError(
-        `task-status message "${messageId}" already names a different event ("${existingRow.taskStatus?.eventId ?? '<non-task row>'}"); refusing to overwrite`,
-        'MESSAGE_UNDELIVERABLE',
-      )
-    }
-    const record: SessionLinkMessageRecordData = {
-      linkId: link.id,
-      senderId: request.targetId,
-      senderTitle: targetTitle,
-      targetId: request.callerId,
-      ...(inReplyTo === undefined ? {} : { inReplyTo }),
-      text,
-      status: 'pending',
-      wakesUsed: 0,
-      chainLength,
-      attempts: 0,
-      createdAt: new Date().toISOString(),
-      seq: this.nextSeq(),
-      statusKind: 'task-status',
-      taskStatus: {
-        taskId: request.taskId,
-        attemptId: request.attemptId,
-        eventId: request.eventId,
-        revision: request.revision,
-        kind: request.eventKind,
-        ...(request.executionState === undefined ? {} : { executionState: request.executionState }),
-        ...(request.reason === undefined ? {} : { reason: request.reason }),
-        requestedModel: request.requestedModel,
-        ...(request.actualModel === undefined ? {} : { actualModel: request.actualModel }),
-        attempts: request.attempts,
-        decisionRequired: request.decisionRequired,
-        resumable: request.resumable,
-      },
-      idempotencyKey: `task-event:${request.eventId}`,
-    }
-    await this.messages.put(messageId, record)
-    return await this.deliverStored(messageId, undefined)
-  }
-
-  /**
    * Pending messages for one target in admission order: the monotonic
    * admission sequence, falling back to the timestamp for messages admitted
    * before 0.4.0 carried one.
    */
   private pendingFor(targetId: SessionId): [SessionLinkMessageId, SessionLinkMessageRecordData][] {
     return [...this.messages.entries()]
-      .filter(([, record]) => record.status === 'pending' && record.targetId === targetId)
+      .filter(([, record]) => record.status === 'pending' && record.targetId === targetId && !legacyTaskReport(record))
       .sort(([, left], [, right]) => left.seq !== undefined && right.seq !== undefined
         ? left.seq - right.seq
         : left.createdAt.localeCompare(right.createdAt))
@@ -1474,7 +1192,6 @@ export class SessionLinkService extends TypertRemoteService {
     const record = this.messages.get(messageId)
     if (record === undefined || record.status !== 'pending') return
     await this.messages.put(messageId, { ...record, status: 'delivered' })
-    this.mailboxSettled()
   }
 
   /** Record a failed immediate leg; never terminal from a single attempt. */
@@ -1482,20 +1199,21 @@ export class SessionLinkService extends TypertRemoteService {
     const record = this.messages.get(messageId)
     if (record === undefined || record.status !== 'pending' || record.inserted === true) return
     const attempts = record.attempts + 1
-    if (attempts >= this.resolved.maxDeliveryAttempts) {
-      await this.messages.put(messageId, { ...record, attempts, status: 'failed', error })
-      this.mailboxSettled()
-      return
-    }
-    await this.messages.put(messageId, { ...record, attempts, error })
+    await this.messages.put(messageId, attempts >= this.resolved.maxDeliveryAttempts
+      ? { ...record, attempts, status: 'failed', error }
+      : { ...record, attempts, error })
   }
 
   /** Service-start recovery: replay pending mail for any already-live target. */
   private async recoverPending(): Promise<void> {
     const targets = new Set<SessionId>()
+    let blocked = 0
     for (const [, record] of this.messages.entries()) {
-      if (record.status === 'pending') targets.add(record.targetId)
+      if (record.status !== 'pending') continue
+      if (legacyTaskReport(record)) { blocked += 1; continue }
+      targets.add(record.targetId)
     }
+    if (blocked > 0) this.ctx.logger.warn(`session-link: ${blocked} legacy experimental reports retained without delivery or wake; inspect this profile before migration`)
     for (const targetId of targets) {
       await this.tryDeliverPending(targetId)
     }
@@ -1511,7 +1229,6 @@ export class SessionLinkService extends TypertRemoteService {
 
   /** Tombstone undelivered messages whose link membership no longer pairs sender and target. */
   private async revokeUndelivered(linkId: SessionLinkId, memberIds: readonly SessionId[]): Promise<void> {
-    let tombstoned = false
     for (const [messageId, record] of this.messages.entries()) {
       if (record.linkId !== linkId || record.status !== 'pending') continue
       const stillGranted = memberIds.includes(record.senderId) && memberIds.includes(record.targetId)
@@ -1519,9 +1236,7 @@ export class SessionLinkService extends TypertRemoteService {
       // Possibly held by the target: not recalled, confirmed by a later flush.
       if (this.mayBeHeld(messageId, record, this.ctx.agents.get(record.targetId))) continue
       await this.messages.put(messageId, { ...record, status: 'revoked' })
-      tombstoned = true
     }
-    if (tombstoned) this.mailboxSettled()
   }
 
   /** Require a live membership edge between caller and target. */
@@ -1537,7 +1252,7 @@ export class SessionLinkService extends TypertRemoteService {
 
   /** Read the durable ledgers row, defaulting to empty. */
   private readLedgers(): SessionLinkLedgersData {
-    return this.ledgers.get(SESSION_LINK_LEDGER_KEY) ?? { idempotency: {}, wakes: {}, spawns: {} }
+    return this.ledgers.get(SESSION_LINK_LEDGER_KEY) ?? { idempotency: {}, wakes: {}, spawns: {}, initialModelSpawns: {} }
   }
 
   /** Persist one ledgers row. */
@@ -1549,13 +1264,6 @@ export class SessionLinkService extends TypertRemoteService {
   private titleOf(agent: Agent): string {
     const titles = this.ctx.get('sessionTitle')
     return titles?.get(agent.session)?.title ?? String(agent.id)
-  }
-
-  /** Human-facing label for one Session id (task-status attribution). */
-  private titleOfSession(sessionId: SessionId): string {
-    const titles = this.ctx.get('sessionTitle')
-    const live = this.ctx.sessions?.get(sessionId)
-    return (live !== undefined ? titles?.get(live)?.title : undefined) ?? String(sessionId)
   }
 }
 
@@ -1601,19 +1309,14 @@ function recordedIds(target: Agent): Set<string> {
   const ids = new Set<string>()
   // oxlint-disable-next-line typescript/no-deprecated -- Existing Session history read; migration deferred.
   for (const event of target.session.snapshotEvents(target.session.inheritedEventCount)) {
-    if (event.type === 'user/message'
-      && (event.data.source.kind === 'session-link-message' || event.data.source.kind === 'session-task-status')) {
-      const source = event.data.source as { kind: string; messageId?: string }
-      if (source.messageId !== undefined) ids.add(source.messageId)
+    if (event.type === 'user/message' && event.data.source.kind === 'session-link-message') {
+      ids.add(event.data.source.messageId)
       continue
     }
     if (event.type !== 'agent/inbox/spliced') continue
     for (const message of event.data.inserted) {
       const source = (message as { source?: { kind?: string; messageId?: string } }).source
-      if ((source?.kind === 'session-link-message' || source?.kind === 'session-task-status')
-        && source.messageId !== undefined) {
-        ids.add(source.messageId)
-      }
+      if (source?.kind === 'session-link-message' && source.messageId !== undefined) ids.add(source.messageId)
     }
   }
   return ids

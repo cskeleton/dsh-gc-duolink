@@ -1,3 +1,12 @@
+# Current installed results — 0.5.0 / 2026-10-13
+
+Official DSH 0.2.0-rc.2 native proof: PASS, 19 mock / 0 paid calls. Packed initial-model tools: PASS, 30 mock / 0 paid calls. Packed Web/Brave smoke: PASS, 0 model calls; five tools are scoped, explicit IDs adopt, invalid plugin configuration leaves core usable, and removed plugin histories remain readable. Current light/dark screenshots were visually inspected. Electron is NOT_RUN.
+
+Full commands, artifact links and evidence boundaries are in [VERIFICATION.md](../../VERIFICATION.md); machine-readable results are under `output/`. No user profile was switched. The previous record below is retained as history.
+
+<details>
+<summary>Earlier installed-smoke record</summary>
+
 # Shipped-runtime verification
 
 ## Model-routing verification round (2026-10-12) — PASS
@@ -36,3 +45,5 @@ An invalid `uiPollIntervalMs: 1` configuration produced an explicit `3 entries d
 The runner closed its browser and server and removed its temporary home. The light, dark, and refresh-error screenshots were visually inspected and showed readable controls with no clipping. Screenshots are under `output/playwright/`: `session-link-light.png`, `session-link-dark.png`, `session-link-refresh-error.png`, and `session-link-invalid-config.png`.
 
 Electron launch, future DSH releases, and live model-driven message exchange were not run by this browser smoke. Non-human peer messages are checked through the history API; the Chat pane displays the ordinary human message in each seeded Session.
+
+</details>

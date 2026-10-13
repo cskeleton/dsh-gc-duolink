@@ -1,3 +1,72 @@
+# Verification — 0.5.0 plugin-only initial model
+
+日期：2026-10-13。本节是当前验收；下方折叠内容保留旧实验版历史，不构成本版依赖或需求。实施决策与任务关闭见 [PLUGIN_ONLY_EXECUTION.md](PLUGIN_ONLY_EXECUTION.md)。
+
+## 当前结果
+
+| 检查 | 当前证据 |
+|---|---|
+| 官方 SDK build / typecheck | PASS；清除 DSH_SOURCE_ROOT，官方开发 peers 0.2.0-rc.2；最终 build 含 TypeScript 声明编译 |
+| pnpm test 默认入口 | PASS；client 56，initial-model 55，built contracts 3；同时运行以下两个官方 integration suites |
+| 官方 native bootstrap | PASS；19 次实际 mock adapter 请求，0 次收费；不安装 Session Link、不替换 controller/persistence/preset |
+| 官方 packed tools | PASS；30 次实际 mock adapter 请求，0 次收费；安装 0.5.0 tarball，实际注册工具、native create/selection owner、JSONL persistence |
+| 原功能辅助 host suite | PASS；120 tests / 4 files：link、remote、tool-session-link、command-session-link；source checkout 仅用于未发布 testkit，不是选模发行依据 |
+| packed Web browser smoke | PASS；Brave；header/panel/wake/poll/theme/reload/invalid config/remove、五工具 scope、明确 ID adopt；0 model calls；明暗截图已人工核对 |
+| diff / 运行依赖 | PASS；git diff --check；生产源码无 taskHost factory/runtime/tasks/outbox/决策工具引用、无私有 deep import或宿主路径；退役字段仅用于拒绝迁移 |
+| Desktop Electron / 付费模型 | NOT_RUN；没有启动/切换用户 Desktop，没有真实远端模型鉴权或收费请求 |
+| 旧 tracked-task profile 迁移 | NOT_RUN；本轮不做现用 profile 切换、降级、迁移或历史数据清理 |
+
+单位、客户端、契约与辅助 host 合计 234 项检查通过。取消功能的旧任务状态机/宿主扩展套件已退休；不以原 359 项计数作为新版目标。
+
+## 可复跑命令
+
+```sh
+env -u DSH_SOURCE_ROOT pnpm typecheck
+env -u DSH_SOURCE_ROOT pnpm build
+env -u DSH_SOURCE_ROOT pnpm test
+DSH_SOURCE_ROOT=/Users/gc/Dev/Opensource/deepseek-harness pnpm test:host
+BROWSER_EXECUTABLE_PATH='/Applications/Brave Browser.app/Contents/MacOS/Brave Browser' pnpm test:integration
+git diff --check
+```
+
+默认 `pnpm test` 已包含 native 与 packed initial-model suites；不需要重复执行 installed suite才能满足默认门禁。复跑环境必须是已安装官方 DSH；runner 记录包版本、entrypoint/manifest realpath 与 controller 公共导出，拒绝 createTaskHost 扩展，并清除 DSH_SOURCE_ROOT/NODE_PATH/NODE_OPTIONS。所有验证 profile 都是临时隔离实例，测试完成后关闭并删除；没有触碰宿主 checkout 或用户运行 profile。
+
+## 实际请求与故障边界
+
+Native：detached Session prepare/append → persistence append/flush/close → read 确认 → native create/adopt。调用方 BASE 显式 effort low、B 省略 effort 且模型默认 high（实际请求必须为 high），以及首次请求、工具第二步、随后 turn、并发 A/B/BASE、首响应前后重启、原生改 C 与重启保留均验证了 adapter request provider/model/effort 和 prompt 内容。seed/execute 后 application 内存默认及 profile/overlay 的原始字节均保持，包含异步保存队列落定后。
+
+Packed：严格目录和 effort、schema/旧参数拒绝、send 无选模、完整正文后缀/模型/授权变化冲突、普通调用不得补模型、解除不复活、ID 碰撞、相同调用首次并发只投递一次、有/无模型竞争两个方向、原生 C 后同调用重放保留 C、卸载后原生恢复均通过。生产 renderer 的第二 text 是可解析 JSON；initialModel 是初始事实，不冒充当前模型或执行成功。
+
+单位测试补充真实安装不强行模拟的 I/O 故障：create/append/flush/close/activate、取消、confirmed receipt 后读取失败、未链接 intent、旧 preset 后续不可解析、未知事件/非普通身份/ownership、完整摘要与单飞。它们证明插件编排的拒绝与恢复规则；不把这些 mock 当作真实磁盘断电测试。
+
+应用默认只允许在 fixture 后续模拟人类原生选择 C 时按宿主行为改变；spawn 的隔离阶段没有改后恢复。插件卸载前后的运行选择由原生事件/请求头保留。未增加第二 controller、selection setter、request/assemble 覆盖 listener 或自动换模。
+
+## 产物
+
+- [native proof JSON](output/initial-model-proof-result.json)
+- [packed tools JSON](output/initial-model-installed-result.json)
+- [browser smoke JSON](output/playwright/installed-smoke-result.json)
+- [light screenshot](output/playwright/session-link-light.png) / [dark screenshot](output/playwright/session-link-dark.png)
+- [baseline 44-file manifest](output/plugin-only-baseline-manifest.json)
+- 本地安装包：`output/dsh-session-link-0.5.0.tgz`（仅交付，未安装到用户 profile）。
+
+以上 output 是本地产物，不提交入 Git。0.5.0 以 master 上的前向提交取代 549a1d7 的实验实现，保留旧提交和计划／审查；历史处理见 [ADR-001](docs/decisions/001-plugin-only-initial-model.md)。
+
+## 本轮审查修复（2026-10-13）
+
+- 保留历史 statusKind/taskStatus JSON 元数据，过滤所有带标记的报告：重启恢复和普通消息触发投递均不插入、不唤醒，显式重放返回 LEGACY_TASK_MESSAGE_BLOCKED。三项新增 host 回归使用同一持久存储重启，核对原记录完整保留及普通邮件仍可送达。此防护不覆盖未标记任务邮件或宿主专属事件，不能据此直接降级旧 tracked profile。
+- 官方 fixtures 让调用方 BASE 显式 low、B 模型默认 high；B 初始选择和工具参数均省略 effort。首请求、工具步骤、后续 turn 和恢复后的真实请求均由 adapter 断言为 high，排除了继承调用方的可能。
+- 空会话 ownership 未确认冲突的报错明确说明崩溃窗口与人工检查；保持保留数据、不自动修复/删除的设计。
+- 两个 bootstrap peers 已标 optional，built contract 验证 manifest。普通 spawn 的并发异参错误改为通用 SPAWN_REPLAY_CONFLICT；完成后的原重放规则仍保持。
+- 本轮重新执行 build、typecheck、默认 pnpm test（56/55/3）、host 120 项及 diff 检查；native 19 / packed 30 mock 请求，paid 0。没有修改 UI，Brave smoke 未在本轮重复，表中该项仍为上一轮已执行证据；Desktop 仍为 NOT_RUN。
+
+## 用户初步测试与文档交付（2026-10-13）
+
+用户反馈“初步测试通过”，未说明具体平台、profile 或覆盖步骤，记录为用户反馈而非自动验收，不据此宣称 Electron／远端付费模型已测试。新增中英文 README 和普通 0.4.1／实验 0.4.1 升级区别；旧实验计划标为历史，宿主 checkout 的未提交扩展留在原处，不纳入本插件提交或清理。
+
+<details>
+<summary>旧 0.4.1 / task-routing 实验历史（非当前验收）</summary>
+
 # Verification — dsh-session-link 0.4.1 workspace
 
 ## Current round — model-routing post-review state (2026-10-13)
@@ -186,3 +255,5 @@ The contract tests inspect the actual built host methods' `request` and final `s
 Screenshots of the actual app were visually inspected in both themes. Detailed installed-smoke evidence is in [tests/integration/RESULTS.md](tests/integration/RESULTS.md); rerun instructions are in [README.md](README.md#开发与验证). Screenshots live in `output/playwright/`.
 
 UI changes in another window or from a command use polling, defaulting to 30 seconds; acknowledged writes refresh immediately. The plugin's `uiConversation` tail card is optional. Existing fork implementations must be disabled before activating the external plugin in the same profile.
+
+</details>

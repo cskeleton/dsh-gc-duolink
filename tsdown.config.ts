@@ -3,7 +3,7 @@ import { defineConfig } from 'tsdown'
 export default defineConfig([
   {
     name: 'dsh-session-link',
-    entry: { index: 'lib/types/index.js', tools: 'lib/types/tools.js', command: 'lib/types/command.js', tasks: 'lib/types/service-tasks.js' },
+    entry: ['lib/types/index.js', 'lib/types/tools.js', 'lib/types/command.js'],
     outDir: 'lib', format: ['esm'], fixedExtension: false,
     platform: 'node', target: 'es2024', dts: false, clean: false, minify: false,
     deps: { neverBundle: [/^@deepseek-ai\//, /^zod($|\/)/] },

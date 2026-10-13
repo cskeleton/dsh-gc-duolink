@@ -212,7 +212,7 @@ try {
   await writeFile(toolVerifier, [
     "import assert from 'node:assert/strict'",
     "export const inject = ['tools', 'agents', 'appReady', 'sessionLinks']",
-    "const names = ['session_list_links', 'session_send_session_message', 'session_cancel_session_message', 'session_spawn_linked_session']",
+    "const names = ['session_list_links', 'session_send_session_message', 'session_cancel_session_message', 'session_spawn_linked_session', 'session_list_models']",
     'export function apply(ctx) {',
     '  ctx.effect(() => ctx.appReady.onReady(() => {',
     "    for (const name of names) assert.equal(ctx.tools.get(name), undefined, `Global tool layer exposes ${name}`)",
@@ -346,7 +346,7 @@ async function runScenario({ page, rpc, requireRpc, eventually, selectSession, a
   await eventually(async () => await peerWake.getAttribute('aria-checked') === 'false', 'background mutation becomes visible through polling')
   const commands = await requireRpc('commands/list', undefined, { args: { agentId: alphaId } })
   assert.ok(commands.some(command => command.name === 'session-link'), 'session-link command is visible to the resumed ordinary Session')
-  await eventually(async () => output.includes(`SESSION_LINK_AGENT ${alphaId} preset=standard tools=4`), 'all four tools mount in the standard-preset Agent scope')
+  await eventually(async () => output.includes(`SESSION_LINK_AGENT ${alphaId} preset=standard tools=5`), 'all five tools mount in the standard-preset Agent scope')
   const minimal = await requireRpc('session/create', { cwd: workspace, agentPreset: 'minimal' })
   assert.equal(minimal.agentPreset, 'minimal')
   const minimalCommands = await requireRpc('commands/list', undefined, { args: { agentId: minimal.sessionId } })

@@ -1,6 +1,6 @@
 {
   "name": "dsh-session-link",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "private": true,
   "description": "Independent Session Link plugin for DeepSeek Harness desktop and web",
   "license": "MIT",
@@ -20,10 +20,6 @@
       "types": "./lib/types/command.d.ts",
       "default": "./lib/command.js"
     },
-    "./tasks": {
-      "types": "./lib/types/service-tasks.d.ts",
-      "default": "./lib/tasks.js"
-    },
     "./types": {
       "types": "./lib/types/types.d.ts",
       "default": "./lib/types/types.js"
@@ -35,6 +31,7 @@
     "lib",
     "cordis.patch.yml",
     "README.md",
+    "README.en.md",
     "LICENSE",
     "VERIFICATION.md",
     "tests/integration/README.md",
@@ -61,7 +58,9 @@
     "@deepseek-ai/dsh-tools": "*",
     "@deepseek-ai/dsh-typert-protocol": "*",
     "@deepseek-ai/dsh-workspace": "*",
-    "@deepseek-ai/schemastery": "*"
+    "@deepseek-ai/schemastery": "*",
+    "@deepseek-ai/dsh-agent-preset-registry": "*",
+    "@deepseek-ai/dsh-session-persistence": "*"
   },
   "dependencies": {
     "zod": "4.4.3"
@@ -103,18 +102,28 @@
     "tsdown": "0.22.2",
     "typescript": "6.0.3",
     "vite": "8.0.16",
-    "vitest": "4.1.8"
+    "vitest": "4.1.8",
+    "@deepseek-ai/dsh-session-persistence": "0.2.0-rc.2"
   },
   "scripts": {
     "sdk:configure": "node scripts/configure-sdk.mjs",
     "build": "node scripts/configure-sdk.mjs && node scripts/clean-build.mjs && tsc -p tsconfig.build.json && tsdown",
     "typecheck": "node scripts/configure-sdk.mjs && tsc -p tsconfig.build.json --noEmit",
-    "test": "pnpm run test:client && pnpm run test:policy && pnpm run test:contracts",
+    "test": "pnpm run test:client && pnpm run test:initial-model && pnpm run test:initial-model-installed && pnpm run test:contracts",
     "test:integration": "node tests/integration/installed-smoke.mjs",
     "test:contracts": "node --test tests/built-contract.test.mjs",
-    "test:client": "vitest run tests/client-turn.spec.tsx tests/client-panel.spec.tsx tests/client-state.spec.ts tests/client-registration.spec.ts tests/scope.spec.ts",
-    "test:policy": "vitest run tests/model-policy.spec.ts",
-    "test:host": "node scripts/test-host.mjs"
+    "test:client": "vitest run tests/client tests/scope.spec.ts",
+    "test:host": "node scripts/test-host.mjs",
+    "test:initial-model": "vitest run tests/initial-model.spec.ts tests/model-spawn.spec.ts && node tests/integration/initial-model-proof.mjs",
+    "test:initial-model-installed": "INITIAL_MODEL_PROOF_PLUGIN=1 node tests/integration/initial-model-proof.mjs"
   },
-  "packageManager": "pnpm@10.33.2"
+  "packageManager": "pnpm@10.33.2",
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh-agent-preset-registry": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-session-persistence": {
+      "optional": true
+    }
+  }
 }

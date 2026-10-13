@@ -1,47 +1,56 @@
-# Session Link external plugin
+# Session Link external plugin — 0.5.0
 
-## Goal
+## Scope
 
-Ship one independently installable `dsh-session-link` package, preserving durable peer messaging, four model tools, the human command, and desktop/web controls without adding code to DSH.
+Ship one independently installable plugin for official DSH `0.2.0-rc.2`. Preserve the original UI, grants, durable peer mailbox, wake budgets, human command and four tools. Add `session_list_models` and optional `initial_model` on `session_spawn_linked_session` only.
 
-## Constraints
+Task routing, temporary model scopes, fallback, task decisions, task status notifications, task RPC/panel/cards and the `./tasks` export are removed. Historical plans and reviews remain evidence of cancelled scope, not implementation requirements.
 
-The existing checkout and live profiles remain intact. Keep storage domain `session_link` version 1 and message attribution `session-link-message`. Resolve host packages from profile peers. Browser modules import only React and ReactDOM at runtime. Do not depend on generated Remote packages or the remote-event allowlist.
+## Existing invariants
 
-## Implementation
+- Keep `session_link` domain version 1, its three tables and `session-link-message` attribution. Mailbox ordering, receipt-based accepted acknowledgement, cancellation-before-insertion, idempotency, unlink and recovery retain their original semantics.
+- Tools and commands mount under qualified top-level Agent scopes. Omitted presets include standard/ptc/cordis and the effective default; explicit lists are exact. Minimal and child Agents remain excluded.
+- Header picker, right hover action, formal row menu, owner-bound management panel and turn-tail linked-spawn card share the link view. UI writes are gated; polling failures retain last known data. No Host DOM interception.
+- Human links and spawn links keep their respective grants. Wake flags are receiving-member permissions, separate from membership and running state. Existing human choices never receive replay-time expansion. Spawn's budgeted first-task wake and optional return wake remain intact.
 
-1. Copy the current service, tools, command and their behavior tests into this package. Keep grant checks, mailbox ordering, receipt-based acknowledgement and cancellation. Correct exposed top-level caller and recovery invariants.
-2. Bind decorated Remote methods through service-derived dispatch. Keep `request` argument names unminified. Add a plugin-owned `view` containing links and session candidates, plus the configured polling interval.
-3. Rewrite UI controls under the four existing slots with local styles and locale dictionaries. Share one read-only view; refresh after acknowledged writes, reset and polling. Cancel subscriptions, timers and stale reads on unload.
-4. Verify focused behavior tests, built endpoint argument names, declared peers/exports and browser module imports. Install a packed artifact in a temporary official DSH profile and exercise real browser add/wake/revoke flows.
+## Initial model contract
 
-5. (0.3.0) Mount tools and the command per preset into top-level Agent scopes through a child plugin under `agent.ctx`, following `agent-preset/selected` and row unload. Give the spawn tool's initial task one budgeted wake, link before rename and delivery, validate the calling Session, reject duplicate pairs inside the admission chain, and gate repeated UI writes.
+`session_list_models` reads the deployment's public provider/model/effort catalog, optionally filtered by provider. `initialModelSelection` reports public bootstrap capability. Catalog presence is metadata, not authentication or successful execution.
 
-## Approved UI / wake update (0.4.1 workspace)
+Spawn accepts only `initial_model: { provider, model, reasoning_effort? }`. Provider/model are required non-empty strings; effort is validated against that exact model. Omission uses the selected model's own default, not the caller's effort. Extra nested fields and retired top-level provider/model/reasoning_effort/model_scope/on_model_unavailable are rejected. Send accepts no model selection. Unselected spawn uses the original path.
 
-- Omitted `presets` selects standard/ptc/cordis plus public registry `defaultId` (effective selectedDefault fallback); explicit lists, including empty, remain exact. Always exclude minimal and child-owned Agents. Clear Schemastery's implicit array default to preserve omission. Re-evaluate on existing Agent/preset lifecycle events, without inventing a default-change event.
-- Remove the leading mark entirely. Register right-side hover action and formal `…` menu through workspace slots. Store the managed row's Session id in typed sidebar-right navigation params; bind mutations to that id, not the visible conversation. No DOM interception or Host modification.
-- Reuse one searchable, explicit-confirmation picker in the header and panel. Show separate visible wake directions and budget cost; membership and execution state are independent. Multi-member groups use receiving-member terminology.
-- New spawn `wake_caller` defaults to `auto_awake`; explicit false opts out. Human link requests have optional `autoWakeCaller` (omission preserves legacy false); human wake RPC can edit the caller's own receiving flag. Existing groups and human-disabled flags never change on replay.
-- Persist the original new spawn intent's optional `autoWakeSessionIds` before its group write. Recovery uses these original grants, not replay arguments. Legacy incomplete intents recover with no later-wake grants; the existing owed-first-task wake remains. Storage version stays 1.
-- Host tests cover return wake with the real ToolRuntime/mock model and storage-failure replay; browser smoke uses a packed artifact, isolated profile/npm cache, and non-foreground peer row management. The browser fixture's rename materializes Host projections and attaches its peer; cold-catalog non-activation is covered by host regression, not inferred from that browser fixture. No live profile or model call is required.
+## Bootstrap and recovery
 
-## Acceptance
+1. Validate public catalog and bootstrap services before creating the selected Session. Resolve the native preset and derive a deterministic Session ID from caller and call ID.
+2. Reserve a ledger `initialModelSpawns` intent keyed by caller/call ID. Hash the full normalized request, including the entire task, Session identity, CWD, title, wake grants and selection. Changed replay parameters, including adding/removing selection, fail explicitly. Concurrent same-key requests share one operation; conflicting payloads fail.
+3. Create the native Session header and durably confirm `headerCreated`. Prepare a detached ordinary top-level Session, append the existing native `model/selection` event, persist/flush/close, then reopen and verify before confirming `seedConfirmed`.
+4. Activate via the native Session Controller with the recorded identity/preset/CWD. Only after the confirmed seed is consumed does the original link/title/task delivery path run.
+5. Replay a confirmed seed by verifying the original fact, never by writing a new model choice. Later request headers, turns and human UI selections remain native-owned. A revoked link is not recreated. An existing or altered unconfirmed identity is refused, without automatic repair or activation.
 
-- Official DSH runs the plugin without the fork's session-link packages or generated metadata.
-- Host behavior tests cover non-human attribution, durable queued/accepted receipts, revocation, cancellation, ordering and wake limits.
-- Browser mutations, header and row marks agree with host data; failures keep existing data visible.
-- Plugin absence/failure preserves DSH startup and already recorded session input.
-- The original checkout files and live Desktop profiles are unchanged by this work.
+The optional ledger map records creation facts, not a second runtime model state machine. It does not change the application default, intercept model requests or provide fallback. Failures report the bootstrap stage and known Session identity/state; retained partial data is not described as successful dispatch.
 
-## Handoff
+## Presentation
 
-`DSH_SOURCE_ROOT` optionally selects built checkout declarations for compilation and source aliases for the full host regression tests. Runtime profile installation always uses its own declared peers. README records actual compatibility evidence and cutover commands; switching the user's running profile is separate from isolated verification.
+The legacy spawn first text block remains unchanged. A second versioned `session-link/initial-model` sidecar exposes configured provider/model/optional effort. The turn projection pairs successful spawn calls/results and retains the original turn cutoff. Invalid metadata does not suppress a valid legacy card. Cards label it “Initial session model” / “初始会话模型”; they do not assert the current model or execution success. Queued/accepted remain delivery-only facts.
 
-## Model-routing presentation milestone (0.4.1 workspace, LL task 6)
+Client runtime dependencies stay within the existing React/ReactDOM browser module set; protocol parsing is local. No task RPC or generated Remote metadata is needed.
 
-- **Tool output**: tracked spawn/send keep the legacy first text segment byte-identical (`session … created and linked (…)` / `message … accepted by …`); a second text block carries the tracked-task facts (state, scope, requested-vs-selected route, inspect/decision pointers) followed by a versioned `session-link/task-result` JSON line. needs_decision results whose precheck failed before a Session existed omit `sessionId`/`linkId` and the card renders no fake session jump. Spawn/send descriptions now document the pairing rule, the task-scope default, the 4-fallback cap, session_default activation-time resolution and exhaustion behavior, so the model never guesses.
-- **Client turn projection**: the existing first-segment pattern stays the ONLY feed for the legacy spawn card (old logs replay unchanged); the new sidecar is narrowed from later text blocks only. The TurnCard renders three additional shapes — admitted (requested vs selected with a temporary/persistent scope label, acceptance framed as delivery-only), needs_decision without a Session (waiting statement + inspect hint, never a session jump), and session-scope labels shown persistently only once persistence is factual (`persistent_selection_skipped` surfaces as an honest "not persisted" note in the panel).
-- **Task view carrier**: one read-only `sessionLinks/taskView` Remote on the existing Typert bridge (same `request` argument convention; built-contract updated) filters tasks server-side by the managed Session; the panel polls it with the same keep-last-known pattern the link view uses. Cards stay static transcript facts; no new namespace, no generated metadata.
-- **Task-status attribution**: `session-task-status` mailbox messages carry body-framing ONLY today — the report body itself states it is a host-generated fact, never the peer Agent's own words and never an instruction; no transcript badge ships (a badge awaits a host message-attribution seat).
-- **Docs**: README gained the tracked-task section (boundary, scope/persist CAS, fallback order + exhaustion → waiting_decision + notification, notification delivery without wake guarantee, partial never re-run / TASK_NOT_RESUMABLE today, minimum host capability and old-host refusal) plus panel/card description updates.
+## Verification and handoff
+
+Use `env -u DSH_SOURCE_ROOT pnpm typecheck`, `pnpm build` and `pnpm test` against official npm SDK packages. `test:initial-model` runs focused parser/catalog/bootstrap tests and an isolated official native proof. The native proof passed with 19 mock requests and zero paid calls; this proves the public native route, not the packed plugin or Electron UI.
+
+`test:initial-model-installed` installs the packed plugin into a temporary official profile and exercises actual tools, native requests, replay/refusal and removal/restart. `test:integration` separately verifies packed Web installation and browser UI. Current results and limitations belong in `VERIFICATION.md`; do not infer PASS from planned coverage. Desktop Electron has not been tested this iteration.
+
+`DSH_SOURCE_ROOT` supports only optional development declarations and the four original auxiliary Host suites (link, remote, tools, command). No patched task-host is required. Runtime installation resolves declared peers from its own profile.
+
+The user's running profile and Host remain unchanged. Do not automatically migrate/downgrade tracked-task experiment profiles or clean historical storage domains. A live cutover requires its own explicit authorization and compatibility assessment.
+
+## Review follow-up
+
+Legacy `statusKind` / `taskStatus` metadata survives schema decoding. Marked pending reports remain stored and are excluded from delivery queues, startup recovery, wake triggers and explicit idempotency replay; ordinary messages continue to deliver. This does not make unmarked experimental task mail or Host-exclusive events safe to downgrade: profile inspection remains required.
+
+Preset-registry and session-persistence peers are optional. Ordinary spawn shares the common flight lock but keeps its normal completed-replay contract; concurrent changed parameters use the generic SPAWN_REPLAY_CONFLICT error. Ownership-uncertain collisions explicitly describe possible empty orphan Sessions and human inspection. The official request fixtures set caller BASE to explicit low effort and B's model default to high, while B omits effort, proving non-inheritance across first/tool/later requests and restarts.
+
+## History and release documentation
+
+[ADR-001](docs/decisions/001-plugin-only-initial-model.md) records the forward replacement of the 19 experimental commits after 42abec4. Historical plans and review evidence are retained and labeled superseded. The separate DSH working tree remains unchanged; its uncommitted Host extension is neither a 0.5.0 dependency nor covered by this plugin commit. [中文 README](README.md) and [English README](README.en.md) describe the same current contract and distinguish ordinary versus experimental 0.4.1 upgrades. The user reported preliminary testing passed without specifying platform or coverage; automated verification boundaries remain unchanged.

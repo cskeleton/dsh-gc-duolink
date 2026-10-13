@@ -60,23 +60,7 @@ const CSS = `
 .slp-card{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:10px 12px;margin:8px 0;border:1px solid var(--dsw-alias-border-l1);border-radius:12px;color:var(--dsw-alias-label-primary);font-size:13px}
 .slp-card-title{flex:1 1 auto;min-width:0;overflow-wrap:anywhere}
 .slp-card-wake{color:var(--dsw-alias-label-tertiary);font-size:11px}
-.slp-task-card{display:flex;flex-direction:column;gap:6px;box-sizing:border-box;padding:10px 12px;margin:8px 0;border:1px solid var(--dsw-alias-border-l1);border-radius:12px;color:var(--dsw-alias-label-primary);font-size:13px;line-height:18px;overflow-wrap:anywhere}
-.slp-task-card-heading{display:flex;align-items:center;gap:6px;flex-wrap:wrap;min-width:0}
-.slp-task-kind{font-weight:500;color:var(--dsw-alias-label-secondary);font-size:12px;flex:none}
-.slp-task-title{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:var(--dsw-alias-font-mono,monospace);font-size:11px;color:var(--dsw-alias-label-tertiary)}
-.slp-task-badge{flex:none;display:inline-flex;align-items:center;padding:1px 7px;border-radius:999px;font-size:11px;line-height:16px;background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-secondary)}
-.slp-task-badge-warn{color:var(--dsw-alias-state-warning-primary,var(--dsw-alias-state-error-primary))}
-.slp-task-badge-success{color:var(--dsw-alias-state-success-primary)}
-.slp-task-badge-info{color:var(--dsw-alias-brand-primary)}
-.slp-task-line{display:flex;flex-wrap:wrap;gap:4px 10px;min-width:0;color:var(--dsw-alias-label-secondary);font-size:12px}
-.slp-task-line b{color:var(--dsw-alias-label-primary);font-weight:500}
-.slp-task-meta{color:var(--dsw-alias-label-tertiary);font-size:11px}
-.slp-task-note{padding:6px 8px;border-radius:8px;background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-secondary);font-size:12px}
-.slp-task-note-warn{border:1px solid var(--dsw-alias-state-warning-primary,var(--dsw-alias-state-error-primary));color:var(--dsw-alias-state-warning-primary,var(--dsw-alias-state-error-primary));background:transparent}
-.slp-task-looks{font-family:var(--dsw-alias-font-mono,monospace);font-size:11px;color:var(--dsw-alias-label-tertiary)}
-.slp-panel-section{display:flex;flex-direction:column;gap:6px;padding:8px 10px;border:1px solid var(--dsw-alias-border-l1);border-radius:12px}
-.slp-panel-section-head{display:flex;align-items:center;justify-content:space-between;gap:8px;color:var(--dsw-alias-label-secondary);font-size:12px;font-weight:500}
-.slp-task-list{display:flex;flex-direction:column;gap:8px}
+.slp-card-initial-model{flex-basis:100%;color:var(--dsw-alias-label-tertiary);font-size:11px;overflow-wrap:anywhere}
 `
 
 /** Styles remain owned by the component and disappear on unmount. */

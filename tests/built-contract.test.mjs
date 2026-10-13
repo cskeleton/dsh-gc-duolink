@@ -15,7 +15,7 @@ test('built SRC methods retain the named wire fields and cancellation position',
   try {
     const service = new SessionLinkService(ctx)
     const expected = { view: ['signal'],
-      linkFrom: ['request'], unlinkFrom: ['request'], setAutoWakeFrom: ['request'], taskView: ['request'] }
+      linkFrom: ['request'], unlinkFrom: ['request'], setAutoWakeFrom: ['request'] }
     assert.equal(service.typertRemote.namespace, 'sessionLinks')
     assert.deepEqual(remoteMethods(service).map(marker => marker.exportName ?? marker.method).sort(), Object.keys(expected).sort())
     for (const [method, names] of Object.entries(expected)) {
@@ -48,6 +48,9 @@ test('browser factory only requests seeded React modules', () => {
 })
 
 test('host imports are declared peers and every bundle row is exported', () => {
+  for (const peer of ['@deepseek-ai/dsh-agent-preset-registry', '@deepseek-ai/dsh-session-persistence']) {
+    assert.equal(manifest.peerDependenciesMeta?.[peer]?.optional, true, `${peer} must be optional for ordinary spawn`)
+  }
   for (const file of ['index.js', 'tools.js', 'command.js']) {
     const source = readFileSync(new URL(`lib/${file}`, root), 'utf8')
     for (const match of source.matchAll(/from ["'](@deepseek-ai\/[^"']+)["']/g)) {

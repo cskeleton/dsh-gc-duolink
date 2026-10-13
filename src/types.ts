@@ -14,9 +14,6 @@ export type SessionLinkId = Branded<'SessionLinkId'>
 /** Identifies one durable mailbox message. */
 export type SessionLinkMessageId = Branded<'SessionLinkMessageId'>
 
-/** Identifies one tracked task row (`task:<callerSessionId>:<firstCallId>`). */
-export type SessionLinkTaskId = Branded<'SessionLinkTaskId'>
-
 /**
  * Brand a Session Link id.
  * @param value - group identifier minted by the service.
@@ -35,16 +32,6 @@ export function SessionLinkMessageId(value: string): SessionLinkMessageId {
   return value as SessionLinkMessageId
 }
 
-/**
- * Brand a tracked task id. The service derives the value stably from the
- * caller Session and the first call id; it never accepts one from input.
- * @param value - task identifier minted by the service.
- * @returns the same string with its compile-time brand.
- */
-export function SessionLinkTaskId(value: string): SessionLinkTaskId {
-  return value as SessionLinkTaskId
-}
-
 /** Stable sender attribution recorded in the target Session, never accepted from tool input. */
 export interface SessionLinkMessageSource {
   readonly kind: 'session-link-message'
@@ -55,63 +42,6 @@ export interface SessionLinkMessageSource {
   readonly senderId: SessionId
   readonly senderTitle: string
   /** Message this delivery replies to when routed through the reply path. */
-  readonly inReplyTo?: SessionLinkMessageId
-}
-
-/** One concrete model route a task-status report names. */
-export interface SessionLinkTaskStatusRoute {
-  readonly provider: string
-  readonly model: string
-  readonly reasoningEffort?: string
-}
-
-/**
- * Host-generated task-status attribution recorded in the RECEIVING (original
- * sender) Session. Distinct from {@link SessionLinkMessageSource}: the
- * delivery is a STATUS FACT the plugin/host emits about the ORIGINAL task —
- * never the target Session speaking, never an instruction. Read-side dedupe
- * keys on `session-task-status` + `messageId`; every existing
- * `session-link-message` consumer keeps reading only peer mail.
- */
-export interface SessionLinkTaskStatusSource {
-  readonly kind: 'session-task-status'
-  /** Durable identity used for deduplication at the receiving Session. */
-  readonly messageId: SessionLinkMessageId
-  /** Group under which the original task pair was admitted. */
-  readonly linkId: SessionLinkId
-  /** The ORIGINAL task this status reports. */
-  readonly taskId: SessionLinkTaskId
-  /** The Session the task ran/runs on (the REPORT's subject, never its speaker). */
-  readonly targetSessionId: SessionId
-  /** The attempt this fact belongs to. */
-  readonly attemptId: string
-}
-
-/**
- * The trusted internal admission input of one host-generated task-status
- * report (Task 5 of the model-routing plan). The plugin's task-notification
- * entry forwards strictly its own durable outbox facts; no public tool and
- * no external caller reaches this entry.
- */
-export interface SessionLinkTaskStatusReport {
-  /** Deterministic outbox identity `taskId/revision/kind`; the mailbox's admission key. */
-  readonly eventId: string
-  readonly taskId: SessionLinkTaskId
-  readonly attemptId: string
-  readonly revision: number
-  readonly eventKind: 'model_fallback_selected' | 'model_unavailable' | 'turn_finished' | 'interrupted' | 'cancelled'
-  /** The Session the report is FOR (the notification is addressed TO it). */
-  readonly callerId: SessionId
-  /** The Session the task ran/runs on (the report's subject). */
-  readonly targetId: SessionId
-  readonly executionState?: 'not_started' | 'partial' | 'unknown'
-  readonly reason?: string
-  readonly requestedModel: SessionLinkTaskStatusRoute
-  readonly actualModel?: SessionLinkTaskStatusRoute
-  readonly attempts: number
-  readonly decisionRequired: boolean
-  readonly resumable: boolean
-  /** Chain root: the ORIGINAL task's notification root, when known. */
   readonly inReplyTo?: SessionLinkMessageId
 }
 
@@ -175,23 +105,6 @@ export interface SessionLinkMessageRecord {
   readonly seq?: number
   /** Set before the message is handed to the target; such a message is never made terminal. */
   readonly inserted?: boolean
-  /** Present only on host-generated task-status reports; peer mail never carries it. */
-  readonly statusKind?: 'task-status'
-  /** Structured task facts of a task-status report. */
-  readonly taskStatus?: {
-    readonly taskId: string
-    readonly attemptId: string
-    readonly eventId: string
-    readonly revision: number
-    readonly kind: 'model_fallback_selected' | 'model_unavailable' | 'turn_finished' | 'interrupted' | 'cancelled'
-    readonly executionState?: 'not_started' | 'partial' | 'unknown'
-    readonly reason?: string
-    readonly requestedModel: SessionLinkTaskStatusRoute
-    readonly actualModel?: SessionLinkTaskStatusRoute
-    readonly attempts: number
-    readonly decisionRequired: boolean
-    readonly resumable: boolean
-  }
 }
 
 /** Per-day automatic-wake counter for one Session. */
@@ -220,69 +133,11 @@ export interface SessionLinkSessionView {
   readonly blank: boolean
 }
 
-/** One concrete route the plugin's task projection names (camelCase wire fields). */
-export interface SessionLinkTaskRouteView {
-  readonly provider: string
-  readonly model: string
-  readonly reasoningEffort?: string
-}
-
-/** Outbox event line the `sessionLinks/taskView` Remote reports (task row lifecycle). */
-export interface SessionLinkTaskOutboxView {
-  readonly eventId: string
-  readonly kind: 'model_fallback_selected' | 'model_unavailable' | 'turn_finished' | 'interrupted' | 'cancelled'
-  readonly status: 'pending' | 'admitted' | 'delivered' | 'blocked'
-  readonly requestedModel?: SessionLinkTaskRouteView
-  readonly actualModel?: SessionLinkTaskRouteView
-  readonly decisionRequired: boolean
-  readonly resumable: boolean
-  readonly blockedReason?: string
-}
-
-/**
- * Read-only task line the human panel shows. Task state against one durable
- * tracked-task intent: state, scope, requested vs actual route (a persistent
- * label appears only once the baseline persist actually committed), the
- * target Session, the latest attempt issue, and the outbox lifecycle.
- * `pending`/`admitted` never claim execution; `currentlyExecuting` comes
- * straight from the durable runtime projection.
- */
-export interface SessionLinkTaskViewEntry {
-  readonly taskId: string
-  readonly taskState: string
-  readonly revision: number
-  readonly executionState?: 'not_started' | 'partial' | 'unknown'
-  readonly reason?: string
-  readonly targetSessionId?: SessionId
-  readonly requestedModel: SessionLinkTaskRouteView
-  readonly currentRoute?: SessionLinkTaskRouteView
-  readonly routeUsed?: SessionLinkTaskRouteView
-  readonly scope: 'task' | 'session'
-  /** True only when the session-baseline persist committed; a skipped persist stays honest (see `reason`). */
-  readonly routePersisted: boolean
-  readonly currentlyExecuting: boolean
-  readonly latestIssue?: { readonly code?: string; readonly message?: string }
-  readonly outbox: readonly SessionLinkTaskOutboxView[]
-  readonly updatedAt: string
-}
-
 /** Current full catalogs; deleted groups disappear from the next poll. */
 export interface SessionLinkView {
   readonly pollIntervalMs: number
   readonly links: readonly SessionLinkSummary[]
   readonly sessions: readonly SessionLinkSessionView[]
-}
-
-/** Request accepted by the `sessionLinks/taskView` Remote. */
-export interface SessionLinkTaskViewRequest {
-  /** Managing Session; only tasks whose callerId or targetSessionId is this may appear. */
-  readonly sessionId: SessionId
-}
-
-/** Read-only task projection for the human panel; never a wake, never a decision. */
-export interface SessionLinkTaskViewResponse {
-  readonly pollIntervalMs: number
-  readonly tasks: readonly SessionLinkTaskViewEntry[]
 }
 
 /**
@@ -354,12 +209,6 @@ export interface SessionLinkSendRequest {
   readonly idempotencyKey?: string
   /** Optional pre-delivery cancellation. */
   readonly signal?: AbortSignal
-  /**
-   * Caller-derived message identity (tracked-task admission only). Legacy
-   * model-less calls NEVER pass this and keep the mailbox's own random
-   * identity mint untouched.
-   */
-  readonly messageId?: SessionLinkMessageId
 }
 
 /** Deployment limits for the Session Link service. */
@@ -403,6 +252,7 @@ export class SessionLinkError extends Error {
       | 'MESSAGE_NOT_FOUND'
       | 'MESSAGE_NOT_REPLYABLE'
       | 'MESSAGE_UNDELIVERABLE'
+      | 'LEGACY_TASK_MESSAGE_BLOCKED'
       | 'MAILBOX_FULL'
       | 'MESSAGE_TOO_LARGE'
       | 'WAKE_BUDGET_EXHAUSTED'
