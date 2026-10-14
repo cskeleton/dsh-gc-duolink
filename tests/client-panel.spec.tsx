@@ -5,13 +5,13 @@ import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { SnapshotSelectorHook, TranslateNS } from '@deepseek-ai/dsh-client-ui-slots'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
-import { SessionLinkId, type SessionLinkSessionView, type SessionLinkView } from '../src/types.ts'
+import { SessionLinkId, type SessionLinkActivityView, type SessionLinkSessionView, type SessionLinkView } from '../src/types.ts'
 import {
   HeaderAction, LinkTab, RowLinkAction, RowLinkMenu, ManagedLinkTab, panelOwner,
   type LinkProps,
 } from '../src/client/components.tsx'
 import type { UseSidebarRightTabInfo } from '@deepseek-ai/dsh-client-ui-sidebar-right/client'
-import { createLinkSource, LinkBusyError, type LinkSource, type LinkSnapshot } from '../src/client/state.ts'
+import { createLinkSource, createMailController, LinkBusyError, type LinkSource, type LinkSnapshot } from '../src/client/state.ts'
 import { en, type NS } from '../src/client/locales.ts'
 
 const SELF = 'session-self' as SessionId
@@ -32,6 +32,17 @@ function selector(source: LinkSource): SnapshotSelectorHook<LinkSnapshot> {
   return <Value,>(select: (snapshot: LinkSnapshot) => Value): Value => {
     const snapshot = useSyncExternalStore(source.subscribe, source.getSnapshot, source.getSnapshot)
     return select(snapshot)
+  }
+}
+
+/** One empty mailbox page; the panel fixture answers mail reads with it. */
+export function emptyActivity(): SessionLinkActivityView {
+  return {
+    sampledAt: '2026-10-13T00:00:00.000Z', total: 0, entries: [],
+    summary: {
+      wake: { used: 0, limit: 6, day: '2026-10-13', resetsAt: '2026-10-14T00:00:00.000Z' },
+      pendingInbound: 0, pendingOutbound: 0, firstTaskWakeOwed: false, legacyBlocked: 0, targets: [],
+    },
   }
 }
 
@@ -62,7 +73,12 @@ function fixture(extraSessions: SessionLinkSessionView[] = []) {
   })
   const props: LinkProps = {
     sessionId: SELF, useLinks: selector(source), refresh: source.refresh,
-    link, setWake, unlink, openPanel: vi.fn(), openSession: vi.fn(), t,
+    link, setWake, unlink, loadActivity: vi.fn(async () => emptyActivity()),
+    mail: createMailController({
+      load: vi.fn(async () => emptyActivity()),
+      pollIntervalMs: () => 3_600_000,
+    }),
+    openPanel: vi.fn(), openSession: vi.fn(), t,
   }
   return { props, source, link, setWake, unlink }
 }

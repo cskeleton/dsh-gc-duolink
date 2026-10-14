@@ -1,6 +1,6 @@
 # Verification — 0.5.0 plugin-only initial model
 
-日期：2026-10-13。本节是当前验收；下方折叠内容保留旧实验版历史，不构成本版依赖或需求。实施决策与任务关闭见 [PLUGIN_ONLY_EXECUTION.md](PLUGIN_ONLY_EXECUTION.md)。
+日期：2026-10-13（M1 里程碑节与复审收尾节更新至 2026-10-14）。本节是 0.5.0 基线验收；**当前验收以「M1 里程碑验证」及其「第二轮/第三轮复审」小节为准**，下方折叠内容保留旧实验版历史，不构成本版依赖或需求。实施决策与任务关闭见 [PLUGIN_ONLY_EXECUTION.md](PLUGIN_ONLY_EXECUTION.md)。
 
 ## 当前结果
 
@@ -17,6 +17,91 @@
 | 旧 tracked-task profile 迁移 | NOT_RUN；本轮不做现用 profile 切换、降级、迁移或历史数据清理 |
 
 单位、客户端、契约与辅助 host 合计 234 项检查通过。取消功能的旧任务状态机/宿主扩展套件已退休；不以原 359 项计数作为新版目标。
+
+## M1 里程碑验证（2026-10-13，0.5.0 之后未发布工作区）
+
+里程碑范围见 [ITERATION_ROADMAP_0_5_BASELINE.md](ITERATION_ROADMAP_0_5_BASELINE.md) M1-A/M1-B：`activityView` 只读分页观察 RPC（M1-A）；最小邮件面板、头部速览、spawn 卡片创建时投递状态与打开会话按钮（M1-B）。本轮不改动持久化 schema（src/spec.ts 未触碰）、不改动任何投递/唤醒语义，邮件 UI 全部只读（取消 UI 属 M2，未实现）。
+
+### 审查发现逐项关闭（M1_REVIEW.md F1–F10）
+
+| 发现 | 修复 | 证据 |
+|---|---|---|
+| F1 错误文本未脱敏 | `sanitizeError` 先脱敏后截断：Authorization/Bearer 头、常见 token/key/password 参数值、URL userinfo 均被替换为占位符；持久化原始记录不改 | 审查方回归 [tests/review-m1-backend.spec.ts](tests/review-m1-backend.spec.ts) 原样转绿（未删除/未 skip/未改写断言） |
+| F2 无关会话误判欠首任务唤醒 | 摘要投影先按被管理会话的组成员身份过滤，再调用原 firstWakeOwed helper；spawn 首任务语义未动 | 同文件回归转绿；另补多组/空邮箱/不存在 owner 用例 |
+| F3 显示队列与投递队列排序不一致 | pending 段直接按实际投递队列（`pendingFor` 同序）分页；跨目标不伪称全局执行序；游标为带签名的有界快照，队列结构变化即失效报 `ACTIVITY_CURSOR_INVALID`；投递 FIFO 未改 | 同文件回归（activity 对照真实 `pendingFor`）转绿 |
+| F4 运行中目标误标"未授权唤醒" | `blockingReasons` 区分"当前投递阻塞"与"若将来空闲时的唤醒限制"：目标 running 或已持有待确认时不列唤醒约束；无明确原因报 unknown；冷驻留不写成"对方未在运行"；入站记录称"接收方/目标" | 同文件回归（模拟 running 后不再出现 wake-unauthorized）转绿 |
+| F5 预览固定剥两行 | `previewText` 用 record 的 senderTitle/senderId/messageId 校验完整已知帧后精确移除；无法识别的旧形状保守保留原文 | 同文件回归（真实 `frameSessionLinkText` 生成消息，预览为用户正文）转绿 |
+| F6 加载更多失败静默 | 分页失败独立呈现 alert 并提供同页重试，已有条目保留；成功重试清除错误且不重复 append | 审查方回归 [tests/client-mail-review.spec.tsx](tests/client-mail-review.spec.tsx) 原样转绿 |
+| F7 刷新失败清空数据 | 同 owner/section 刷新失败保留最后快照并标记 stale（保留 sampledAt）；owner/section 切换立即隔离；补迟到响应/卸载/切换/竞争用例 | 同文件第二项回归转绿；client-state 竞争用例覆盖 |
+| F8 邮箱未接入刷新生命周期 | 按 owner 共享的 MailController（[src/client/state.ts](src/client/state.ts)）：仅订阅时轮询（沿用 view 的 pollIntervalMs）、`connection/reset` 触发刷新、写后 invalidate 全部邮箱、AbortSignal 取消过时请求、退订即停；采样时间按页记录。本轮 smoke 另复现并修复重订阅死链：视图全部卸载后重新挂载时 `subscribe()` 重新武装轮询定时器（退订会停表），peek 收尾同样补武装 | smoke "revoked mail disappears from the mounted view" 通过；新增单测 "re-arms polling when a view resubscribes after a full unmount" |
+| F9 入口与诊断缺口 | 头栏弹层新增已互联对象快览与逐条"打开会话"入口；面板标题新增"打开被管理会话"；摘要含 firstTaskWakeOwed 首任务例外提示；入队时间明确标注 "Enqueued"；legacy 脚注说明本版不投递、需人工检查 | smoke quickPeerOpen / managedSessionOpen / 头部快览断言通过；组件测试覆盖文案 |
+| F10 packed RPC / Web smoke | packed tarball + 隔离 profile + Brave：activityView 请求/响应分页与畸形游标拒绝、管理非当前会话、头栏对端入口、前台切换/断连重连/写后刷新、分页错误保留与重试、窄栏/长正文/明暗主题截图（output/playwright/）；0 次模型调用 | `pnpm test:integration` PASS，摘要 13 项标志全 true；截图已人工核对 |
+
+F10 范围说明：隔离 profile 无模型供应商，目标永远不会 running，因此"已送达"邮件在 smoke 中按设计不可能；recent 段通过解除互联后的终态 `revoked` 记录验证，长正文经 600 字符信封验证。delivered 路径、firstTaskWakeOwed 实际触发与 legacy 标记隔离由 host/单测覆盖。
+
+### 第二轮复审发现逐项关闭（M1_REVIEW.md R2-01–R2-07，2026-10-14）
+
+审查方复审在首轮未覆盖场景复现 F1/F3/F8 未闭合，记为 R2-01–R2-07；审查方新增回归 [tests/review-m1-backend.spec.ts](tests/review-m1-backend.spec.ts) +3 项、[tests/client-mail-rereview.spec.tsx](tests/client-mail-rereview.spec.tsx) +5 项，全部原样转绿（未删除/未 skip/未改写断言）。
+
+| 发现 | 修复 | 证据 |
+|---|---|---|
+| R2-01 脱敏漏纯文本 password=X 与 JSON api_key | 本轮先改为 `redactSecrets` 系统化分层（authorization 头、bearer/basic、JSON 成员、带引号与裸 key=value、header 风格、URL userinfo，敏感键并集大小写/空白不敏感）；**第三轮复审判定"改写任意原文"仍不可完备（R3-01），已由固定安全摘要取代，见下节**；持久化原始记录始终不改 | 审查方 `it.each` 回归（纯文本 password=、JSON api_key）原样转绿；R3 三项亦已转绿 |
+| R2-02 pending 投影用非传递比较器全局排序 | 不再对超集做全局排序后过滤：按目标取 `pendingFor(targetId)` 权威队列并过滤到可见集合，按入队时间（平手：targetId、messageId）做 k 路归并交错；`sig` 摘要对最终可见有序身份列表计算；注释改述 sig 为无密钥内容摘要（变更检测），非安全签名 | 审查方多目标队列保序回归原样转绿（过滤后子序列恒等于真实 `pendingFor` 队列） |
+| R2-03 退订遗留 loading/refreshing，重挂载不重启首次加载 | 全员退订时把 `status`（空页时）复位为 idle、清 refreshing/loadingMore；重挂载订阅时按 status 重新启动读取，epoch 防护保留 | 审查方"中断的首次加载在重挂载后重启"回归原样转绿；smoke 新增 reload 后延迟路由中断首读→前台切换打断→重开面板重启边界断言 |
+| R2-04 refresh/loadMore 互相取代但不清对方忙标志 | 忙标志归属当前 epoch：refresh 落定发布 `loadingMore: false`，loadMore 落定发布 `refreshing: false` | 审查方"refresh 取代 loadMore 后按钮不再永久禁用"回归原样转绿 |
+| R2-05 头部速览 peek-only，计数器永久陈旧 | 仅摘要订阅（速览）也纳入共享轮询：有监听且（有页或有摘要）即武装定时器，无页时以 peek 轮询；落定记录 `summarySampledAt`，速览以 title 标注采样时刻；退订即停 | 审查方 fake-timers 轮询回归原样转绿；smoke 新增速览 staleness title 断言 |
+| R2-06 invalidate 重读所有曾打开的 owner | 无订阅时 invalidate 仅标记 dirty，不发请求；下次激活（重新订阅）时按模式重读（有页 refresh、仅摘要 peek）；有订阅时行为不变；缓存保留策略不动 | 审查方"退订后 invalidate 不再触发读取"回归原样转绿；补 client-state 两项 dirty 激活重读单测；smoke 新增"alpha 退订期间 UI 写不产生 alpha 读取"路由计数边界 |
+| R2-07 MailSection 本地 section 状态与控制器脱节 | 删除组件内本地 section useState 与重置 effect：tab 选中唯一以 `state.section`（控制器）为准 | 审查方"Recent 重挂载后 tab 与数据一致"回归原样转绿；smoke 新增前台切换重挂载后 tab=Recent 且 recent 行仍在断言 |
+
+### 第二轮门禁（2026-10-14 复跑，全部 PASS）
+
+| 检查 | 证据 |
+|---|---|
+| 官方 SDK typecheck / build | `env -u DSH_SOURCE_ROOT pnpm typecheck`、`pnpm build` PASS |
+| pnpm test:client | 79 tests / 8 files（审查方 rereview 5 项 + 新增 dirty 重读 2 项，全部原样/新增转绿） |
+| pnpm test:host | 143 tests / 5 files（审查方后端复审 3 项原样转绿） |
+| 官方 native bootstrap proof | 19 次 mock adapter 请求，0 次收费 |
+| 官方 packed tools proof | 30 次 mock adapter 请求，0 次收费（`npm_config_cache=/tmp/dsh-npm-cache`） |
+| pnpm test:contracts | 3 tests PASS |
+| packed Web browser smoke | PASS；Brave；13 项标志全 true；新增 R2 浏览器边界：速览采样时刻 title、重挂载 tab/数据一致、退订期间写零读取、reload 后中断首读重启 |
+| git diff --check | PASS |
+| Desktop Electron / 付费模型 | NOT_RUN |
+
+### 第三轮复审收尾：R3-01 与 lastError 输出契约（2026-10-14）
+
+第三轮复审确认 R2-02～R2-07 可关闭，仅 R2-01/F1 仍阻断：审查方新增 3 项真实 activityView 回归（[tests/review-m1-backend.spec.ts](tests/review-m1-backend.spec.ts) :119–128，原 8 项未动）复现"改写任意原文"路线仍不完备——URL query 裸 `key`（前一轮键集重写时遗漏）、合法 JSON 值内含相反引号、JSON 字符串转义引号，三种形状均可泄漏后缀。
+
+**根因**：`lastError` 由任意自由文本经分层正则改写得到。对不受约束的原文，任何正则集合都不完备（形状无穷、每轮都有新绕过），且"截断 + 控制字符压平"同样不满足"不返回敏感错误"。继续叠加正则只会重复第三轮。
+
+**最终契约（不再改写原文）**：`errorSummary(error)` 在记录带 error 时返回固定安全摘要 `delivery error (details withheld)`，不含原始文本的任何片段；无 error 时仍不产生 `lastError` 字段（可选短字符串契约不变，schema/类型/工具/错误系统均未增改）。`redactSecrets`/`SECRET_KEYS` 已整体删除，不留正则层。持久化记录的 `error`、`text` 原样保留，投影只读、不迁移不改写。注释明确记载：任意原文不保证安全，截断压平不能满足"不返回敏感错误"要求，故只报"发生过投递异常、详细诊断未展示"。
+
+| 检查 | 证据 |
+|---|---|
+| 审查方 R3 三项回归 | 原样转绿（未删除/未 skip/未改写）；本地先复现 143 PASS/3 FAIL 后再修复 |
+| tests/remote.spec.ts 契约更新 | 原"恰好 200 字符且以 boom 开头"期望改为固定摘要内容 + ≤200 上限 + 不含原文片段 + 无控制字符；新增 7 形状 `it.each`：任意原文不拼接到 `lastError`/`JSON.stringify(view)`，且原始记录 `error`/`text` 逐字节不变 |
+| pnpm test:host | 153 tests / 5 files（146 + 7 新形状用例） |
+| pnpm test:client / contracts / typecheck / build | 79 tests PASS / 3 tests PASS / PASS / PASS |
+| native + packed initial-model | 19 / 30 次 mock，0 次收费 |
+| packed Web browser smoke | PASS；Brave；13 项标志全 true；0 次模型调用 |
+| git diff --check | PASS |
+| 文档校正 | 本节输出契约；[ITERATION_ROADMAP_0_5_BASELINE.md](ITERATION_ROADMAP_0_5_BASELINE.md) M1-B 的 packed 浏览器 NOT_RUN 更正为 PASS（隔离 profile + packed tarball + Brave） |
+
+### 本轮门禁（2026-10-13 复跑，全部 PASS）
+
+| 检查 | 证据 |
+|---|---|
+| 官方 SDK typecheck / build | `env -u DSH_SOURCE_ROOT pnpm typecheck`、`pnpm build`（ESM 117.79 kB） |
+| pnpm test:client | 72 tests / 7 files（含审查方 2 项客户端回归原样转绿、重订阅轮询回归） |
+| 官方 native bootstrap proof | 19 次 mock adapter 请求，0 次收费 |
+| 官方 packed tools proof | 30 次 mock adapter 请求，0 次收费（`npm_config_cache=/tmp/dsh-npm-cache` 隔离缓存） |
+| pnpm test:contracts | 3 tests；activityView 在期望方法集内 |
+| 原功能辅助 host suite | 140 tests / 5 files；审查方 5 项后端回归（[tests/review-m1-backend.spec.ts](tests/review-m1-backend.spec.ts)）已纳入 test:host 门禁并原样转绿 |
+| packed Web browser smoke | PASS；Brave；摘要 `activityViewPaged/activityCursorRejected/mailSurface/mailFailureRetained/quickPeerOpen/managedSessionOpen/unlinkRevokesQueuedMail` 等 13 项全 true |
+| git diff --check | PASS |
+| Desktop Electron / 付费模型 | NOT_RUN；无真实远端模型鉴权或收费请求 |
+
+行为边界：activityView 不唤醒、不 flush、不占用预算、不激活冷会话，不做会话存在性检查；条目预览 ≤160 字符且剥离投递帧，`lastError` 脱敏后 ≤200 字符；游标为 base64url 不透明令牌，畸形或队列结构变化时报 `ACTIVITY_CURSOR_INVALID`。spawn 卡片新增"任务消息创建时已入队/受理"标签——仅记录创建时刻的投递意图状态，不表示已读、已执行或已完成，也不会随后续送达变化冒充实时状态；需要最新详情时打开面板。打开会话按钮仅调用宿主 openSession。带 legacy statusKind/taskStatus 标记的记录继续隔离：不进条目列表，仅计入 `legacyBlocked` 并在面板以脚注提示。面板摘要含唤醒已用/上限与 UTC 重置时刻，并以 sampledAt 标注数据采样时间，陈旧数据可被识别。
+
 
 ## 可复跑命令
 

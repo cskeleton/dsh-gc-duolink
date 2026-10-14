@@ -1,14 +1,17 @@
 /** Self-contained controls for the plugin's allocated Harness slots. */
 import {
-  useEffect, useId, useLayoutEffect, useMemo, useRef, useState,
+  useEffect, useId, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore,
   type CSSProperties, type ReactNode,
 } from 'react'
 import { createPortal } from 'react-dom'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
 import type { HostObservable, InjectFace, SnapshotSelectorHook, TranslateNS } from '@deepseek-ai/dsh-client-ui-slots'
 import type { UseSidebarRightTabInfo } from '@deepseek-ai/dsh-client-ui-sidebar-right/client'
-import type { SessionLinkId } from '../types.ts'
-import { LinkBusyError, type LinkSnapshot } from './state.ts'
+import type {
+  SessionLinkActivityQuery, SessionLinkActivitySection,
+  SessionLinkActivityView, SessionLinkId,
+} from '../types.ts'
+import { createMailController, LinkBusyError, type LinkSnapshot, type MailController } from './state.ts'
 import { linkCandidates, peerRows, sessionTitle, type PeerRow } from './selectors.ts'
 import { NS } from './locales.ts'
 import { Styles } from './styles.tsx'
@@ -20,6 +23,10 @@ export interface LinkInjected {
   readonly link: (peerId: SessionId, autoWake: boolean, autoWakeCaller: boolean) => Promise<void>
   readonly setWake: (linkId: SessionLinkId, memberId: SessionId, on: boolean) => Promise<void>
   readonly unlink: (linkId: SessionLinkId) => Promise<void>
+  /** Read one mailbox page for the bound Session; rejects on a protocol mismatch. */
+  readonly loadActivity: (query: SessionLinkActivityQuery) => Promise<SessionLinkActivityView>
+  /** Shared per-owner mailbox source; panel, glance, and popover all read through it. */
+  readonly mail: MailController
   readonly openPanel: () => void
   readonly openSession: (sessionId: SessionId) => void
 }
@@ -27,7 +34,7 @@ export type LinkProps = InjectFace<LinkInjected> & {
   readonly sessionId: SessionId
   readonly t: TranslateNS<typeof NS>
 }
-export type LinkActions = Pick<LinkInjected, 'link' | 'setWake' | 'unlink' | 'openPanel' | 'openSession'>
+export type LinkActions = Pick<LinkInjected, 'link' | 'setWake' | 'unlink' | 'loadActivity' | 'mail' | 'openPanel' | 'openSession'>
 
 /** Local link icon, using only the current text color. */
 export function LinkIcon({ size = 16 }: { readonly size?: number }): ReactNode {
@@ -172,6 +179,167 @@ function Peer({ row, snapshot, busy, setWake, openSession, t }: {
   </div>
 }
 
+/** One-line pending/wake glance inside the header popover; reads the shared per-owner source. */
+function MailGlance({ mail, t }: {
+  readonly mail: MailController
+  readonly t: LinkProps['t']
+}): ReactNode {
+  const state = useSyncExternalStore(mail.subscribe, mail.getSnapshot)
+  // A summary peek shares the controller without disturbing any section pages.
+  useEffect(() => {
+    if (state.summary === undefined) void mail.peek()
+  }, [mail, state.summary])
+  const summary = state.summary ?? state.pages[0]?.summary
+  if (summary === undefined) {
+    return state.peekError !== undefined
+      ? <div className="slp-notice" role="alert">{t('mail.error')}: {state.peekError}</div>
+      : <div className="slp-footnote">{t('mail.loading')}</div>
+  }
+  const { pendingInbound, wake } = summary
+  // Peek-only counters poll through the shared controller; the sampled time
+  // makes their staleness inspectable on hover.
+  const sampled = state.summarySampledAt ?? state.pages[0]?.sampledAt
+  return <div className="slp-footnote"
+    title={sampled === undefined ? undefined : t('mail.updated', { time: new Date(sampled).toLocaleTimeString() })}>
+    {t('mail.glance', { count: pendingInbound, used: wake.used, limit: wake.limit })}
+  </div>
+}
+
+/** UTC wall-clock label for a wake-budget reset instant; 'HH:mm UTC', ISO input. */
+function utcClock(iso: string): string {
+  const time = new Date(iso)
+  return Number.isNaN(time.getTime()) ? iso : `${time.toISOString().slice(11, 16)} UTC`
+}
+
+/** Read-only mailbox for the panel owner: pending and recent pages, never a write. */
+export function MailSection({ sessionId, snapshot, loadActivity, mail: provided, t }: {
+  readonly sessionId: SessionId
+  readonly snapshot: LinkSnapshot
+  readonly loadActivity: LinkInjected['loadActivity']
+  /** Shared per-owner source; an ad-hoc controller is created when none is injected. */
+  readonly mail?: MailController
+  readonly t: LinkProps['t']
+}): ReactNode {
+  const loader = useRef(loadActivity)
+  loader.current = loadActivity
+  const fallbackPoll = useRef(snapshot.view?.pollIntervalMs)
+  fallbackPoll.current = snapshot.view?.pollIntervalMs
+  // A direct-rendered section (tests, embedding) still runs the same state
+  // machine as the production shared controller, so failure modes cannot
+  // diverge between the two wiring paths.
+  const own = useMemo(() => createMailController({
+    load: (query) => loader.current(query),
+    pollIntervalMs: () => fallbackPoll.current ?? 30_000,
+  }), [sessionId])
+  useEffect(() => () => { own.dispose() }, [own])
+  const mail = provided ?? own
+  const state = useSyncExternalStore(mail.subscribe, mail.getSnapshot)
+  // The controller is the single section authority: the tab and the data
+  // both read it, so a remount can never show one tab with another's rows.
+  const section = state.section
+  // The section owns full-page loads; a fresh or cleared source reads page one.
+  useEffect(() => {
+    if (state.status === 'idle') void mail.refresh()
+  }, [mail, state.status])
+  const select = (name: SessionLinkActivitySection): void => { mail.setSection(name) }
+  const summary = state.summary ?? state.pages[0]?.summary
+  const sampledAt = state.pages[0]?.sampledAt
+  const timeOf = (iso: string): string => new Date(iso).toLocaleTimeString()
+  return <section className="slp-mail" aria-label={t('mail.title')}>
+    <div className="slp-mail-head">
+      <div className="slp-mail-tabs" role="tablist" aria-label={t('mail.title')}>
+        {(['pending', 'recent'] as const).map(name => (
+          <button key={name} type="button" role="tab" aria-selected={section === name}
+            className={`slp-mail-tab${section === name ? ' slp-mail-tab-active' : ''}`}
+            onClick={() => { select(name) }}>{t(name === 'pending' ? 'mail.pending' : 'mail.recent')}</button>
+        ))}
+      </div>
+      <button type="button" className="slp-text-button" disabled={state.status === 'loading' || state.refreshing || state.loadingMore}
+        onClick={() => { void mail.refresh() }}>{t('mail.refresh')}</button>
+    </div>
+    {summary === undefined ? null : <div className="slp-mail-summary">
+      {t('mail.summary', {
+        inbound: summary.pendingInbound, outbound: summary.pendingOutbound,
+        used: summary.wake.used, limit: summary.wake.limit, reset: utcClock(summary.wake.resetsAt),
+      })}
+    </div>}
+    {summary?.firstTaskWakeOwed === true
+      ? <div className="slp-footnote" title={t('mail.firstwake.title')}>{t('mail.firstwake')}</div> : null}
+    {sampledAt === undefined ? null
+      : <div className="slp-footnote">{t('mail.updated', { time: timeOf(sampledAt) })}</div>}
+    {state.status === 'error' ? <div className="slp-notice" role="alert">
+      <span>{t('mail.error')}{state.error === undefined ? '' : `: ${state.error}`}</span>
+      <button type="button" className="slp-text-button" onClick={() => { void mail.refresh() }}>{t('panel.retry')}</button>
+    </div> : null}
+    {state.refreshError === undefined && state.pageError === undefined ? null : <div className="slp-notice" role="alert">
+      {state.refreshError === undefined ? null : <span>
+        {t('mail.stale', { time: sampledAt === undefined ? '?' : timeOf(sampledAt) })}: {state.refreshError}
+        {' '}<button type="button" className="slp-text-button" onClick={() => { void mail.refresh() }}>{t('panel.retry')}</button>
+      </span>}
+      {state.pageError === undefined ? null : <span>
+        {t('mail.more.error')}: {state.pageError}
+        {' '}<button type="button" className="slp-text-button" onClick={() => { void mail.loadMore() }}>{t('panel.retry')}</button>
+      </span>}
+    </div>}
+    {state.status === 'loading' ? <div className="slp-state" role="status">{t('mail.loading')}</div> : null}
+    {state.status === 'ready' && state.pages.every(page => page.entries.length === 0) ? <div className="slp-state">{t('mail.empty')}</div> : null}
+    {state.pages.map((page, index) => <div key={`${state.section}-${index}`} className="slp-mail-page">
+      {index === 0 ? null : <div className="slp-footnote">{t('mail.page.sampled', { time: timeOf(page.sampledAt) })}</div>}
+      {page.entries.map(entry => {
+        const peer = entry.direction === 'inbound' ? entry.senderId : entry.targetId
+        const title = sessionTitle(snapshot.view, peer)
+        return <article key={entry.messageId} className="slp-mail-entry">
+          <div className="slp-mail-row">
+            <span className="slp-mail-direction">{t(entry.direction === 'inbound' ? 'mail.direction.in' : 'mail.direction.out', { title })}</span>
+            <span className={`slp-mail-status slp-mail-status-${entry.status}`}>{t(`mail.status.${entry.status}`)}</span>
+          </div>
+          {entry.preview === '' ? null : <div className="slp-mail-preview">{entry.preview}</div>}
+          <div className="slp-mail-meta">{t('mail.enqueued', { time: new Date(entry.createdAt).toLocaleString() })}</div>
+          {entry.lastError === undefined ? null : <div className="slp-notice">{t('mail.last.error')}: {entry.lastError}</div>}
+          {entry.blockingReasons.length === 0 ? null : <div className="slp-footnote">
+            {t('mail.blocking', { reasons: entry.blockingReasons.map(reason => t(`mail.reason.${reason}`)).join(' · ') })}
+          </div>}
+        </article>
+      })}
+    </div>)}
+    {state.pages[state.pages.length - 1]?.nextCursor === undefined ? null : <div className="slp-mail-actions">
+      <button type="button" className="slp-text-button" disabled={state.loadingMore || state.refreshing}
+        onClick={() => { void mail.loadMore() }}>{state.loadingMore ? t('mail.loading') : t('mail.more')}</button>
+    </div>}
+    {summary === undefined || summary.legacyBlocked === 0 ? null
+      : <div className="slp-footnote">{t('mail.legacy', { count: summary.legacyBlocked })}</div>}
+  </section>
+}
+
+/** Linked-peer quick view in the header popover; each row opens that session. */
+function QuickPeers({ snapshot, sessionId, openSession, t }: {
+  readonly snapshot: LinkSnapshot
+  readonly sessionId: SessionId
+  readonly openSession: LinkInjected['openSession']
+  readonly t: LinkProps['t']
+}): ReactNode {
+  const rows = peerRows(snapshot.view?.links ?? [], sessionId)
+  const seen = new Set<SessionId>()
+  const peers = rows.filter(row => seen.size !== seen.add(row.peerId).size)
+  if (peers.length === 0) return null
+  return <div className="slp-quick-peers">
+    <div className="slp-footnote">{t('quick.peers')}</div>
+    {peers.map(row => {
+      const session = snapshot.view?.sessions.find(item => item.id === row.peerId)
+      const title = sessionTitle(snapshot.view, row.peerId)
+      const status = session?.archived ? t('peer.archived') : t(session?.running ? 'peer.running' : 'peer.idle')
+      return <div key={row.peerId} className="slp-peer-heading">
+        <div className="slp-peer-main">
+          <span className="slp-peer-title" title={title}>{title}</span>
+          <span className="slp-peer-meta">{status}</span>
+        </div>
+        {session?.archived === true ? null : <button type="button" className="slp-text-button"
+          title={t('peer.open.title', { title })} onClick={() => { openSession(row.peerId) }}>{t('peer.open')}</button>}
+      </div>
+    })}
+  </div>
+}
+
 /** Click-to-open quick linker. Escape restores focus; outside pointer/focus dismisses. */
 export function HeaderAction(props: LinkProps & {
   readonly useSession: SnapshotSelectorHook<{ readonly openState: string }>
@@ -236,6 +404,8 @@ export function HeaderAction(props: LinkProps & {
       <div className="slp-peer-heading"><strong>{t('quick.title')}</strong><button type="button" className="slp-text-button"
         aria-label={t('quick.close')} onClick={() => { setOpen(false); trigger.current?.focus() }}>×</button></div>
       <div className="slp-footnote">{t('panel.owner', { title: sessionTitle(snapshot.view, sessionId) })}</div>
+      <MailGlance mail={props.mail} t={t} />
+      <QuickPeers snapshot={snapshot} sessionId={sessionId} openSession={props.openSession} t={t} />
       <QueryState snapshot={snapshot} refresh={refresh} t={t} />
       {snapshot.view === undefined ? null : <LinkPicker key={sessionId} sessionId={sessionId} snapshot={snapshot} link={props.link} t={t}
         autoFocus onLinked={() => { setOpen(false); trigger.current?.focus() }} />}
@@ -245,7 +415,7 @@ export function HeaderAction(props: LinkProps & {
 }
 
 /** Management actions always bind to this explicit owner, not the visible conversation. */
-export function LinkTab({ sessionId, useLinks, refresh, setWake, link, unlink, openSession, t }: LinkProps): ReactNode {
+export function LinkTab({ sessionId, useLinks, refresh, setWake, link, unlink, loadActivity, mail, openSession, t }: LinkProps): ReactNode {
   const snapshot = useLinks(value => value)
   const view = snapshot.view
   const { busy, error, run } = useOperation(sessionId)
@@ -257,7 +427,12 @@ export function LinkTab({ sessionId, useLinks, refresh, setWake, link, unlink, o
   const self = view?.sessions.find(session => session.id === sessionId)
   const disabled = busy || snapshot.status !== 'ready' || self === undefined || self.archived || !self.ordinary
   return <div className="slp-panel" data-session-link-panel="" data-session-link-owner={sessionId} aria-busy={busy}>
-    <Styles /><div className="slp-footnote">{t('panel.owner', { title: sessionTitle(view, sessionId) })}</div>
+    <Styles /><div className="slp-peer-heading">
+      <div className="slp-peer-main"><span className="slp-footnote">{t('panel.owner', { title: sessionTitle(view, sessionId) })}</span></div>
+      {self === undefined || self.archived ? null : <button type="button" className="slp-text-button"
+        title={t('peer.open.title', { title: sessionTitle(view, sessionId) })}
+        onClick={() => { openSession(sessionId) }}>{t('panel.open.session')}</button>}
+    </div>
     <QueryState snapshot={snapshot} refresh={refresh} t={t} />
     {view === undefined ? null : <>
       {groups.length === 0 ? <div className="slp-state">{t('panel.empty')}</div> : groups.map(group => (
@@ -287,6 +462,7 @@ export function LinkTab({ sessionId, useLinks, refresh, setWake, link, unlink, o
       </div>
       <div className="slp-footnote">{t('wake.budget.hint')}</div><div className="slp-footnote">{t('tab.command.hint')}</div>
     </>}
+    <MailSection sessionId={sessionId} snapshot={snapshot} loadActivity={loadActivity} mail={mail} t={t} />
     {error === null ? null : <div role="alert" className="slp-notice">{error}</div>}
   </div>
 }

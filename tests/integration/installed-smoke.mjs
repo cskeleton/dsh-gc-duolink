@@ -22,6 +22,8 @@ const env = { ...process.env, DSH_HOME: home, DSH_TELEMETRY_DISABLED: '1', npm_c
 const artifactDir = resolve(process.env.SMOKE_ARTIFACT_DIR ?? join(pluginDir, 'output', 'playwright'))
 const alphaId = 'session-link-smoke-alpha'
 const betaId = 'session-link-smoke-beta'
+// Gamma never runs a foreground turn, so mail addressed to it stays queued.
+const gammaId = 'session-link-smoke-gamma'
 const peerHistoryText = 'Peer history remains readable.'
 let betaReadThroughSeq
 let server
@@ -67,7 +69,7 @@ async function seedSessions() {
   const ctx = new Context()
   try {
     await ctx.plugin(Persistence, { root: join(home, 'sessions') })
-    for (const [id, title] of [[alphaId, 'Link alpha'], [betaId, 'Link beta']]) {
+    for (const [id, title] of [[alphaId, 'Link alpha'], [betaId, 'Link beta'], [gammaId, 'Link gamma']]) {
       const at = Date.now() - 60_000
       const header = { version: SESSION_FORMAT_VERSION, id: SessionId(id), createdAt: at, isSeeded: false, cwd: workspace, delegationDepth: 0 }
       const handle = await ctx.sessionPersistence.create(header)
@@ -202,7 +204,7 @@ try {
     '- id: ui-plugin-manager', '  config:', '    registryProbeEnabled: false',
     '- id: ui-settings-general', '  config:', '    welcomeNoticeVersion: 2026-09-28.1',
     '- id: ui-settings-models', '  config:', '    credentialOnboarding: false',
-    '- id: session-link', '  config:', '    uiPollIntervalMs: 1000',
+    '- id: session-link', '  config:', '    uiPollIntervalMs: 1000', '    maxPendingPerTarget: 48',
     '- id: workspace-controller', '  config:', `    documentsDirectory: ${JSON.stringify(join(temp, 'Documents'))}`,
     '- id: directory-picker', '  disabled: true',
     '- insert:', '    - id: directory-picker-browse', "      name: '@deepseek-ai/dsh-host-directory-picker-browse'",
@@ -224,6 +226,32 @@ try {
     "    const visible = names.filter(name => ctx.tools.get(name, agent) !== undefined).length",
     "    process.stdout.write(`SESSION_LINK_AGENT ${agent.id} preset=${preset} tools=${visible}\\n`)",
     '  }, 500) })',
+    // Seed real mail through the packed service once the gamma link exists. No
+    // target ever runs a turn in this profile (there is no model provider), so
+    // delivered mail is impossible here by design; the recent section is
+    // exercised through terminal `revoked` records after the unlink.
+    "  ctx.effect(() => {",
+    "    let seeded = false",
+    '    const seed = setInterval(async () => {',
+    '      try {',
+    '        if (seeded) return',
+    `        const alpha = ctx.agents.get('${alphaId}')`,
+    '        if (alpha === undefined) return',
+    `        const links = ctx.sessionLinks.list('${alphaId}')`,
+    `        if (!links.some(link => link.memberIds.includes('${gammaId}'))) return`,
+    '        for (let index = 1; index <= 25; index += 1) {',
+    `          const text = index === 13 ? 'queued smoke envelope 13 '.padEnd(600, 'long body ') : \`queued smoke envelope \${index}\``,
+    `          await ctx.sessionLinks.send(alpha, '${gammaId}', { targetId: '${gammaId}', text })`,
+    '        }',
+    '        seeded = true',
+    '        clearInterval(seed)',
+    "        process.stdout.write('SESSION_LINK_PENDING_SEEDED=25\\n')",
+    '      } catch (error) {',
+    "        process.stdout.write(`SESSION_LINK_SEED_ERROR ${error?.message ?? error}\\n`)",
+    '      }',
+    '    }, 1000)',
+    '    return () => clearInterval(seed)',
+    "  }, 'integration: seed peer mail')",
     '}', '',
   ].join('\n'))
   const verificationOverlay = join(temp, 'verification.patch.yml')
@@ -241,7 +269,7 @@ try {
   assert.ok(view.sessions.some(session => session.id === alphaId && session.title === 'Link alpha'))
   assert.ok(view.sessions.some(session => session.id === betaId && session.ordinary && !session.blank))
   // The final UI assertions are kept below so every browser action uses the installed bundle.
-  await runScenario({ page, rpc, requireRpc, eventually, selectSession, alphaId, betaId, artifactDir })
+  await runScenario({ page, rpc, requireRpc, eventually, selectSession, alphaId, betaId, gammaId, artifactDir })
   await page.screenshot({ path: join(artifactDir, 'installed-session-link.png') })
   assert.deepEqual(failures, [], 'browser emitted no unhandled JavaScript errors')
   await stopServer()
@@ -268,7 +296,7 @@ try {
   await missingLinkRpc()
   assert.equal(await page.locator('[data-session-link-action]').count(), 0, 'removed plugin has no header action')
   assert.deepEqual(failures, [], 'plugin-free browser emitted no unhandled JavaScript errors')
-  const summary = JSON.stringify({ result: 'PASS', dshVersion: version.trim(), installation: 'packed tarball', modelCalls: 0, toolsScopedToListedPresets: true, explicitSessionIdAdopted: true, invalidPluginConfigCoreUsable: true, pluginAbsentSessionsReadable: true, artifactDir })
+  const summary = JSON.stringify({ result: 'PASS', dshVersion: version.trim(), installation: 'packed tarball', modelCalls: 0, toolsScopedToListedPresets: true, explicitSessionIdAdopted: true, invalidPluginConfigCoreUsable: true, pluginAbsentSessionsReadable: true, activityViewPaged: true, activityCursorRejected: true, mailSurface: true, mailFailureRetained: true, quickPeerOpen: true, managedSessionOpen: true, unlinkRevokesQueuedMail: true, artifactDir })
   await writeFile(join(artifactDir, 'installed-smoke-result.json'), `${summary}\n`)
   await removeGenerated(join(artifactDir, 'installed-session-link-failure.png'), { force: true })
   console.log(summary)
@@ -287,7 +315,7 @@ try {
   await removeGenerated(temp, { recursive: true, force: true })
 }
 
-async function runScenario({ page, rpc, requireRpc, eventually, selectSession, alphaId, betaId, artifactDir }) {
+async function runScenario({ page, rpc, requireRpc, eventually, selectSession, alphaId, betaId, gammaId, artifactDir }) {
   const concurrent = await Promise.all([
     rpc('sessionLinks/linkFrom', { callerId: alphaId, peerId: betaId, autoWake: false }),
     rpc('sessionLinks/linkFrom', { callerId: betaId, peerId: alphaId, autoWake: false }),
@@ -344,6 +372,125 @@ async function runScenario({ page, rpc, requireRpc, eventually, selectSession, a
   await eventually(async () => (await requireRpc('sessionLinks/view')).links.find(group => group.id === link.id)?.autoWakeSessionIds.includes(betaId), 'UI wake writes the peer flag')
   await requireRpc('sessionLinks/setAutoWakeFrom', { callerId: alphaId, linkId: link.id, peerId: betaId, on: false })
   await eventually(async () => await peerWake.getAttribute('aria-checked') === 'false', 'background mutation becomes visible through polling')
+  // M1 activity surface: packed RPC paging, the mail tab, and the header quick view.
+  const gammaLink = await requireRpc('sessionLinks/linkFrom', { callerId: alphaId, peerId: gammaId, autoWake: false })
+  await eventually(async () => output.includes('SESSION_LINK_PENDING_SEEDED=25'), 'queued smoke envelopes are admitted by the packed plugin')
+  const first = await requireRpc('sessionLinks/activityView', { sessionId: alphaId, section: 'pending' })
+  assert.equal(first.total, 25, 'pending total counts every queued envelope')
+  assert.equal(first.entries.length, 20, 'the default page size applies over the wire')
+  assert.ok(first.nextCursor !== undefined, 'a second page is advertised')
+  assert.ok(first.entries[0].preview.includes('queued smoke envelope 1'), 'admission order leads the first page')
+  assert.ok(first.entries[0].blockingReasons.includes('cold-target'), 'a cold target explains its queue state')
+  assert.equal(first.summary.pendingOutbound, 25)
+  assert.equal(first.summary.wake.limit, 6)
+  const second = await requireRpc('sessionLinks/activityView', { sessionId: alphaId, section: 'pending', cursor: first.nextCursor })
+  assert.equal(second.entries.length, 5, 'the opaque cursor continues the same admission order')
+  assert.ok(second.entries[0].preview.includes('queued smoke envelope 21'), 'the second page resumes after the first')
+  assert.equal(second.nextCursor, undefined, 'the chain ends after the last entry')
+  const invalidCursor = await rpc('sessionLinks/activityView', { sessionId: alphaId, section: 'pending', cursor: 'not-a-cursor' })
+  assert.equal(invalidCursor.ok, false, 'a forged cursor is rejected over the wire')
+  assert.ok(JSON.stringify(invalidCursor.error).includes('ACTIVITY_CURSOR_INVALID'), 'the rejection carries the cursor code')
+  // Mail surface inside the alpha management tab opened above.
+  const mail = panel.locator('section.slp-mail')
+  await eventually(async () => (await mail.textContent()).includes('Outbound 25'), 'mail summary counts queued envelopes')
+  assert.ok((await mail.textContent()).includes('Wake 0/6'), 'mail summary shows the day budget')
+  assert.ok((await mail.textContent()).includes('queued smoke envelope 1'), 'first-page rows render')
+  assert.ok((await mail.textContent()).includes('Enqueued'), 'rows carry their enqueue time')
+  assert.ok((await mail.textContent()).includes('target not resident'), 'rows explain why they are queued')
+  // A failed next page keeps page one and reports raw detail.
+  const alerts = async () => (await mail.getByRole('alert').allTextContents()).join(' ')
+  await page.route('**/api/sessionLinks/activityView', route => route.fulfill({ status: 503, contentType: 'application/json', body: '{}' }))
+  await mail.getByRole('button', { name: 'Load more', exact: true }).click()
+  await eventually(async () => (await alerts()).includes('Next page unavailable'), 'raw paging failure surfaces')
+  assert.ok((await mail.textContent()).includes('queued smoke envelope 1'), 'page one survives the paging failure')
+  await page.unroute('**/api/sessionLinks/activityView')
+  await mail.getByRole('button', { name: 'Retry', exact: true }).last().click()
+  await eventually(async () => (await mail.textContent()).includes('queued smoke envelope 21'), 'retry appends the second page')
+  // A failed refresh keeps the stale snapshot with its sampled time.
+  await page.route('**/api/sessionLinks/activityView', route => route.fulfill({ status: 503, contentType: 'application/json', body: '{}' }))
+  await mail.getByRole('button', { name: 'Refresh', exact: true }).click()
+  await eventually(async () => (await alerts()).includes('Refresh unavailable'), 'refresh failure surfaces without dropping rows')
+  assert.ok((await mail.textContent()).includes('queued smoke envelope 21'), 'the stale snapshot stays rendered')
+  await page.screenshot({ path: join(artifactDir, 'session-link-mail-stale.png') })
+  await page.unroute('**/api/sessionLinks/activityView')
+  await mail.getByRole('button', { name: 'Retry', exact: true }).first().click()
+  await eventually(async () => await mail.getByRole('alert').count() === 0, 'refresh retry clears the alert')
+  // The pending tab with both pages loaded is the documented mail surface.
+  await page.screenshot({ path: join(artifactDir, 'session-link-mail.png') })
+  // Header glance plus the linked-session quick view open a peer session.
+  await page.locator('[data-session-link-action]').click()
+  const quickView = page.getByRole('dialog', { name: 'Quick link', exact: true })
+  await quickView.waitFor({ timeout: 15_000 })
+  await eventually(async () => (await quickView.textContent()).includes('Wake 0/6'), 'header glance shows the day budget')
+  const glance = quickView.locator('.slp-footnote', { hasText: 'Inbound' })
+  assert.ok(((await glance.getAttribute('title')) ?? '').startsWith('Updated '), 'the glance carries a sampled-time staleness hint')
+  assert.ok((await quickView.textContent()).includes('Linked sessions'), 'header quick view lists linked peers')
+  await quickView.locator('button[title="Open session \\"Link beta\\""]').click()
+  await page.getByText('Link beta.', { exact: true }).first().waitFor({ timeout: 15_000 })
+  await selectSession('Link alpha')
+  // Unlink revokes queued mail; the mounted mail view converges through polling.
+  await requireRpc('sessionLinks/unlinkFrom', { callerId: alphaId, linkId: gammaLink.linkId })
+  await eventually(async () => (await requireRpc('sessionLinks/activityView', { sessionId: alphaId, section: 'pending' })).total === 0, 'unlink revokes queued mail')
+  const revoked = await requireRpc('sessionLinks/activityView', { sessionId: alphaId, section: 'recent' })
+  assert.ok(revoked.total >= 25, 'revoked mail lands in the recent section')
+  assert.ok(revoked.entries.every(entry => entry.status === 'revoked'), 'every recent entry is terminal revoked')
+  assert.ok(revoked.entries.some(entry => entry.preview.includes('queued smoke envelope 1')), 'recent previews match the queued envelopes')
+  await alphaRow.hover()
+  await alphaRow.locator('[data-session-link-row-action]').click()
+  await eventually(async () => await panel.getAttribute('data-session-link-owner') === alphaId, 'management tab returns to alpha')
+  await eventually(async () => (await mail.textContent()).includes('No messages'), 'revoked mail disappears from the mounted view')
+  // The recent tab lists the revoked envelopes, including the long body.
+  await mail.getByRole('tab', { name: 'Recent', exact: true }).click()
+  await eventually(async () => (await mail.textContent()).includes('queued smoke envelope 13'), 'recent tab lists revoked mail')
+  assert.ok((await mail.textContent()).includes('Revoked'), 'recent rows carry the revoked status')
+  assert.ok((await mail.textContent()).includes('long body'), 'long previews render in recent rows')
+  // Round-2 lifecycle boundaries: remount consistency and inactivity read
+  // isolation. (The interrupted-first-read boundary runs after the reload
+  // below, where a fresh controller starts its first read.)
+  // A foreground-switch remount keeps the selected tab consistent with the retained section.
+  await alphaRow.hover()
+  await alphaRow.locator('[data-session-link-row-action]').click()
+  await eventually(async () => await panel.getAttribute('data-session-link-owner') === alphaId, 'panel owner returns to alpha')
+  await eventually(async () => (await mail.textContent()).includes('Revoked'), 'alpha recent rows stay retained')
+  await selectSession('Link beta')
+  await selectSession('Link alpha')
+  await eventually(async () => (await mail.textContent()).includes('queued smoke envelope 13'), 'remount keeps the retained recent rows')
+  assert.equal((await mail.getByRole('tab', { selected: true }).textContent())?.trim(), 'Recent', 'remount keeps the selected tab consistent with the retained section')
+  // While alpha's mail is unsubscribed, client writes never re-read it.
+  await betaRow.hover()
+  await betaRow.locator('[data-session-link-row-action]').click()
+  await eventually(async () => await panel.getAttribute('data-session-link-owner') === betaId, 'alpha mail unsubscribes behind the beta panel')
+  let alphaReads = 0
+  await page.route('**/api/sessionLinks/activityView', route => {
+    if ((route.request().postData() ?? '').includes(alphaId)) alphaReads += 1
+    return route.continue()
+  })
+  const betaWake = panel.getByRole('switch', { name: 'Peer messages → wake me', exact: true })
+  await betaWake.click()
+  await eventually(async () => await betaWake.getAttribute('aria-checked') === 'true', 'beta wake grant toggles on')
+  await betaWake.click()
+  await eventually(async () => await betaWake.getAttribute('aria-checked') === 'false', 'beta wake grant toggles back off')
+  await new Promise(resolve => setTimeout(resolve, 2_500))
+  assert.equal(alphaReads, 0, 'an unsubscribed owner issues no activity reads on writes')
+  await page.unroute('**/api/sessionLinks/activityView')
+  await alphaRow.hover()
+  await alphaRow.locator('[data-session-link-row-action]').click()
+  await eventually(async () => await panel.getAttribute('data-session-link-owner') === alphaId, 'panel owner returns to alpha for the layout checks')
+  await eventually(async () => (await mail.textContent()).includes('queued smoke envelope 13'), 'reactivation converges on the retained recent rows')
+  // Narrow viewports keep the mail surface usable, long body included.
+  await page.setViewportSize({ width: 820, height: 1000 })
+  await eventually(async () => (await mail.textContent()).includes('queued smoke envelope 13'), 'narrow viewport still renders the mail surface')
+  await page.screenshot({ path: join(artifactDir, 'session-link-narrow.png') })
+  await page.setViewportSize({ width: 1440, height: 1000 })
+  await mail.getByRole('tab', { name: 'Pending', exact: true }).click()
+  // The management tab of a non-current session opens that session.
+  const betaRowAgain = page.getByRole('treeitem').filter({ hasText: 'Link beta' }).last()
+  await betaRowAgain.hover()
+  await betaRowAgain.locator('[data-session-link-row-action]').click()
+  await eventually(async () => await panel.getAttribute('data-session-link-owner') === betaId, 'beta management tab is keyed to beta')
+  await panel.getByRole('button', { name: 'Open managed session', exact: true }).click()
+  await page.getByText('Link beta.', { exact: true }).first().waitFor({ timeout: 15_000 })
+  await selectSession('Link alpha')
   const commands = await requireRpc('commands/list', undefined, { args: { agentId: alphaId } })
   assert.ok(commands.some(command => command.name === 'session-link'), 'session-link command is visible to the resumed ordinary Session')
   await eventually(async () => output.includes(`SESSION_LINK_AGENT ${alphaId} preset=standard tools=5`), 'all five tools mount in the standard-preset Agent scope')
@@ -374,11 +521,29 @@ async function runScenario({ page, rpc, requireRpc, eventually, selectSession, a
   await page.unroute('**/api/sessionLinks/view')
   await panel.getByRole('button', { name: 'Retry', exact: true }).click()
   await eventually(async () => await panel.getByRole('alert').count() === 0, 'retry restores the catalog')
+  // An interrupted first read after reload restarts on remount instead of
+  // sticking on loading.
+  let activityReads = 0
+  await page.route('**/api/sessionLinks/activityView', async route => {
+    activityReads += 1
+    await new Promise(resolve => setTimeout(resolve, 700))
+    // The interrupted request is aborted by the client, so its route may
+    // already be handled by the time the delay elapses.
+    await route.continue().catch(() => {})
+  })
   await page.reload({ waitUntil: 'load' })
   await selectSession('Link alpha')
   await page.locator('[data-session-link-action]').click()
   await page.getByRole('dialog', { name: 'Quick link', exact: true }).getByRole('button', { name: 'Manage links', exact: true }).click()
   await panel.waitFor({ timeout: 15_000 })
+  await eventually(async () => activityReads > 0, 'the first read is in flight')
+  await selectSession('Link beta')
+  await selectSession('Link alpha')
+  await page.locator('[data-session-link-action]').click()
+  await page.getByRole('dialog', { name: 'Quick link', exact: true }).getByRole('button', { name: 'Manage links', exact: true }).click()
+  await panel.waitFor({ timeout: 15_000 })
+  await page.unroute('**/api/sessionLinks/activityView')
+  await eventually(async () => (await mail.textContent()).includes('No messages'), 'an interrupted first read restarts on remount')
   assert.ok((await panel.textContent()).includes('Link beta'), 'link survives browser reload')
   await panel.getByRole('button', { name: 'Unlink', exact: true }).click()
   await panel.getByRole('button', { name: 'Confirm unlink', exact: true }).click()

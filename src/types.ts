@@ -140,6 +140,110 @@ export interface SessionLinkView {
   readonly sessions: readonly SessionLinkSessionView[]
 }
 
+/** Mailbox section an activity query pages through. */
+export type SessionLinkActivitySection = 'pending' | 'recent'
+
+/**
+ * Why one pending message is still waiting. Several reasons may coexist on one
+ * entry; `unknown` appears alone when none of the known blockers applies.
+ */
+export type SessionLinkBlockingReason =
+  | 'wake-unauthorized'
+  | 'wake-budget'
+  | 'archived'
+  | 'cold-target'
+  | 'delivery-unverified'
+  | 'link-revoked'
+  | 'unknown'
+
+/** One mailbox row as the activity view projects it; carries no model-visible body. */
+export interface SessionLinkActivityEntry {
+  readonly messageId: SessionLinkMessageId
+  readonly linkId: SessionLinkId
+  /** Direction relative to the querying Session. */
+  readonly direction: 'inbound' | 'outbound'
+  readonly senderId: SessionId
+  readonly targetId: SessionId
+  readonly status: SessionLinkMessageStatus
+  /** ISO-8601 admission timestamp; enqueue time, never a delivery time. */
+  readonly createdAt: string
+  /** Admission sequence; absent on messages admitted before 0.4.0. */
+  readonly seq?: number
+  readonly inReplyTo?: SessionLinkMessageId
+  /** Sender body without its delivery frame, control characters collapsed, capped at 160 characters. */
+  readonly preview: string
+  /** Sanitized failure detail for `failed` records; capped, markup inert. */
+  readonly lastError?: string
+  /** Whether a cancel request could still succeed for this pending message right now. */
+  readonly canCancel: boolean
+  /** Known reasons this pending message has not moved; empty for terminal and delivered rows. */
+  readonly blockingReasons: readonly SessionLinkBlockingReason[]
+}
+
+/** Live posture of one counterparty named on the returned page. */
+export interface SessionLinkActivityTarget {
+  readonly id: SessionId
+  /** Whether an Agent exists for the Session without resuming it. */
+  readonly live: boolean
+  /** Whether that live Agent is currently running a turn. */
+  readonly running: boolean
+  readonly archived: boolean
+}
+
+/** Session-level counters beside one page; never filtered by section or peer. */
+export interface SessionLinkActivitySummary {
+  readonly wake: {
+    /** Automatic wakes the querying Session's incoming mail already spent today. */
+    readonly used: number
+    readonly limit: number
+    /** UTC day key the counter belongs to. */
+    readonly day: string
+    /** Start of the next UTC day, when the counter resets. */
+    readonly resetsAt: string
+  }
+  readonly pendingInbound: number
+  readonly pendingOutbound: number
+  /** Whether any spawn-granted group still owes this Session its one first-task wake. */
+  readonly firstTaskWakeOwed: boolean
+  /** Legacy report-marked records held in isolation; informational, never actionable here. */
+  readonly legacyBlocked: number
+  readonly targets: readonly SessionLinkActivityTarget[]
+}
+
+/** One bounded page of mailbox activity plus the counters a quick glance needs. */
+export interface SessionLinkActivityView {
+  /** ISO-8601 instant the snapshot was assembled. */
+  readonly sampledAt: string
+  /** Rows matching the section and filters before paging. */
+  readonly total: number
+  readonly entries: readonly SessionLinkActivityEntry[]
+  /** Pass back as `cursor` for the next page; absent when this page is the last. */
+  readonly nextCursor?: string
+  readonly summary: SessionLinkActivitySummary
+}
+
+/**
+ * Request accepted by the `sessionLinks/activityView` Remote: a read-only,
+ * paginated mailbox observation. `sessionId` selects the viewed mailbox and is
+ * not an identity credential; viewing grants no send rights.
+ */
+export interface SessionLinkActivityRequest {
+  readonly sessionId: SessionId
+  readonly section: SessionLinkActivitySection
+  /** Restrict entries to mail with this one counterparty, in either direction. */
+  readonly peerId?: SessionId
+  /** Opaque continuation token from an earlier page's `nextCursor`. */
+  readonly cursor?: string
+  /** Page size; defaults to 20, never above 50. */
+  readonly limit?: number
+}
+
+/**
+ * Client-side `activityView` page request: the caller binds its own Session
+ * identity before invoking the Remote.
+ */
+export type SessionLinkActivityQuery = Omit<SessionLinkActivityRequest, 'sessionId'>
+
 /**
  * Request accepted by the `sessionLinks/linkFrom` Remote: link the caller's
  * Session with one peer, granted as `{ kind: 'human' }` like the `/session-link`
@@ -260,6 +364,7 @@ export class SessionLinkError extends Error {
       | 'TARGET_ARCHIVED'
       | 'TARGET_OWNED_BY_SUBAGENT'
       | 'TARGET_UNAVAILABLE'
+      | 'ACTIVITY_CURSOR_INVALID'
       | 'DISPOSED',
   ) {
     super(message)

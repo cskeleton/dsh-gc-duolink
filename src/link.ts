@@ -4,7 +4,7 @@
  * @module dsh-session-link/link
  */
 
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { Context, Service } from '@deepseek-ai/cordis'
 import { brandString } from '@deepseek-ai/dsh-brand'
 import { z as wire } from 'zod'
@@ -33,8 +33,12 @@ import {
 } from './types.ts'
 import type {
   Config as SessionLinkConfigShape,
+  SessionLinkActivityEntry,
+  SessionLinkActivityRequest,
+  SessionLinkActivityView,
   SessionLinkAddRequest,
   SessionLinkAddResult,
+  SessionLinkBlockingReason,
   SessionLinkGrant,
   SessionLinkMessageSource,
   SessionLinkRevokeRequest,
@@ -51,6 +55,13 @@ const wireLinkId = wire.string().min(1).transform(value => SessionLinkId(value))
 const addRequestSchema = wire.strictObject({ callerId: wireSessionId, peerId: wireSessionId, autoWake: wire.boolean(), autoWakeCaller: wire.boolean().optional() })
 const revokeRequestSchema = wire.strictObject({ callerId: wireSessionId, linkId: wireLinkId })
 const wakeRequestSchema = wire.strictObject({ callerId: wireSessionId, linkId: wireLinkId, peerId: wireSessionId, on: wire.boolean() })
+const activityRequestSchema = wire.strictObject({
+  sessionId: wireSessionId,
+  section: wire.enum(['pending', 'recent']),
+  peerId: wireSessionId.optional(),
+  cursor: wire.string().min(1).max(512).optional(),
+  limit: wire.number().int().min(1).max(50).optional(),
+})
 
 /** Fully resolved deployment limits. */
 export interface SessionLinkLimits {
@@ -151,6 +162,136 @@ function chainRootOf(
 /** Presence of either old report marker prevents normal peer execution. */
 function legacyTaskReport(record: SessionLinkMessageRecordData): boolean {
   return record.statusKind !== undefined || record.taskStatus !== undefined
+}
+
+/**
+ * Opaque page-cursor payload. `recent` pages keyset on the enqueue identity of
+ * the last returned entry. `pending` pages pin a bounded snapshot instead: the
+ * mixed-generation admission comparator is not a total order, so a keyset
+ * could skip or repeat rows; the snapshot digest invalidates the cursor as
+ * soon as the queue under it changes, and the offset walks that snapshot.
+ */
+const activityCursorSchema = wire.strictObject({
+  v: wire.literal(1),
+  kind: wire.enum(['recent', 'pending']),
+  seq: wire.number().int().positive().nullable().optional(),
+  createdAt: wire.string().optional(),
+  id: wire.string().min(1).optional(),
+  sig: wire.string().min(1).optional(),
+  offset: wire.number().int().nonnegative().optional(),
+})
+
+type ActivityCursor = wire.infer<typeof activityCursorSchema>
+
+/**
+ * Delivery admission order, shared verbatim with `pendingFor` so the pending
+ * projection can never diverge from what delivery would do: the monotonic
+ * admission sequence, falling back to the timestamp for messages admitted
+ * before 0.4.0 carried one. This comparator is only pairwise — a mailbox
+ * mixing generations with inverted sequence/timestamp pairs is not totally
+ * ordered by it — which is why pending paging pins snapshots, not keysets.
+ */
+function compareAdmission(
+  left: { seq?: number; createdAt: string },
+  right: { seq?: number; createdAt: string },
+): number {
+  return left.seq !== undefined && right.seq !== undefined
+    ? left.seq - right.seq
+    : left.createdAt.localeCompare(right.createdAt)
+}
+
+/**
+ * Total order over enqueue identity for the display-only recent section: the
+ * admission sequence, with every pre-0.4.0 unsequenced record preceding all
+ * sequenced ones. The timestamp and the durable id break ties so keyset
+ * paging stays stable even when a mailbox mixes both generations. This order
+ * is a reading convention, not a delivery claim; pending uses the delivery
+ * comparator plus snapshot cursors instead.
+ */
+function compareEnqueue(
+  left: { seq?: number; createdAt: string },
+  leftId: string,
+  right: { seq?: number; createdAt: string },
+  rightId: string,
+): number {
+  if (left.seq === undefined && right.seq !== undefined) return -1
+  if (left.seq !== undefined && right.seq === undefined) return 1
+  if (left.seq !== undefined && right.seq !== undefined && left.seq !== right.seq) return left.seq - right.seq
+  const byTime = left.createdAt.localeCompare(right.createdAt)
+  if (byTime !== 0) return byTime
+  return String(leftId).localeCompare(String(rightId))
+}
+
+function encodeActivityCursor(cursor: ActivityCursor): string {
+  return Buffer.from(JSON.stringify(cursor), 'utf8').toString('base64url')
+}
+
+/** Decode one page cursor; anything malformed or cross-section rejects as a caller error. */
+function decodeActivityCursor(cursor: string, section: 'pending' | 'recent'): ActivityCursor {
+  const invalid = (): never => {
+    throw new SessionLinkError('ACTIVITY_CURSOR_INVALID: activity cursor is invalid, stale, or belongs to another view', 'ACTIVITY_CURSOR_INVALID')
+  }
+  let parsed: ActivityCursor
+  try {
+    parsed = activityCursorSchema.parse(JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8')))
+  } catch {
+    return invalid()
+  }
+  if (parsed.kind !== section) invalid()
+  if (parsed.kind === 'recent') {
+    if (parsed.seq === undefined || parsed.createdAt === undefined || parsed.id === undefined
+      || parsed.sig !== undefined || parsed.offset !== undefined) invalid()
+  } else if (parsed.sig === undefined || parsed.offset === undefined
+    || parsed.seq !== undefined || parsed.createdAt !== undefined || parsed.id !== undefined) invalid()
+  return parsed
+}
+
+/** Flatten control runs so one row renders as one inert line; markup is escaped by React. */
+function flattenForDisplay(text: string, limit: number): string {
+  const flat = text.replace(/[\u0000-\u001f\u007f-\u009f]+/g, ' ').trim()
+  return flat.length <= limit ? flat : `${flat.slice(0, limit - 3)}...`
+}
+
+/**
+ * Fixed failure summary for the read-only view. Delivery errors come from
+ * arbitrary layers (storage, flush, resume, host channels) as free text, and
+ * arbitrary free text cannot be made safe by rewriting it: no redaction
+ * pattern set is complete for unconstrained input (URL query keys, JSON
+ * values containing the opposite quote character, escaped quotes, unknown
+ * credential shapes), and truncating plus flattening control characters does
+ * not satisfy "do not return sensitive errors" either. The projection
+ * therefore reports only that a delivery error happened, never any fragment
+ * of the original message, so no credential shape can leak regardless of how
+ * the error was formatted. Records keep their original `error` verbatim:
+ * nothing is rewritten, redacted, or migrated in durable state.
+ */
+const DELIVERY_ERROR_SUMMARY = 'delivery error (details withheld)'
+
+/**
+ * Project a stored delivery error into the view contract: `undefined` when
+ * the record carries no error, otherwise the fixed safe summary above. The
+ * optional short-string contract of `lastError` is unchanged.
+ */
+function errorSummary(error: string | undefined): string | undefined {
+  return error === undefined ? undefined : DELIVERY_ERROR_SUMMARY
+}
+
+/**
+ * Strip the delivery frame only when the stored text provably carries this
+ * record's own frame, rebuilt byte-exact from the record's sender title,
+ * sender id, and message id — never by counting lines, which a sender title
+ * containing newlines would break. Unrecognized or legacy shapes keep their
+ * full text rather than guessing. The caller's words are then capped at 160.
+ */
+function previewText(record: SessionLinkMessageRecordData, messageId: SessionLinkMessageId): string {
+  const frame = frameSessionLinkText({
+    senderTitle: record.senderTitle,
+    senderId: record.senderId,
+    messageId,
+    text: '',
+  })
+  const body = record.text.startsWith(frame) ? record.text.slice(frame.length) : record.text
+  return flattenForDisplay(body, 160)
 }
 
 /**
@@ -471,6 +612,169 @@ export class SessionLinkService extends TypertRemoteService {
           blank: row.blank,
         }
       }),
+    }
+  }
+
+  /**
+   * Remote: one bounded, read-only page of mailbox activity for one Session.
+   * Observing never claims wake budget, writes the domain, consults the
+   * Session Controller, or resumes a cold target; live posture comes from the
+   * already-running Agent registry and the archived-id list only. `sessionId`
+   * is a view selector, not an identity credential: an unlinked party may read
+   * its history without regaining any send rights.
+   * @param request - viewed Session, section, optional peer filter, cursor, and page size.
+   * @returns the page, session-level counters, and a continuation cursor when more rows remain.
+   */
+  @Remote('activityView')
+  async activityView(request: SessionLinkActivityRequest): Promise<SessionLinkActivityView> {
+    const parsed = activityRequestSchema.parse(request)
+    const limit = parsed.limit ?? 20
+    const after = parsed.cursor === undefined ? undefined : decodeActivityCursor(parsed.cursor, parsed.section)
+    const descending = parsed.section === 'recent'
+    const rows = [...this.messages.entries()]
+      .filter(([, record]) => !legacyTaskReport(record))
+      .filter(([, record]) => record.senderId === parsed.sessionId || record.targetId === parsed.sessionId)
+      .filter(([, record]) => parsed.peerId === undefined
+        || record.senderId === parsed.peerId || record.targetId === parsed.peerId)
+      .filter(([, record]) => parsed.section === 'recent' || record.status === 'pending')
+    let page: [SessionLinkMessageId, SessionLinkMessageRecordData][]
+    let more = false
+    let nextCursor: string | undefined
+    if (descending) {
+      // Recent history is display-only: a documented total enqueue order,
+      // newest first, with a stable keyset cursor. It claims no delivery order.
+      rows.sort(([leftId, left], [rightId, right]) => -compareEnqueue(left, leftId, right, rightId))
+      const paged = after === undefined ? rows : rows.filter(([id, record]) => {
+        const order = compareEnqueue(record, id, { seq: after.seq ?? undefined, createdAt: after.createdAt ?? '' }, after.id ?? '')
+        return order < 0
+      })
+      page = paged.slice(0, limit)
+      more = paged.length > limit
+      const last = page.length === 0 ? undefined : page[page.length - 1]!
+      if (more && last !== undefined) {
+        nextCursor = encodeActivityCursor({
+          v: 1, kind: 'recent', seq: last[1].seq ?? null, createdAt: last[1].createdAt, id: last[0],
+        })
+      }
+    } else {
+      // Pending mirrors the real delivery queues, never a global comparator:
+      // `pendingFor` is authoritative for each target's relative order —
+      // including same-target records from senders this view filters out —
+      // and the visible targets interleave by a documented k-way merge on
+      // enqueue time (ties: target id, then message id). Sorting a superset
+      // with the pairwise, non-transitive admission comparator and filtering
+      // afterwards would not preserve any target's true queue.
+      const visible = new Set(rows.map(([id]) => id))
+      const lanes: [SessionLinkMessageId, SessionLinkMessageRecordData][][] = []
+      const laneTargets: SessionId[] = []
+      for (const [, record] of rows) {
+        if (!laneTargets.includes(record.targetId)) {
+          laneTargets.push(record.targetId)
+          lanes.push(this.pendingFor(record.targetId).filter(([id]) => visible.has(id)))
+        }
+      }
+      const heads = lanes.map(() => 0)
+      const ordered: [SessionLinkMessageId, SessionLinkMessageRecordData][] = []
+      for (;;) {
+        let best = -1
+        for (let lane = 0; lane < lanes.length; lane += 1) {
+          const candidate = lanes[lane]![heads[lane]!]
+          if (candidate === undefined) continue
+          if (best === -1) { best = lane; continue }
+          const [bestId, bestRecord] = lanes[best]![heads[best]!]!
+          const [id, record] = candidate
+          const byTime = record.createdAt.localeCompare(bestRecord.createdAt)
+          if (byTime < 0 || (byTime === 0
+            && (String(record.targetId) < String(bestRecord.targetId)
+              || (record.targetId === bestRecord.targetId && String(id) < String(bestId))))) {
+            best = lane
+          }
+        }
+        if (best === -1) break
+        ordered.push(lanes[best]![heads[best]!]!)
+        heads[best]! += 1
+      }
+      // Pages pin a snapshot digest over the final visible ordered
+      // identities: any queue change under an open page invalidates its
+      // cursor instead of skipping rows. `sig` is an unkeyed content digest
+      // for change detection only, not a security signature.
+      const sig = createHash('sha256').update(ordered.map(([id]) => id).join('')).digest('hex').slice(0, 16)
+      const offset = after === undefined ? 0 : after.offset ?? 0
+      if (after !== undefined && after.sig !== sig) {
+        throw new SessionLinkError('ACTIVITY_CURSOR_INVALID: the pending queue changed since this page chain started; reload from the first page', 'ACTIVITY_CURSOR_INVALID')
+      }
+      page = ordered.slice(offset, offset + limit)
+      more = offset + limit < ordered.length
+      if (more) nextCursor = encodeActivityCursor({ v: 1, kind: 'pending', sig, offset: offset + limit })
+    }
+    const entries: SessionLinkActivityEntry[] = page.map(([messageId, record]) => {
+      const pending = record.status === 'pending'
+      const lastError = errorSummary(record.error)
+      return {
+        messageId,
+        linkId: record.linkId,
+        direction: record.targetId === parsed.sessionId ? 'inbound' : 'outbound',
+        senderId: record.senderId,
+        targetId: record.targetId,
+        status: record.status,
+        createdAt: record.createdAt,
+        ...(record.seq === undefined ? {} : { seq: record.seq }),
+        ...(record.inReplyTo === undefined ? {} : { inReplyTo: record.inReplyTo }),
+        preview: previewText(record, messageId),
+        ...(lastError === undefined ? {} : { lastError }),
+        canCancel: pending && !this.mayBeHeld(messageId, record, this.ctx.agents.get(record.targetId)),
+        blockingReasons: pending ? this.blockingReasons(messageId, record) : [],
+      }
+    })
+    const now = new Date()
+    const today = dayKey(now)
+    const wakeEntry = this.readLedgers().wakes[String(parsed.sessionId)]
+    let pendingInbound = 0
+    let pendingOutbound = 0
+    let legacyBlocked = 0
+    for (const [, record] of this.messages.entries()) {
+      if (record.senderId !== parsed.sessionId && record.targetId !== parsed.sessionId) continue
+      if (legacyTaskReport(record)) { legacyBlocked += 1; continue }
+      if (record.status !== 'pending') continue
+      if (record.targetId === parsed.sessionId) pendingInbound += 1
+      else pendingOutbound += 1
+    }
+    // Only groups the viewed Session belongs to may owe it a first-task wake;
+    // an unrelated spawn grant between other Sessions is not this viewer's debt.
+    let firstTaskWakeOwed = false
+    for (const [linkId, link] of this.links.entries()) {
+      if (!link.memberIds.includes(parsed.sessionId)) continue
+      if (this.firstWakeOwed(linkId, link, parsed.sessionId)) { firstTaskWakeOwed = true; break }
+    }
+    const counterparties = new Set<SessionId>()
+    for (const entry of entries) counterparties.add(entry.direction === 'inbound' ? entry.senderId : entry.targetId)
+    if (parsed.peerId !== undefined) counterparties.add(parsed.peerId)
+    return {
+      sampledAt: now.toISOString(),
+      total: rows.length,
+      entries,
+      ...(more && nextCursor !== undefined ? { nextCursor } : {}),
+      summary: {
+        wake: {
+          used: wakeEntry !== undefined && wakeEntry.day === today ? wakeEntry.wakes : 0,
+          limit: this.resolved.maxAutoWakesPerSessionPerDay,
+          day: today,
+          resetsAt: new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1)).toISOString(),
+        },
+        pendingInbound,
+        pendingOutbound,
+        firstTaskWakeOwed,
+        legacyBlocked,
+        targets: [...counterparties].map(id => {
+          const live = this.ctx.agents.get(id)
+          return {
+            id,
+            live: live !== undefined,
+            running: live?.status === 'running',
+            archived: this.ctx.workspaceRegistry.archivedSessionIds.includes(id),
+          }
+        }),
+      },
     }
   }
 
@@ -1068,6 +1372,56 @@ export class SessionLinkService extends TypertRemoteService {
     return (recorded ?? recordedIds(target)).has(messageId)
   }
 
+  /**
+   * Every known reason one pending message has not moved, checked against the
+   * same predicates the delivery branch consults. A message the target may
+   * already hold reports only the unverified receipt — idle-wake limits no
+   * longer apply to it. A running target receives pending mail as follow-ups,
+   * so wake authorization and budget are not its blockers either. Only a
+   * resident-idle or cold target lists the conditions a future admission's
+   * wake request would face. `['unknown']` means none of the known blockers
+   * applies yet the message has not moved.
+   */
+  private blockingReasons(
+    messageId: SessionLinkMessageId,
+    record: SessionLinkMessageRecordData,
+  ): SessionLinkBlockingReason[] {
+    const target = this.ctx.agents.get(record.targetId)
+    if (this.mayBeHeld(messageId, record, target)) return ['delivery-unverified']
+    const reasons: SessionLinkBlockingReason[] = []
+    const archived = this.ctx.workspaceRegistry.archivedSessionIds.includes(record.targetId)
+    if (archived) reasons.push('archived')
+    const link = this.links.get(record.linkId)
+    const granted = link !== undefined
+      && link.memberIds.includes(record.senderId)
+      && link.memberIds.includes(record.targetId)
+    if (!granted) {
+      reasons.push('link-revoked')
+    } else if (target === undefined) {
+      // Not resident: nothing can move until a later admission resumes it.
+      reasons.push('cold-target')
+      if (!archived) {
+        const wakeGranted = link.autoWakeSessionIds.includes(record.targetId)
+          || this.firstWakeOwed(record.linkId, link, record.targetId)
+        if (!wakeGranted) reasons.push('wake-unauthorized')
+        else if (this.wakeBudgetExhausted(messageId, record)) reasons.push('wake-budget')
+      }
+    } else if (target.status !== 'running' && !archived) {
+      // Resident but idle: the next admission needs an idle wake under the
+      // group's grant and the wake budgets.
+      const wakeGranted = link.autoWakeSessionIds.includes(record.targetId)
+        || this.firstWakeOwed(record.linkId, link, record.targetId)
+      if (!wakeGranted) reasons.push('wake-unauthorized')
+      else if (this.wakeBudgetExhausted(messageId, record)) reasons.push('wake-budget')
+    }
+    // A running target needs none of these; delivery follows as a follow-up.
+    // There the empty list is the honest answer — no blocker is claimed — while
+    // an idle or cold target with every permission intact reports `unknown`,
+    // because something outside the checked predicates kept the message queued.
+    if (reasons.length === 0 && target?.status !== 'running') return ['unknown']
+    return reasons
+  }
+
   /** Return one claimed wake to a target's day budget after its message was cancelled. */
   private async refundWake(targetId: SessionId): Promise<void> {
     const ledger = this.readLedgers()
@@ -1094,14 +1448,14 @@ export class SessionLinkService extends TypertRemoteService {
   /**
    * Pending messages for one target in admission order: the monotonic
    * admission sequence, falling back to the timestamp for messages admitted
-   * before 0.4.0 carried one.
+   * before 0.4.0 carried one. The comparator is the shared
+   * {@link compareAdmission}, so the activity projection reads the same order
+   * delivery executes.
    */
   private pendingFor(targetId: SessionId): [SessionLinkMessageId, SessionLinkMessageRecordData][] {
     return [...this.messages.entries()]
       .filter(([, record]) => record.status === 'pending' && record.targetId === targetId && !legacyTaskReport(record))
-      .sort(([, left], [, right]) => left.seq !== undefined && right.seq !== undefined
-        ? left.seq - right.seq
-        : left.createdAt.localeCompare(right.createdAt))
+      .sort(([, left], [, right]) => compareAdmission(left, right))
   }
 
   /** The next admission sequence number, one above every stored message's. */
@@ -1156,6 +1510,29 @@ export class SessionLinkService extends TypertRemoteService {
   }
 
   /**
+   * Read-only wake budget check shared by claiming and the activity
+   * projection: whether any of the per-message, per-chain, and per-target-day
+   * budgets is already spent for one more wake of this message.
+   */
+  private wakeBudgetExhausted(
+    messageId: SessionLinkMessageId,
+    record: SessionLinkMessageRecordData,
+    ledger: SessionLinkLedgersData = this.readLedgers(),
+    today: string = dayKey(new Date()),
+  ): boolean {
+    if (record.wakesUsed >= this.resolved.maxAutoWakesPerMessage) return true
+    const root = rootIdOf(this.messages, messageId, record)
+    const chainSpent = [...this.messages.entries()]
+      // Roots are message ids, so a chain counts across every group it moved through.
+      .filter(([candidateId, candidate]) => rootIdOf(this.messages, candidateId, candidate) === root)
+      .reduce((sum, [, candidate]) => sum + candidate.wakesUsed, 0)
+    if (chainSpent >= this.resolved.maxAutoWakesPerChain) return true
+    const entry = ledger.wakes[String(record.targetId)]
+    const spentToday = entry !== undefined && entry.day === today ? entry.wakes : 0
+    return spentToday >= this.resolved.maxAutoWakesPerSessionPerDay
+  }
+
+  /**
    * Claim one automatic wake for this already-granted delivery under
    * per-message, per-chain, and per-target-day budgets. The claim is written
    * durably before the target is woken; the chain spend is derived from
@@ -1165,18 +1542,11 @@ export class SessionLinkService extends TypertRemoteService {
     messageId: SessionLinkMessageId,
     record: SessionLinkMessageRecordData,
   ): Promise<boolean> {
-    if (record.wakesUsed >= this.resolved.maxAutoWakesPerMessage) return false
-    const root = rootIdOf(this.messages, messageId, record)
-    const chainSpent = [...this.messages.entries()]
-      // Roots are message ids, so a chain counts across every group it moved through.
-      .filter(([candidateId, candidate]) => rootIdOf(this.messages, candidateId, candidate) === root)
-      .reduce((sum, [, candidate]) => sum + candidate.wakesUsed, 0)
-    if (chainSpent >= this.resolved.maxAutoWakesPerChain) return false
     const ledger = this.readLedgers()
     const today = dayKey(new Date())
+    if (this.wakeBudgetExhausted(messageId, record, ledger, today)) return false
     const entry = ledger.wakes[String(record.targetId)]
     const spentToday = entry !== undefined && entry.day === today ? entry.wakes : 0
-    if (spentToday >= this.resolved.maxAutoWakesPerSessionPerDay) return false
     await this.writeLedgers({
       ...ledger,
       wakes: {

@@ -14,7 +14,7 @@ import type {
   ConversationNodeDefinition, TurnLocation,
 } from '@deepseek-ai/dsh-client-ui-conversation/client'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
-import type { SessionLinkId } from '../types.ts'
+import type { SessionLinkId, SessionLinkMessageId } from '../types.ts'
 
 /** Wire Tool name whose settled result announces one spawned-and-linked Session. */
 export const SPAWN_LINKED_SESSION_TOOL = 'session_spawn_linked_session'
@@ -34,6 +34,10 @@ export interface LinkedSpawn {
   readonly sessionId: SessionId
   /** Group the spawn joined. */
   readonly linkId: SessionLinkId
+  /** Task message recorded for the spawn; never claims delivery or execution. */
+  readonly messageId: SessionLinkMessageId
+  /** Admission state the Host announced at creation time. */
+  readonly delivery: 'queued' | 'accepted'
   /** Model configured at spawn time, without claiming the model ran or remains current. */
   readonly initialModel?: InitialSessionModel
 }
@@ -64,7 +68,7 @@ export interface SessionLinkTurnOwner {
 }
 
 /** The spawn result's text shape, published by the Host tool's renderer. */
-const RESULT_PATTERN = /^session (\S+) created and linked \((\S+)\); task message \S+ (?:queued|accepted)$/
+const RESULT_PATTERN = /^session (\S+) created and linked \((\S+)\); task message (\S+) (queued|accepted)$/
 
 /** Optional metadata never prevents a legacy successful spawn from rendering. */
 function initialSessionModel(text: string | undefined): InitialSessionModel | undefined {
@@ -88,7 +92,7 @@ function initialSessionModel(text: string | undefined): InitialSessionModel | un
 }
 
 /** First text attributes the spawn; only the second text may add initial model metadata. */
-function linkedSpawn(content: readonly { type: string; text?: string }[]): Pick<LinkedSpawn, 'sessionId' | 'linkId' | 'initialModel'> | undefined {
+function linkedSpawn(content: readonly { type: string; text?: string }[]): Pick<LinkedSpawn, 'sessionId' | 'linkId' | 'messageId' | 'delivery' | 'initialModel'> | undefined {
   const texts = content.filter(block => block.type === 'text')
   const text = texts[0]?.text
   if (text === undefined) return undefined
@@ -98,6 +102,8 @@ function linkedSpawn(content: readonly { type: string; text?: string }[]): Pick<
   return {
     sessionId: match[1] as SessionId,
     linkId: match[2] as SessionLinkId,
+    messageId: match[3] as SessionLinkMessageId,
+    delivery: match[4] as 'queued' | 'accepted',
     ...(initialModel === undefined ? {} : { initialModel }),
   }
 }

@@ -10,14 +10,14 @@ import type {} from '@deepseek-ai/dsh-client-ui-sidebar-right/client'
 import type {} from '@deepseek-ai/dsh-client-ui-chat/client'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
 import type { SessionLinkAddRequest, SessionLinkRevokeRequest, SessionLinkWakeRequest } from '../types.ts'
-import { createLinkSource, createWriteGate } from './state.ts'
+import { createLinkSource, createMailController, createWriteGate, type MailController } from './state.ts'
 import {
   HeaderAction, ManagedLinkTab, ManagedLinkTabTitle, RowLinkAction, RowLinkMenu,
   type LinkInjected, type LinkActions,
 } from './components.tsx'
 import { TurnCard } from './TurnCard.tsx'
 import { sessionLinkTurnDefinition } from './turn.ts'
-import { isLinkView } from './rpc.ts'
+import { isActivityView, isLinkView } from './rpc.ts'
 import { en, NS, zh } from './locales.ts'
 
 const TAB_ID = 'dsh-session-link/panel'
@@ -54,6 +54,27 @@ export function apply(ctx: Context & { readonly connection: ConnectionHandle }):
     subscribeReset: listener => ctx.on('connection/reset', listener),
   })
   ctx.effect(() => () => source.dispose(), 'session-link: view lifetime')
+  // One mailbox source per owner Session; panel, glance, and popover share it.
+  const mails = new Map<SessionId, MailController>()
+  const mailFor = (sessionId: SessionId): MailController => {
+    const existing = mails.get(sessionId)
+    if (existing !== undefined) return existing
+    const controller = createMailController({
+      load: async (query, signal) => {
+        const value = await invoke('activityView', { request: { sessionId, ...query } }, signal)
+        if (!isActivityView(value)) throw new Error(t('panel.protocol.error'))
+        return value
+      },
+      pollIntervalMs: () => source.getSnapshot().view?.pollIntervalMs ?? 30_000,
+      subscribeReset: listener => ctx.on('connection/reset', listener),
+    })
+    mails.set(sessionId, controller)
+    return controller
+  }
+  ctx.effect(() => () => {
+    for (const controller of mails.values()) controller.dispose()
+    mails.clear()
+  }, 'session-link: mail lifetime')
   // One write at a time across header, panel, and cards; clicks during a pending write are refused.
   const gate = createWriteGate()
   const mutate = (
@@ -62,6 +83,9 @@ export function apply(ctx: Context & { readonly connection: ConnectionHandle }):
   ): Promise<void> => gate(async () => {
     await invoke(method, { request })
     if (!await source.refresh()) throw new Error(t('panel.refresh.error'))
+    // A write changes pending mail for every linked owner; re-read rather
+    // than trusting the interval so mailbox rows never lag their own write.
+    for (const controller of mails.values()) controller.invalidate()
   })
   const openPanelFor = (sessionId: SessionId): void => {
     ctx.sidebarRight.openTab(TAB_KIND, { params: { sessionId } })
@@ -70,6 +94,12 @@ export function apply(ctx: Context & { readonly connection: ConnectionHandle }):
     link: (peerId, autoWake, autoWakeCaller) => mutate('linkFrom', { callerId: sessionId, peerId, autoWake, autoWakeCaller }),
     setWake: (linkId, peerId, on) => mutate('setAutoWakeFrom', { callerId: sessionId, linkId, peerId, on }),
     unlink: linkId => mutate('unlinkFrom', { callerId: sessionId, linkId }),
+    loadActivity: async query => {
+      const value = await invoke('activityView', { request: { sessionId, ...query } })
+      if (!isActivityView(value)) throw new Error(t('panel.protocol.error'))
+      return value
+    },
+    mail: mailFor(sessionId),
     openPanel: () => { openPanelFor(sessionId) },
     openSession: id => { ctx.uiWorkspace.openSession(id) },
   })

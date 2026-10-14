@@ -9,7 +9,7 @@ import type {
   ConversationMatch, ConversationNodeContext, ConversationStartMatch, TurnLocation,
 } from '@deepseek-ai/dsh-client-ui-conversation/client'
 import type { SnapshotSelectorHook, TranslateNS } from '@deepseek-ai/dsh-client-ui-slots'
-import { SessionLinkId, type SessionLinkView } from '../src/types.ts'
+import { SessionLinkId, SessionLinkMessageId, type SessionLinkView } from '../src/types.ts'
 import { TurnCard } from '../src/client/TurnCard.tsx'
 import {
   sessionLinkTurnDefinition, selectLinkedSpawns, SPAWN_LINKED_SESSION_TOOL, type SessionLinkTurnData,
@@ -21,6 +21,7 @@ import { en, zh, type NS } from '../src/client/locales.ts'
 const SELF = 'owner' as SessionId
 const PEER = 'spawned-session' as SessionId
 const LINK = SessionLinkId('link-01')
+const MSG = SessionLinkMessageId('msg-1')
 const CALL = 'call-spawn'
 const RESULT_TEXT = `session ${PEER} created and linked (${LINK}); task message msg-1 queued`
 const DATA_KEY = 'session-link-external-created'
@@ -89,7 +90,7 @@ describe('settled linked-spawn Definition', () => {
     expect(fold([start, call(2)])).toEqual({ created: [] })
     expect(fold([start, result(3)])).toEqual({ created: [] })
     expect(fold([start, call(2), result(3)])).toEqual({
-      created: [{ seq: 3, callId: CALL, sessionId: PEER, linkId: LINK }],
+      created: [{ seq: 3, callId: CALL, sessionId: PEER, linkId: LINK, messageId: MSG, delivery: 'queued' }],
     })
     const replacement = result(3)
     if (replacement.type !== 'tool/result') throw new Error('tool/result fixture required')
@@ -125,11 +126,11 @@ describe('settled linked-spawn Definition', () => {
     const sidecar = JSON.stringify({ type: 'session-link/initial-model', version: 1, initialModel })
     const events = [event(1, 'turn/start', { turn: 1 }), call(2)]
     expect(fold([...events, result(3, RESULT_TEXT, false, CALL, sidecar)])).toEqual({
-      created: [{ seq: 3, callId: CALL, sessionId: PEER, linkId: LINK, initialModel }],
+      created: [{ seq: 3, callId: CALL, sessionId: PEER, linkId: LINK, messageId: MSG, delivery: 'queued', initialModel }],
     })
     expect(fold([...events, result(3, RESULT_TEXT.replace('queued', 'accepted'), false, CALL,
       JSON.stringify({ type: 'session-link/initial-model', version: 1, initialModel: { provider: 'p', model: 'm' } }),
-    )])?.created[0]?.initialModel).toEqual({ provider: 'p', model: 'm' })
+    )])?.created[0]).toMatchObject({ messageId: MSG, delivery: 'accepted', initialModel: { provider: 'p', model: 'm' } })
     expect(fold([...events, result(3, 'unrecognized result', false, CALL, sidecar)])).toEqual({ created: [] })
     expect(fold([...events, result(3, RESULT_TEXT, true, CALL, sidecar)])).toEqual({ created: [] })
   })
@@ -144,7 +145,7 @@ describe('settled linked-spawn Definition', () => {
     ].map(initialModel => JSON.stringify({ type: 'session-link/initial-model', version: 1, initialModel })),
   ])('ignores invalid sidecar %s while keeping the legacy spawn card', sidecar => {
     expect(fold([event(1, 'turn/start', { turn: 1 }), call(2), result(3, RESULT_TEXT, false, CALL, sidecar)]))
-      .toEqual({ created: [{ seq: 3, callId: CALL, sessionId: PEER, linkId: LINK }] })
+      .toEqual({ created: [{ seq: 3, callId: CALL, sessionId: PEER, linkId: LINK, messageId: MSG, delivery: 'queued' }] })
   })
 
   it('reads only the second text block, without scanning other result content for metadata', () => {
@@ -165,8 +166,8 @@ describe('settled linked-spawn Definition', () => {
 
 describe('closing Turn cutoff', () => {
   const data: SessionLinkTurnData = { created: [
-    { seq: 3, callId: 'call-a', sessionId: PEER, linkId: LINK },
-    { seq: 7, callId: 'call-b', sessionId: PEER, linkId: LINK },
+    { seq: 3, callId: 'call-a', sessionId: PEER, linkId: LINK, messageId: MSG, delivery: 'queued' },
+    { seq: 7, callId: 'call-b', sessionId: PEER, linkId: LINK, messageId: MSG, delivery: 'accepted' },
   ] }
 
   it('uses the Turn end before the owner sequence, with an open-Turn fallback', () => {
@@ -192,12 +193,16 @@ describe('Turn card Host view', () => {
       select(useSyncExternalStore(source.subscribe, source.getSnapshot, source.getSnapshot))
     const props: LinkProps = {
       sessionId: SELF, useLinks, refresh: source.refresh, t,
-      link: vi.fn(), setWake: vi.fn(), unlink: vi.fn(), openPanel: vi.fn(), openSession: vi.fn(),
+      link: vi.fn(), setWake: vi.fn(), unlink: vi.fn(), loadActivity: vi.fn(), openPanel: vi.fn(), openSession: vi.fn(),
     }
-    const location = turn({ created: [{ seq: 3, callId: CALL, sessionId: PEER, linkId: LINK }] }, 9)
+    const location = turn({ created: [{ seq: 3, callId: CALL, sessionId: PEER, linkId: LINK, messageId: MSG, delivery: 'queued' }] }, 9)
     const rendered = render(<TurnCard {...props} turn={location} seq={9} />)
     await act(async () => { await Promise.resolve() })
     expect(screen.getByText('Linked with "Peer title"')).toBeTruthy()
+    expect(screen.getByText('Task message queued at creation')).toBeTruthy()
+    expect(screen.queryByText(/read|executed|completed/i)).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'Open session' }))
+    expect(props.openSession).toHaveBeenCalledWith(PEER)
     expect(screen.getByText('Wake peer: on')).toBeTruthy()
     expect(screen.getByText('Wake me: off')).toBeTruthy()
     expect(screen.queryByText(/Initial session model/)).toBeNull()
@@ -220,7 +225,7 @@ describe('Turn card Host view', () => {
       ] } })
     const props: LinkProps = {
       sessionId: SELF, useLinks, refresh: vi.fn(), t,
-      link: vi.fn(), setWake: vi.fn(), unlink: vi.fn(), openPanel: vi.fn(), openSession: vi.fn(),
+      link: vi.fn(), setWake: vi.fn(), unlink: vi.fn(), loadActivity: vi.fn(), openPanel: vi.fn(), openSession: vi.fn(),
     }
     const rendered = render(<TurnCard {...props} turn={turn({ created: [] }, 9)} seq={9} />)
     expect(rendered.container.firstChild).toBeNull()
@@ -231,10 +236,10 @@ describe('Turn card Host view', () => {
       select({ status: 'ready', view: { pollIntervalMs: 30_000, sessions: [], links: [] } })
     const props: LinkProps = {
       sessionId: SELF, useLinks, refresh: vi.fn(), t,
-      link: vi.fn(), setWake: vi.fn(), unlink: vi.fn(), openPanel: vi.fn(), openSession: vi.fn(),
+      link: vi.fn(), setWake: vi.fn(), unlink: vi.fn(), loadActivity: vi.fn(), openPanel: vi.fn(), openSession: vi.fn(),
     }
     const location = (initialModel: { provider: string; model: string; reasoningEffort?: string }) =>
-      turn({ created: [{ seq: 3, callId: CALL, sessionId: PEER, linkId: LINK, initialModel }] }, 9)
+      turn({ created: [{ seq: 3, callId: CALL, sessionId: PEER, linkId: LINK, messageId: MSG, delivery: 'accepted', initialModel }] }, 9)
     const rendered = render(<TurnCard {...props} turn={location({ provider: 'p', model: 'm', reasoningEffort: 'high' })} seq={9} />)
     expect(screen.getByText('Initial session model: p / m · Reasoning effort: high')).toBeTruthy()
     expect(screen.queryByText(/current model|execution succeeded|executed model/i)).toBeNull()

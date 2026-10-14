@@ -61,6 +61,24 @@ const CSS = `
 .slp-card-title{flex:1 1 auto;min-width:0;overflow-wrap:anywhere}
 .slp-card-wake{color:var(--dsw-alias-label-tertiary);font-size:11px}
 .slp-card-initial-model{flex-basis:100%;color:var(--dsw-alias-label-tertiary);font-size:11px;overflow-wrap:anywhere}
+.slp-mail{display:flex;flex-direction:column;box-sizing:border-box;border:1px solid var(--dsw-alias-border-l1);border-radius:12px;overflow:hidden}
+.slp-mail-head{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:6px 10px;background:var(--dsw-alias-bg-layer-2)}
+.slp-mail-tabs{display:flex;gap:4px}
+.slp-mail-tab{padding:2px 8px;border:1px solid var(--dsw-alias-border-l1);border-radius:999px;background:transparent;color:var(--dsw-alias-label-secondary);font:inherit;font-size:12px;line-height:18px;cursor:pointer}
+.slp-mail-tab-active{border-color:var(--dsw-alias-brand-primary);color:var(--dsw-alias-brand-primary)}
+.slp-mail-tab:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:2px}
+.slp-mail-summary{padding:6px 10px 0;color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:16px}
+.slp-mail-entry{display:flex;flex-direction:column;gap:4px;min-width:0;padding:8px 10px;border-top:1px solid var(--dsw-alias-border-l1)}
+.slp-mail-row{display:flex;align-items:center;justify-content:space-between;gap:8px;min-width:0}
+.slp-mail-direction{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-secondary);font-size:12px}
+.slp-mail-status{flex:none;font-size:11px;color:var(--dsw-alias-label-tertiary)}
+.slp-mail-status-pending{color:var(--dsw-alias-brand-primary)}
+.slp-mail-status-delivered{color:var(--dsw-alias-state-success-primary)}
+.slp-mail-status-failed,.slp-mail-status-cancelled,.slp-mail-status-revoked{color:var(--dsw-alias-state-error-primary)}
+.slp-mail-preview{font-size:12px;line-height:18px;overflow-wrap:anywhere}
+.slp-mail-meta{color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:16px}
+.slp-mail-actions{display:flex;justify-content:center;padding:6px;border-top:1px solid var(--dsw-alias-border-l1)}
+.slp-mail .slp-footnote,.slp-mail .slp-notice{padding:2px 10px 6px}
 `
 
 /** Styles remain owned by the component and disappear on unmount. */

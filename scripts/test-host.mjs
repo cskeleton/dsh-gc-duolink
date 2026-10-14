@@ -4,6 +4,7 @@ if (!process.env.DSH_SOURCE_ROOT) throw new Error('Host regression tests require
 const result = spawnSync('pnpm', ['exec', 'vitest', 'run',
   'tests/link.spec.ts', 'tests/remote.spec.ts',
   'tests/tool-session-link.spec.ts', 'tests/command-session-link.spec.ts',
+  'tests/review-m1-backend.spec.ts',
 ], { stdio: 'inherit', env: process.env })
 if (result.error) throw result.error
 if (result.signal) throw new Error(`Host tests terminated by ${result.signal}`)

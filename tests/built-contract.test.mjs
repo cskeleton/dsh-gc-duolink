@@ -15,7 +15,8 @@ test('built SRC methods retain the named wire fields and cancellation position',
   try {
     const service = new SessionLinkService(ctx)
     const expected = { view: ['signal'],
-      linkFrom: ['request'], unlinkFrom: ['request'], setAutoWakeFrom: ['request'] }
+      linkFrom: ['request'], unlinkFrom: ['request'], setAutoWakeFrom: ['request'],
+      activityView: ['request'] }
     assert.equal(service.typertRemote.namespace, 'sessionLinks')
     assert.deepEqual(remoteMethods(service).map(marker => marker.exportName ?? marker.method).sort(), Object.keys(expected).sort())
     for (const [method, names] of Object.entries(expected)) {
