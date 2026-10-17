@@ -4,6 +4,7 @@ import {
   type CSSProperties, type ReactNode,
 } from 'react'
 import { createPortal } from 'react-dom'
+import { MenuItemButton } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
 import type { HostObservable, InjectFace, SnapshotSelectorHook, TranslateNS } from '@deepseek-ai/dsh-client-ui-slots'
 import type { UseSidebarRightTabInfo } from '@deepseek-ai/dsh-client-ui-sidebar-right/client'
@@ -49,18 +50,19 @@ export function LinkIcon({ size = 16 }: { readonly size?: number }): ReactNode {
 }
 
 /** Visible direction, state, explanation, and keyboard-operable switch. */
-function WakeSetting({ checked, disabled, onChange, label, hint, t }: {
+function WakeSetting({ checked, disabled, onChange, label, accessibleLabel, hint, t }: {
   readonly checked: boolean
   readonly disabled: boolean
   readonly onChange: (checked: boolean) => void
   readonly label: string
+  readonly accessibleLabel?: string
   readonly hint: string
   readonly t: LinkProps['t']
 }): ReactNode {
   return <div className="gcdl-wake-setting">
     <div className="gcdl-wake-copy"><span>{label}</span><span className="gcdl-peer-meta">{hint}</span></div>
     <span className="gcdl-peer-meta">{t(checked ? 'wake.on' : 'wake.off')}</span>
-    <button type="button" role="switch" aria-checked={checked} aria-label={label} title={hint}
+    <button type="button" role="switch" aria-checked={checked} aria-label={accessibleLabel ?? label} title={hint}
       className={`gcdl-switch${checked ? ' gcdl-switch-on' : ''}`} disabled={disabled}
       onClick={() => { onChange(!checked) }}><span className="gcdl-switch-thumb" /></button>
   </div>
@@ -124,29 +126,40 @@ function LinkPicker({ sessionId, snapshot, link, t, onLinked, autoFocus = false 
   readonly autoFocus?: boolean
 }): ReactNode {
   const [query, setQuery] = useState('')
+  const [expanded, setExpanded] = useState(false)
+  const candidatesId = useId()
   const [selected, setSelected] = useState<SessionId | null>(null)
   const [autoWake, setAutoWake] = useState(true)
   const [autoWakeCaller, setAutoWakeCaller] = useState(true)
   const { busy, error, run } = useOperation(sessionId)
   const candidates = useMemo(() => snapshot.view === undefined ? [] : linkCandidates(snapshot.view, sessionId), [snapshot.view, sessionId])
   const filtered = candidates.filter(candidate => `${candidate.title} ${candidate.id}`.toLowerCase().includes(query.trim().toLowerCase()))
+  // The Host catalog is already ordered by latest activity. Search all candidates before limiting the display.
+  const visible = filtered.slice(0, expanded ? 8 : 3)
   const self = snapshot.view?.sessions.find(session => session.id === sessionId)
   const disabled = busy || snapshot.status !== 'ready' || self === undefined || !self.ordinary || self.archived
   // Never send a candidate that disappeared after a poll or a change of query.
-  const chosen = selected !== null && filtered.some(candidate => candidate.id === selected)
-  useEffect(() => { setQuery(''); setSelected(null); setAutoWake(true); setAutoWakeCaller(true) }, [sessionId])
+  const chosen = selected !== null && visible.some(candidate => candidate.id === selected)
+  useEffect(() => { setQuery(''); setExpanded(false); setSelected(null); setAutoWake(true); setAutoWakeCaller(true) }, [sessionId])
   return <div className="gcdl-picker" aria-busy={busy}>
     <input className="gcdl-input" value={query} placeholder={t('add.search')} aria-label={t('add.search')}
-      autoFocus={autoFocus} disabled={busy} onChange={event => { setQuery(event.target.value); setSelected(null) }} />
-    <div className="gcdl-candidates">
-      {filtered.length === 0 ? <div className="gcdl-state">{t('add.empty')}</div> : filtered.map(candidate => (
+      autoFocus={autoFocus} disabled={busy} onChange={event => { setQuery(event.target.value); setExpanded(false); setSelected(null) }} />
+    <div id={candidatesId} className="gcdl-candidates" aria-live="polite">
+      {visible.length === 0 ? <div className="gcdl-state">{t('add.empty')}</div> : visible.map(candidate => (
         <button key={candidate.id} type="button" aria-pressed={selected === candidate.id} disabled={disabled}
+          data-gc-duolink-candidate={candidate.id}
           className={`gcdl-candidate${selected === candidate.id ? ' gcdl-candidate-selected' : ''}`}
           onClick={() => { setSelected(candidate.id) }}>
           <span className="gcdl-peer-title">{candidate.title}</span><span className="gcdl-peer-meta">{String(candidate.id).replace(/^session-/, '').slice(0, 8)}</span>
         </button>
       ))}
     </div>
+    {filtered.length > 3 ? <button type="button" className="gcdl-text-button gcdl-more-toggle" disabled={busy}
+      aria-expanded={expanded} aria-controls={candidatesId} onClick={() => {
+        setExpanded(value => !value)
+        if (expanded && !filtered.slice(0, 3).some(candidate => candidate.id === selected)) setSelected(null)
+      }}>{t(expanded ? 'add.less' : 'add.more')}</button> : null}
+    {expanded && filtered.length > 8 ? <div className="gcdl-footnote">{t('add.limit')}</div> : null}
     <WakeSetting checked={autoWake} disabled={disabled} onChange={setAutoWake} label={t('add.wake')} hint={t('add.wake.hint')} t={t} />
     <WakeSetting checked={autoWakeCaller} disabled={disabled} onChange={setAutoWakeCaller} label={t('add.wake.self')} hint={t('add.wake.self.hint')} t={t} />
     <p className="gcdl-footnote">{t('wake.budget.hint')}</p>
@@ -172,14 +185,15 @@ function Peer({ row, snapshot, busy, setWake, openSession, t }: {
   const group = row.link.memberIds.length > 2
   return <div className="gcdl-peer">
     <div className="gcdl-peer-heading">
-      <div className="gcdl-peer-main"><span className="gcdl-peer-title" title={title}>{title}</span>
+      <div className="gcdl-peer-main">{group ? <span className="gcdl-peer-title" title={title}>{title}</span> : null}
         <span className="gcdl-peer-meta">{String(row.peerId).replace(/^session-/, '').slice(0, 8)} · {status}</span></div>
       <span className="gcdl-linked">{t('peer.linked')}</span>
       {!session?.archived ? <button type="button" className="gcdl-text-button" title={t('peer.open.title', { title })}
         onClick={() => { openSession(row.peerId) }}>{t('peer.open')}</button> : null}
     </div>
     <WakeSetting checked={row.autoWake} disabled={busy || snapshot.status !== 'ready' || session?.archived === true}
-      onChange={setWake} label={`${t(group ? 'row.wake.group' : 'row.wake')} · ${title}`}
+      onChange={setWake} label={group ? `${t('row.wake.group')} · ${title}` : t('row.wake')}
+      accessibleLabel={`${t(group ? 'row.wake.group' : 'row.wake')} · ${title}`}
       hint={t(group ? 'row.wake.group.hint' : 'row.wake.title')} t={t} />
   </div>
 }
@@ -498,8 +512,10 @@ export function LinkTab({ sessionId, useLinks, refresh, setWake, link, unlink, c
   const { busy, error, run } = useOperation(sessionId)
   const [pickerOpen, setPickerOpen] = useState(false)
   const [confirming, setConfirming] = useState<SessionLinkId | null>(null)
+  const [collapsed, setCollapsed] = useState<ReadonlySet<SessionLinkId>>(() => new Set())
+  const groupPrefix = useId()
   const groups = useMemo(() => view?.links.filter(group => group.memberIds.includes(sessionId)) ?? [], [view, sessionId])
-  useEffect(() => { setPickerOpen(false); setConfirming(null) }, [sessionId])
+  useEffect(() => { setPickerOpen(false); setConfirming(null); setCollapsed(new Set()) }, [sessionId])
   useEffect(() => { if (confirming !== null && !groups.some(group => group.id === confirming)) setConfirming(null) }, [groups, confirming])
   const self = view?.sessions.find(session => session.id === sessionId)
   const disabled = busy || snapshot.status !== 'ready' || self === undefined || self.archived || !self.ordinary
@@ -512,10 +528,32 @@ export function LinkTab({ sessionId, useLinks, refresh, setWake, link, unlink, c
     </div>
     <QueryState snapshot={snapshot} refresh={refresh} t={t} />
     {view === undefined ? null : <>
-      {groups.length === 0 ? <div className="gcdl-state">{t('panel.empty')}</div> : groups.map(group => (
-        <section key={group.id} className="gcdl-group" aria-label={group.name}>
-          <header className="gcdl-group-header"><LinkIcon size={14} />{group.name}</header>
-          {peerRows([group], sessionId).map(row => <Peer key={row.peerId} row={row} snapshot={snapshot} busy={disabled}
+      {groups.length === 0 ? <div className="gcdl-state">{t('panel.empty')}</div> : groups.map(group => {
+        const rows = peerRows([group], sessionId)
+        // A pair has exactly one peer: its title owns the card, so controls need no repeated name.
+        // Larger groups retain their group title and each receiving member's identity below it.
+        const title = group.memberIds.length === 2 && rows[0] !== undefined ? sessionTitle(view, rows[0].peerId) : group.name
+        const isCollapsed = collapsed.has(group.id)
+        const bodyId = `${groupPrefix}-${group.id}`
+        return (
+        <section key={group.id} className="gcdl-group" aria-label={title}>
+          <header className="gcdl-group-header">
+            <button type="button" className="gcdl-group-toggle" aria-expanded={!isCollapsed} aria-controls={bodyId}
+              aria-label={t(isCollapsed ? 'group.expand' : 'group.collapse', { title })}
+              title={group.name === title ? title : `${title} · ${group.name}`} onClick={() => { setCollapsed(previous => {
+                const next = new Set(previous)
+                if (next.has(group.id)) next.delete(group.id); else next.add(group.id)
+                return next
+              }) }}>
+              <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.6" aria-hidden="true">
+                <path d={isCollapsed ? 'm6 3 5 5-5 5' : 'm3 6 5 5 5-5'} />
+              </svg><span className="gcdl-group-title">{title}</span>
+            </button>
+            <button type="button" className="gcdl-text-button gcdl-danger" disabled={disabled}
+              onClick={() => { setConfirming(group.id) }}>{t('peer.revoke')}</button>
+          </header>
+          <div id={bodyId} hidden={isCollapsed}>
+          {rows.map(row => <Peer key={row.peerId} row={row} snapshot={snapshot} busy={disabled}
             setWake={on => { void run(() => setWake(group.id, row.peerId, on)) }} openSession={openSession} t={t} />)}
           <div className="gcdl-group-self">
             <WakeSetting checked={group.autoWakeSessionIds.includes(sessionId)} disabled={disabled}
@@ -524,14 +562,14 @@ export function LinkTab({ sessionId, useLinks, refresh, setWake, link, unlink, c
               hint={t('add.wake.self.hint')} t={t} />
             {!group.autoWakeSessionIds.includes(sessionId) ? <p className="gcdl-footnote">{t('wake.self.off.hint')}</p> : null}
           </div>
+          </div>
           {confirming === group.id ? <div className="gcdl-confirm"><div>{t('revoke.confirm')}</div><div className="gcdl-confirm-actions">
             <button type="button" className="gcdl-button" disabled={busy} onClick={() => { setConfirming(null) }}>{t('revoke.cancel')}</button>
             <button type="button" className="gcdl-button gcdl-danger" disabled={disabled}
               onClick={() => { void run(() => unlink(group.id)).then(ok => { if (ok) setConfirming(null) }) }}>{t('revoke.action')}</button>
-          </div></div> : <div className="gcdl-confirm-actions"><button type="button" className="gcdl-text-button gcdl-danger" disabled={disabled}
-            onClick={() => { setConfirming(group.id) }}>{t('peer.revoke')}</button></div>}
+          </div></div> : null}
         </section>
-      ))}
+      )})}
       <div className="gcdl-add">
         <button type="button" className="gcdl-text-button gcdl-add-toggle" aria-expanded={pickerOpen} disabled={disabled}
           onClick={() => { setPickerOpen(value => !value) }}>{t('add.title')}</button>
@@ -574,15 +612,16 @@ export interface RowInjected {
   readonly openPanelFor: (id: SessionId) => void
 }
 type RowProps = InjectFace<RowInjected> & { readonly sessionId: SessionId; readonly t: LinkProps['t'] }
-/** The Host owns hover/focus visibility of this right-hand action strip. No leading decoration. */
+/** Only linked Sessions contribute an action; the Host owns hover/focus visibility. */
 export function RowLinkAction({ sessionId, useLinks, openPanelFor, t }: RowProps): ReactNode {
   const snapshot = useLinks(value => value)
   const session = snapshot.view?.sessions.find(row => row.id === sessionId)
   const [error, setError] = useState<string | null>(null)
   if (session?.ordinary !== true || session.archived || session.blank) return null
   const count = new Set(peerRows(snapshot.view?.links ?? [], sessionId).map(row => row.peerId)).size
-  const title = count > 0 ? t('row.linked', { count }) : t('row.unlinked')
-  return <><Styles /><button type="button" className={`gcdl-row-action${count > 0 ? ' gcdl-row-linked' : ''}`}
+  if (count === 0) return null
+  const title = t('row.linked', { count })
+  return <><Styles /><button type="button" className="gcdl-row-action gcdl-row-linked"
     data-gc-duolink-row-action="" title={error ?? title} aria-label={title} onClick={event => {
       event.stopPropagation()
       try { openPanelFor(sessionId); setError(null) } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)) }
@@ -594,7 +633,7 @@ export function RowLinkMenu(props: RowProps & { readonly useMenuOpenState: () =>
   const [error, setError] = useState<string | null>(null)
   const session = snapshot.view?.sessions.find(row => row.id === props.sessionId)
   if (session?.ordinary !== true || session.archived || session.blank) return null
-  return <><Styles /><button type="button" role="menuitem" className="gcdl-menu-item" onClick={() => {
+  return <><MenuItemButton icon={<LinkIcon />} onSelect={() => {
     try { props.openPanelFor(props.sessionId); setMenuOpen(false); setError(null) } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)) }
-  }}><LinkIcon />{props.t('row.manage')}</button>{error === null ? null : <span className="gcdl-notice" role="alert">{error}</span>}</>
+  }}>{props.t('row.manage')}</MenuItemButton>{error === null ? null : <><Styles /><span className="gcdl-notice" role="alert">{error}</span></>}</>
 }

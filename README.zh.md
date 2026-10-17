@@ -4,15 +4,19 @@
 
 `dsh-gc-duolink`
 
-DeepSeek Harness Desktop / Web 的会话互联与消息插件：建立互联、持久收发消息、管理唤醒预算、新建带初始模型的普通会话，以及复制会话 ID。使用官方 `0.2.0-rc.2` 公开接口，不修改宿主源码。
+DeepSeek Harness Desktop / Web 的会话互联与消息插件：建立互联、持久收发消息、管理唤醒预算、新建带初始模型的普通会话。使用官方 `0.2.0-rc.2` 公开接口，不修改宿主源码。
 
-当前工作区使用 DuoLink 独立的配置、存储与协议标识，不读取或迁移旧 `dsh-session-link` 的配置、互联组、邮箱和账本。`output/` 下已有安装包是历史快照，不包含本轮工作区修改。开发期间默认不增加版本号、不生成安装包，仅在明确要求发布或打包时执行。详见 [命名空间隔离](docs/plans/duolink-isolation.md) 和 [验证记录](VERIFICATION.md)。
+**预发布版本：[0.6.1-beta](https://github.com/cskeleton/dsh-gc-duolink/releases/tag/v0.6.1-beta)。** DuoLink 使用独立的配置、存储与协议标识，不读取或迁移旧 `dsh-session-link` 的配置、互联组、邮箱和账本。请先停用或卸载旧插件，再在 DuoLink 中重新建立互联与唤醒授权；旧存储文件可保留，请勿改名或复制到新存储域。详见 [命名空间隔离](docs/plans/duolink-isolation.md) 和 [验证记录](VERIFICATION.md)。
 
 ## 使用
 
-会话列表的 `…` 菜单新增「复制会话 ID」，复制被点击会话的完整 ID，成功后关闭菜单；复制失败会保留菜单并提示重试。无需先建立互联。优先使用 Clipboard API，受限或不可用时尝试原插件的文本框复制路径。
+复制会话 ID 使用 DSH 在会话列表 `…` 菜单中的内置入口，DuoLink 不再新增重复入口。「会话互联…」使用宿主菜单组件，字号和间距与原生菜单保持一致。
 
-点击会话头栏「互联」，搜索已有会话、确认两个方向的自动唤醒，再点「建立互联」。右侧面板可打开对方会话、调整唤醒或确认解除。会话列表的右侧链条按钮和 `… → 会话互联…` 管理被点击的会话，不切换主对话。链条颜色只表示互联，与运行状态、唤醒开关无关。
+点击会话头栏「互联」，搜索已有会话、确认两个方向的自动唤醒，再点「建立互联」。右侧面板可打开对方会话、调整唤醒或确认解除。会话列表的右侧链条按钮和 `… → 会话互联…` 管理被点击的会话，不切换主对话。外侧链条按钮仅在会话已有互联关系时显示，解除最后一个互联后隐藏；与运行状态和唤醒开关无关。未互联时仍可从菜单进入。
+
+界面语言跟随 DSH 的共享语言偏好，面板打开时切换语言也会同步更新。候选列表默认显示最近活跃的 3 个可互联会话，「展示更多」扩展到 8 个；搜索会先匹配全部可互联会话，再应用显示数量限制。
+
+互联卡片可通过标题栏折叠，右侧提供「解除互联」并保留二次确认。双人卡片只在标题显示一次对端会话名，下方为 ID、状态及唤醒控制；多人组保留各接收成员的名称以区分授权。
 
 双成员组按「我发消息 → 唤醒对方／对方发消息 → 唤醒我」显示；多人组按接收成员授权显示。同一成员的开关适用于该组全部发送方。新 UI 互联的两个开关默认开，需确认；旧组和人工关闭的开关不补授权。只有存在、未归档的普通顶层会话可以互联，重复会话对在串行队列内原子拒绝。
 
@@ -93,6 +97,8 @@ spawn 的第一段工具文本保持旧格式；第二段携带 version 1 的 `g
 
 ## 安装
 
+从预发布页面下载 [dsh-gc-duolink-0.6.1-beta.tgz](https://github.com/cskeleton/dsh-gc-duolink/releases/download/v0.6.1-beta/dsh-gc-duolink-0.6.1-beta.tgz)，在 DSH 插件安装器中选择该文件；同页提供校验和与交付清单。此前本地 0.6.1 安装包是测试快照。下方步骤用于源码开发安装。
+
 先构建目录，开发安装使用 `link:`，不生成安装包。`dsh-agent-preset-registry` 和 `dsh-session-persistence` 是 optional peers，缺失时普通工具仍可挂载，带 `initial_model` 的调用明确拒绝。运行时 peers 从目标 DSH profile 解析；禁用自动安装 peers，避免拉入另一套宿主。
 
 ```sh
@@ -121,7 +127,7 @@ DESKTOP_DSH='/Applications/DeepSeek Harness.app/Contents/Resources/runtime/cli/b
 
 默认 JSON 后端将数据写入 `$DSH_HOME/storages/gc_duolink.json`，不会回退读取 `session_link.json`。磁盘中保存插件身份标记；把旧版或其他非空存储复制到新路径会明确拒绝，不支持手动改名迁移。
 
-`dsh-client-ui-copy-session-id` 的源码继续保留；使用 DuoLink 内置复制功能时，停用旧复制插件的 UI 贡献，避免菜单重复。构建和验证不修改实际用户 profile。
+`dsh-client-ui-copy-session-id` 的源码继续保留；DSH 已提供内置复制入口时，保持该独立插件停用，避免菜单重复。DuoLink 不再包含自己的复制实现。构建和验证不修改实际用户 profile。
 
 卸载：Web 用 `dsh plugin --profile web remove dsh-gc-duolink`；Desktop 完全退出后用 `"$DESKTOP_DSH" plugin --profile desktop remove dsh-gc-duolink`。卸载保留 DuoLink 数据和会话历史。
 
@@ -196,7 +202,7 @@ env -u DSH_SOURCE_ROOT pnpm build
 env -u DSH_SOURCE_ROOT pnpm test
 ```
 
-`pnpm test` 包括客户端、初始模型单位测试、原生 proof、构建目录链接安装验收与构建契约，运行前先 build；默认验证不生成安装包。当前检查包括客户端 111 项、初始模型 56 项、构建契约 3 项，以及辅助 Host 回归 260 项。链接安装后的模型 proof 使用 46 次 mock 请求，无付费调用。浏览器 smoke 和准确验证边界见 [VERIFICATION.md](VERIFICATION.md)。
+`pnpm test` 包括客户端、初始模型单位测试、原生 proof、构建目录链接安装验收与构建契约，运行前先 build；默认验证不生成安装包。当前检查包括客户端 109 项、初始模型 56 项、构建契约 3 项，以及辅助 Host 回归 260 项。链接安装后的模型 proof 使用 46 次 mock 请求，无付费调用。浏览器 smoke 和准确验证边界见 [VERIFICATION.md](VERIFICATION.md)。
 
 ```sh
 BROWSER_EXECUTABLE_PATH='/Applications/Brave Browser.app/Contents/MacOS/Brave Browser' pnpm test:workspace-installed

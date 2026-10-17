@@ -29,7 +29,7 @@ test('built SRC methods retain the named wire fields and cancellation position',
   }
 })
 
-test('browser factory only requests seeded React modules', () => {
+test('browser factory only requests seeded React and Host UI modules', () => {
   const source = readFileSync(new URL('lib/client.js', root), 'utf8')
   let registration
   new Function('window', source)({ __ModuleLoader__: { load(value) { registration = value } } })
@@ -38,6 +38,7 @@ test('browser factory only requests seeded React modules', () => {
   const require = createRequire(import.meta.url)
   const client = registration.factory(specifier => {
     requested.push(specifier)
+    if (specifier === '@deepseek-ai/dsh-client-ui-primitives') return { MenuItemButton() {} }
     assert.match(specifier, /^react(?:-dom)?(?:\/|$)/)
     return require(specifier)
   })
@@ -45,6 +46,10 @@ test('browser factory only requests seeded React modules', () => {
   assert.ok(client.inject.includes('connection'))
   assert.ok(client.inject.includes('slots'))
   assert.ok(requested.includes('react'))
+  assert.ok(requested.includes('@deepseek-ai/dsh-client-ui-primitives'))
+  assert.ok(manifest.dsh.client.inject.includes('@deepseek-ai/dsh-client-ui-renderer'))
+  assert.ok(!source.includes('data-duolink-copy-session-id'))
+  assert.ok(!source.includes('row.copy.id'))
   assert.ok(!source.includes('session-link/changed'))
 })
 

@@ -2,8 +2,6 @@
 export const NS = 'gcDuolink'
 
 export const zh = {
-  'row.copy.id': '复制会话 ID',
-  'row.copy.error': '复制失败，请允许剪贴板访问后重试。',
   'mail.extend.action': '增加唤醒额度',
   'mail.extend.title': '增加本条回复链的唤醒额度',
   'mail.extend.chain': '回复链唤醒 {used}/{limit} · 双方合计',
@@ -45,7 +43,6 @@ export const zh = {
   'quick.close': '关闭快速互联',
   'panel.owner': '正在管理：{title}',
   'row.linked': '已互联 {count} 个会话 · 管理互联',
-  'row.unlinked': '未互联 · 添加互联',
   'row.manage': '会话互联…',
   'wake.on': '开',
   'wake.off': '关',
@@ -68,6 +65,11 @@ export const zh = {
   'revoke.cancel': '取消',
   'add.title': '添加互联',
   'add.search': '搜索标题或 ID',
+  'add.more': '展示更多（最多 8 个）',
+  'add.less': '收起',
+  'add.limit': '仅展示最近 8 个匹配会话，可输入标题或 ID 缩小范围。',
+  'group.expand': '展开「{title}」',
+  'group.collapse': '折叠「{title}」',
   'add.wake': '我发消息 → 唤醒对方',
   'add.wake.hint': '允许对方空闲时自动开始工作',
   'add.wake.self': '对方发消息 → 唤醒我',
@@ -138,8 +140,6 @@ export const zh = {
 export type LinkLocaleKey = keyof typeof zh
 
 export const en: Record<LinkLocaleKey, string> = {
-  'row.copy.id': 'Copy Session ID',
-  'row.copy.error': 'Copy failed. Allow clipboard access and try again.',
   'mail.extend.action': 'Increase wake budget',
   'mail.extend.title': 'Increase wake budget for this reply chain',
   'mail.extend.chain': 'Reply-chain wakes {used}/{limit} · both parties combined',
@@ -181,7 +181,6 @@ export const en: Record<LinkLocaleKey, string> = {
   'quick.close': 'Close quick link',
   'panel.owner': 'Managing: {title}',
   'row.linked': '{count} linked session(s) · Manage links',
-  'row.unlinked': 'Not linked · Add a link',
   'row.manage': 'Session links…',
   'wake.on': 'On',
   'wake.off': 'Off',
@@ -204,6 +203,11 @@ export const en: Record<LinkLocaleKey, string> = {
   'revoke.cancel': 'Cancel',
   'add.title': 'Link a session',
   'add.search': 'Search title or ID',
+  'add.more': 'Show more (up to 8)',
+  'add.less': 'Show less',
+  'add.limit': 'Showing the 8 most recent matches. Search by title or ID to narrow the list.',
+  'group.expand': 'Expand "{title}"',
+  'group.collapse': 'Collapse "{title}"',
   'add.wake': 'My messages → wake peer',
   'add.wake.hint': 'Allow the idle peer to start automatically',
   'add.wake.self': 'Peer messages → wake me',

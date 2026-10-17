@@ -11,7 +11,8 @@ const alias = Object.entries<string[]>(sdkPaths?.config.compilerOptions.paths ??
   .map(([find, candidates]) => ({ find, replacement: resolve(sdkRoot!, candidates[0]!) }))
 
 export default defineConfig({
-  resolve: { alias },
+  resolve: { alias: [{ find: '@deepseek-ai/dsh-client-ui-primitives',
+    replacement: resolve(import.meta.dirname, 'tests/fixtures/host-ui-primitives.tsx') }, ...alias] },
   plugins: [{
     name: 'standard-decorators', enforce: 'pre',
     transform(code, id) {

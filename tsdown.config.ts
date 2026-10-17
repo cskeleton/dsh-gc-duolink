@@ -13,7 +13,7 @@ export default defineConfig([
     entry: { client: 'lib/types/client/index.js' },
     outDir: 'lib', format: ['cjs'], platform: 'browser', target: 'es2024',
     dts: false, clean: false,
-    deps: { neverBundle: /^react(-dom)?($|\/)/ },
+    deps: { neverBundle: [/^react(-dom)?($|\/)/, /^@deepseek-ai\/dsh-client-ui-primitives$/] },
     outputOptions: {
       entryFileNames: 'client.js',
       banner: 'window.__ModuleLoader__.load({ id: "dsh-gc-duolink", factory: (require) => {',

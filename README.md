@@ -4,15 +4,19 @@
 
 `dsh-gc-duolink`
 
-Bidirectional Session messaging and utilities for DeepSeek Harness Desktop and Web: create links, exchange durable messages, manage wake budgets, spawn ordinary Sessions with an initial model and copy Session IDs. It uses official DSH `0.2.0-rc.2` public APIs without changing the Host.
+Bidirectional Session messaging and utilities for DeepSeek Harness Desktop and Web: create links, exchange durable messages, manage wake budgets, spawn ordinary Sessions with an initial model. It uses official DSH `0.2.0-rc.2` public APIs without changing the Host.
 
-The current working tree uses independent DuoLink configuration, storage and protocol identities. It does not load or migrate old `dsh-session-link` settings, mail, link groups or ledgers. Existing archives under `output/` are historical snapshots and do not contain these working-tree changes. Development does not bump versions or create archives unless explicitly requested. See [namespace isolation](docs/plans/duolink-isolation.md) and [verification](VERIFICATION.md).
+**Preview release: [0.6.1-beta](https://github.com/cskeleton/dsh-gc-duolink/releases/tag/v0.6.1-beta).** DuoLink uses independent configuration, storage and protocol identities. It does not load or migrate old `dsh-session-link` settings, mail, link groups or ledgers. Disable or uninstall the old plugin and recreate links and wake grants in DuoLink. Keep old storage files if you need them; do not rename or copy them into the new domain. See [namespace isolation](docs/plans/duolink-isolation.md) and [verification](VERIFICATION.md).
 
 ## Usage
 
-Choose **Copy Session ID** from a Session row's `…` menu to copy that row's full ID. No link is required. The menu closes after success; failures remain visible and retryable. The Clipboard API is preferred, with the original textarea copy fallback when unavailable or denied.
+Use DSH's built-in **Copy Session ID** action in a Session row's `…` menu. DuoLink does not add a second copy action. Its **Session links…** entry uses the Host's menu component for matching typography and spacing.
 
-Click **Links** in the Session header, find a peer, confirm the wake settings in both directions, and create the link. The right panel opens peers, changes wake settings and confirms unlinking. The sidebar's right-hand chain action and `… → Session links…` manage the clicked Session without switching the main conversation. Chain color indicates membership only, independently of execution and wake state.
+Click **Links** in the Session header, find a peer, confirm the wake settings in both directions, and create the link. The right panel opens peers, changes wake settings and confirms unlinking. The sidebar's right-hand chain action and `… → Session links…` manage the clicked Session without switching the main conversation. The sidebar chain action appears only for Sessions with at least one link and disappears after the last link is removed, independently of execution and wake state. Unlinked Sessions remain accessible through the menu.
+
+The interface follows DSH's shared language preference, including changes while the panel is open. The picker initially shows the 3 most recently active eligible Sessions; **Show more** expands it to 8. Search matches the entire eligible catalog before applying the display limit.
+
+Link cards can collapse from their title bar, with **Unlink** on the right and confirmation before removal. Pair cards display the peer title once, followed by its ID/status and wake controls; larger groups retain individual receiving-member names.
 
 Two-member groups show “My messages → wake peer” and “Peer messages → wake me.” Larger groups grant wake permission per receiving member; that setting applies to every sender in the group. Both switches default to on for a new UI link and require confirmation. Existing groups and human-disabled switches receive no additional grants. Only existing, unarchived ordinary top-level Sessions can link. Duplicate Session pairs are rejected within the serialized admission queue.
 
@@ -93,6 +97,8 @@ Old top-level `provider`, `model`, `reasoning_effort`, `model_scope` and `on_mod
 
 ## Installation
 
+Download [dsh-gc-duolink-0.6.1-beta.tgz](https://github.com/cskeleton/dsh-gc-duolink/releases/download/v0.6.1-beta/dsh-gc-duolink-0.6.1-beta.tgz) from the prerelease and select it in the DSH plugin installer. Checksums and a delivery manifest accompany the archive. Earlier local 0.6.1 archives are test snapshots. The instructions below cover source development installs.
+
 Build the directory first; development installs use `link:` without archives. Preset-registry and session-persistence are optional peers: ordinary tools can mount without them; selected spawn explicitly refuses missing public bootstrap services. Runtime peers resolve from the target profile. Disable peer auto-installation to avoid a second Host dependency tree.
 
 ```sh
@@ -121,7 +127,7 @@ Configure DuoLink as a fresh plugin. Recreate desired links and wake permissions
 
 The default JSON backend stores DuoLink state at `$DSH_HOME/storages/gc_duolink.json`. It never falls back to `session_link.json`. A persisted product marker identifies owned storage; an old or foreign nonempty file copied to the new path is rejected. Do not manually rename old data files as a migration.
 
-The standalone `dsh-client-ui-copy-session-id` source remains available. Disable its separate UI contribution when using DuoLink's built-in copy action to avoid duplicate menus. Building and validation do not change actual user profiles.
+The standalone `dsh-client-ui-copy-session-id` source remains available. On DSH versions with the built-in copy action, keep that standalone plugin disabled to avoid duplicate menus. DuoLink no longer contains its own copy implementation. Building and validation do not change actual user profiles.
 
 Uninstall Web with `dsh plugin --profile web remove dsh-gc-duolink`; for Desktop, quit first and use `"$DESKTOP_DSH" plugin --profile desktop remove dsh-gc-duolink`. Removal retains DuoLink data and Session history.
 
@@ -196,7 +202,7 @@ env -u DSH_SOURCE_ROOT pnpm build
 env -u DSH_SOURCE_ROOT pnpm test
 ```
 
-The default test command runs client tests, initial-model unit tests, native proof, linked-directory tools integration and built contracts; build first. Default validation creates no install archive. Current checks include 111 client tests, 56 initial-model tests, 3 built contracts and 260 auxiliary Host tests. Installed-directory model proof makes 46 mock requests and zero paid calls. Browser evidence and exact boundaries are in [VERIFICATION.md](VERIFICATION.md).
+The default test command runs client tests, initial-model unit tests, native proof, linked-directory tools integration and built contracts; build first. Default validation creates no install archive. Current checks include 109 client tests, 56 initial-model tests, 3 built contracts and 260 auxiliary Host tests. Installed-directory model proof makes 46 mock requests and zero paid calls. Browser evidence and exact boundaries are in [VERIFICATION.md](VERIFICATION.md).
 
 ```sh
 BROWSER_EXECUTABLE_PATH='/Applications/Brave Browser.app/Contents/MacOS/Brave Browser' pnpm test:workspace-installed

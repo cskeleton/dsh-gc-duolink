@@ -1,3 +1,75 @@
+# Verification — 0.6.1-beta prerelease preparation
+
+日期：2026-10-18。用户明确授权 commit、push 和 GitHub beta release，版本使用标准 SemVer `0.6.1-beta`，tag 为 `v0.6.1-beta`；发布为 Pre-release，不替换稳定版。中英文 README 增加预发布包入口和旧插件独立安装说明。
+
+| 发布前检查 | 结果 |
+|---|---|
+| 类型和构建 | PASS；`pnpm typecheck`、`pnpm build`，版本 0.6.1-beta |
+| 默认测试 | PASS；`pnpm test`：客户端 109/109、初始模型单位测试 56/56、构建契约 3/3；原生 proof 19 次 mock，链接安装 proof 46 次 mock，均 0 付费调用 |
+| 打包保护 | PASS；`pnpm test:pack-release`，1/1；相同字节可重试，禁止不同内容覆盖同版本包 |
+| 完整浏览器回归 | PASS；已安装 Desktop 0.2.1-rc.2 的运行时 + 隔离 Web profile + Brave；本轮未使用 `SMOKE_UI_ONLY`，完整邮箱、取消、唤醒额度追加、刷新/重载、撤销、旧命名空间隔离及卸载历史场景通过；[JSON](output/playwright-beta-release/installed-smoke-result.json) |
+| 最新 UI | PASS；中英文即时切换、3/8 候选与完整搜索、紧凑折叠卡片、标题栏解除、单行打开按钮、原生菜单字体与间距、仅保留 1 个原生复制入口、仅已互联会话显示侧栏链条 |
+
+发布包通过 `pnpm pack:release` 生成到 `output/0.6.1-beta/`，打包器逐文件核对工作区字节与导出入口；GitHub 随包提供 SHA256SUMS 和含源码提交信息的 delivery-manifest.json。此前 0.6.1 本机测试包继续保留，不覆盖。自动化只操作一次性 profile；未修改或重启用户实际 Desktop，未进行真实远端模型调用。实际 Electron 前台窗口的自动交互不在本轮范围。
+
+以下为历史验证记录；其中「未提交/未发布」「不打包」「完整邮箱 NOT_RUN」等陈述仅描述各自轮次。
+
+---
+
+# Verification — linked-only sidebar action (working tree)
+
+日期：2026-10-18。会话列表外侧链条按钮仅在该会话至少有一个互联对象时显示，解除最后一组后隐藏；互联菜单入口始终保留，唤醒开关不影响可见性。移除不再使用的「未互联」按钮文案，中英文 README 同步说明。
+
+- PASS：`pnpm test:client`，109/109，10 files；新增未互联隐藏→建链出现（双向唤醒均关闭）→解除隐藏、菜单保留的订阅更新检查，既有唤醒关闭不隐藏检查保留。
+- PASS：`pnpm typecheck`、`pnpm build`、`pnpm test:contracts`，契约 3/3。
+- PASS：已安装 Desktop 的 0.2.1-rc.2 运行时 + 一次性 Web profile + Brave，实际验证未建链无外侧按钮、菜单可进入、建链后可管理、解除后隐藏且菜单保留；[JSON](output/playwright-linked-row/installed-smoke-result.json)、[未互联截图](output/playwright-linked-row/ui-row-unlinked.png)。此运行时版本取自实际命令输出。
+- 0 模型调用；`SMOKE_UI_ONLY=1`，完整邮箱场景 NOT_RUN。其余紧凑 UI、语言、原生菜单样式、无重复复制、无效配置及卸载后历史检查通过。
+- 版本仍为 0.6.1，未打包、安装、commit/push 或修改用户 profile；17 个既有安装包保持不变。实际 Desktop 窗口未操作。
+
+以下为历史验证记录。
+
+---
+
+# Verification — native Session menu and copy removal (working tree)
+
+日期：2026-10-18。当前 Desktop 0.2.1-rc.1 已内置「复制 Session ID」。本轮从 DuoLink 删除重复菜单注册、复制组件、Clipboard/textarea fallback、专用文案及 6 个专用测试；独立复制插件源码不变。「会话互联…」改用宿主提供的 `MenuItemButton`，删除自定义菜单按钮 CSS。浏览器构建将该 UI 模块保留为宿主外部模块，不打入另一套组件；运行时契约限定仅请求 React 和这一宿主模块。
+
+| 检查 | 当前结果与证据 |
+|---|---|
+| 客户端 | PASS；`pnpm test:client`，108/108，10 files；只注册互联菜单、使用宿主组件、点击管理与关闭行为通过 |
+| 类型、构建与契约 | PASS；`pnpm typecheck`、`pnpm build`、`pnpm test:contracts`，契约 3/3；产物不包含复制入口/文案标记，Host UI 外部模块保留 |
+| 当前 Desktop 运行时的隔离 Web proof | PASS；使用已安装应用的 CLI/asar（0.2.1-rc.1）和 Electron 的 Node 模式加载依赖，启动一次性 Web profile + Brave；中英文菜单均与原生行样式相同，字体 13px、行高 20px、上下 padding 各 6px、min-height 34px；仅剩 1 个原生复制入口；[JSON](output/playwright-native-menu/installed-smoke-result.json) |
+| UI 回归 | PASS；3/8 候选与完整搜索、语言即时切换、单行打开按钮、紧凑卡片折叠、标题去重、插件无效配置/卸载后核心和历史可用；0 模型调用 |
+| 截图 | [中文菜单](output/playwright-native-menu/ui-menu-zh.png)、[英文菜单](output/playwright-native-menu/ui-menu-en.png)，均已人工查看 |
+| 边界 | 最终运行使用 `SMOKE_UI_ONLY=1`，完整邮箱场景 NOT_RUN；没有操作正在运行的 Desktop 窗口或用户 profile；未重启实际应用、未重新安装 |
+| 工作区 | 版本仍为 0.6.1，HEAD/master、既有 tgz 文件及 SHA256、独立复制插件文件均保持不变；未打包、commit 或 push；`git diff --check` 通过 |
+
+旧的本机测试包仍保留先前复制实现，不代表当前工作区；需要用户另行要求打包后再交付新测试包。复跑命令见 [integration README](tests/integration/README.md)。以下记录为历史验证范围。
+
+---
+
+# Verification — compact bilingual UI (working tree)
+
+日期：2026-10-18。基于已提交的 `e23989a` 调整 UI；本轮未 commit/push，版本仍为 0.6.1，未生成或覆盖安装包，未修改实际用户 profile 或重启 Desktop。
+
+- 沿用 DSH locale 注册和语言偏好；真实 Host 设置切换中英文后，已打开的面板和快速互联弹窗即时更新，无需刷新。
+- 候选列表按 Host 的最近活跃顺序默认显示 3 个，展开最多 8 个；搜索先过滤完整候选集合，再应用显示上限。打开会话按钮不换行。
+- 双人组标题直接显示对端名称，正文只保留 ID、状态和操作；可见唤醒文案省略重复名称，无障碍名称仍保留对象。多人组继续显示成员名和逐成员接收控制，避免方向歧义。
+- 卡片标题加深、元信息变浅，解除互联移至标题栏并保留确认；折叠仅隐藏正文。删除无关的 `doraemon-bicycle.html`。
+
+| 检查 | 当前结果与证据 |
+|---|---|
+| 客户端 | PASS；`pnpm test:client`，114/114，11 files；新增 3/8 展开、完整搜索、隐藏选择清理、双人/多人语义、折叠和标题栏解除确认检查 |
+| 类型、构建与契约 | PASS；`pnpm typecheck`、`pnpm build`、`pnpm test:contracts`，契约 3/3 |
+| 真实浏览器专项 | PASS；官方 DSH 0.2.0-rc.2 + Brave，隔离 profile 链接构建目录；中英文即时切换、3/8 和第 9 个候选搜索、单行打开按钮、折叠与标题去重；0 模型调用；[JSON](output/playwright-ui-compact/installed-smoke-result.json) |
+| 截图 | [英文](output/playwright-ui-compact/ui-compact-en.png)、[中文](output/playwright-ui-compact/ui-compact-zh.png)、[窄屏快速互联](output/playwright-ui-compact/ui-quick-zh-narrow.png)、[深色](output/playwright-ui-compact/ui-compact-zh-dark.png)；测试样本卡片展开 188px、折叠 34px |
+| 验证边界 | 本次最终浏览器命令使用 `SMOKE_UI_ONLY=1`，完整邮箱场景为 NOT_RUN；仍验证卸载后会话可读、非法插件配置不影响核心功能。Host 源码未改，未重复模型/Host 测试；实际 Desktop 为 NOT_RUN |
+| 交付边界 | 版本、HEAD/master、`output/` 下全部 7 个既有 tgz 的清单与 SHA256 未变；未打包、安装或发布；`git diff --check` 通过 |
+
+复跑命令见 [integration README](tests/integration/README.md)。以下保留之前各轮的验证记录，其范围与计数不并入本轮。
+
+---
+
 # Verification — independent DuoLink namespaces (working tree)
 
 日期：2026-10-18。本节取代此前保留旧插件配置、存储路径和协议的决定；下方记录只说明当时的历史验证。`package.json` 版本仍为 0.6.1，本轮未生成或覆盖任何 tgz，也未 commit/push、修改实际用户 profile 或重启 Desktop。

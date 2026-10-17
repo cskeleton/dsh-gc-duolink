@@ -55,6 +55,34 @@ Screenshots go to `output/playwright/` or `SMOKE_ARTIFACT_DIR`. Authentication U
 
 This verifies the shared Web surface; it does not launch Electron. Desktop is NOT_RUN for this iteration. Future DSH releases require fresh compatibility checks; current results are in [../../VERIFICATION.md](../../VERIFICATION.md).
 
+## Compact UI and Host language proof
+
+```sh
+SMOKE_UI_ONLY=1 \
+BROWSER_EXECUTABLE_PATH='/Applications/Brave Browser.app/Contents/MacOS/Brave Browser' \
+SMOKE_ARTIFACT_DIR="$PWD/output/playwright-ui-compact" \
+pnpm test:integration
+```
+
+This bounded run skips the full mailbox scenario and reports it as `NOT_RUN`. It verifies the sidebar chain action only appears while the Session has links, with its menu retained after unlinking. It compares DuoLink menu typography/spacing with native menu rows and verifies the plugin adds no copy action; on Hosts with native copy, only the built-in entry remains. It also checks the real Host locale preference switching mounted UI between English and Chinese, recent candidates expanding from 3 to 8, search beyond eight, single-line open actions, collapsible compact cards, header Unlink and pair-title deduplication. It captures English/Chinese/light/dark/narrow screenshots, then still checks invalid configuration and plugin removal/history. It makes no model calls, creates no archive and does not touch the running Desktop profile. The default full smoke also runs this UI proof.
+
+### Use the installed Desktop runtime in a disposable Web profile
+
+The bundled CLI uses Electron's Node mode to read its asar dependencies. Run this from the plugin root; `DSH_RUNTIME_PACKAGE` points the fixture seeder at that same runtime. Both the profile and npm cache remain under a temporary `DSH_HOME`.
+
+```sh
+ELECTRON_RUN_AS_NODE=1 \
+DSH_BIN='/Applications/DeepSeek Harness.app/Contents/Resources/runtime/cli/bin/dsh' \
+DSH_RUNTIME_PACKAGE='/Applications/DeepSeek Harness.app/Contents/Resources/app.asar/dsh/package.json' \
+SMOKE_UI_ONLY=1 \
+BROWSER_EXECUTABLE_PATH='/Applications/Brave Browser.app/Contents/MacOS/Brave Browser' \
+SMOKE_ARTIFACT_DIR="$PWD/output/playwright-native-menu" \
+'/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSeek Harness' \
+--expose-internals tests/integration/installed-smoke.mjs
+```
+
+This checks the shared shipped Web surface from the installed Desktop distribution; it does not control or replace the user's Desktop installation. The runtime version is recorded in the result JSON. Native copying is owned by DSH; DuoLink does not add a compatibility copy action on older Hosts.
+
 ## Isolation from the old plugin
 
 Old-package upgrade/migration mode is removed. `SMOKE_UPGRADE_FROM` is explicitly rejected. The runner installs `link:` to the built directory into a disposable profile without generating archives. It seeds an incompatible `session_link.json` and an invalid old `session-link` configuration row. The new `gc-duolink` row still activates, only `gcDuolink/*` RPC succeeds, the old file remains unchanged and a separate `gc_duolink.json` persists a DuoLink ownership marker.
@@ -65,6 +93,6 @@ SMOKE_ARTIFACT_DIR="$PWD/output/playwright-isolation" \
 pnpm test:integration
 ```
 
-The full UI scenario includes system-clipboard ID copy, mail, cancellation, wake extension and same-domain recovery/removal checks. It makes no model requests. The installed initial-model proof also links the built directory and exercises mock models only.
+The full UI scenario includes mail, cancellation, wake extension and same-domain recovery/removal checks. It makes no model requests. The installed initial-model proof also links the built directory and exercises mock models only.
 
 Development does not bump versions or generate archives by default. `pnpm test:contracts` runs only built-runtime checks. `pnpm test:pack-release` and `pnpm pack:release` are explicit release operations; do not run them unless release packaging is requested.

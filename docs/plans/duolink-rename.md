@@ -1,3 +1,5 @@
+> Current UI decision (2026-10-18): DuoLink no longer includes the copy utility because Desktop 0.2.1-rc.1 provides it natively. The standalone source remains untouched. The merge steps below are historical.
+
 # DuoLink Rename and Copy Session ID Execution Plan
 
 Historical plan. Its old-compatibility and migration decisions are superseded by [DuoLink namespace isolation](duolink-isolation.md). The old directory symlink has been removed; do not follow the old upgrade steps below.

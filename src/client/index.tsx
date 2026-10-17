@@ -1,4 +1,4 @@
-/** Browser-only Session Link contributions, with no Harness Client value imports. */
+/** Browser-only DuoLink contributions using the Host's seeded menu component. */
 import type { Context } from '@deepseek-ai/cordis'
 import type { ConnectionHandle } from '@deepseek-ai/dsh-client-connection/client'
 import type {} from '@deepseek-ai/dsh-client-locale/client'
@@ -16,7 +16,6 @@ import {
   type LinkInjected, type LinkActions,
 } from './components.tsx'
 import { TurnCard } from './TurnCard.tsx'
-import { CopySessionIdMenu } from './CopySessionIdMenu.tsx'
 import { sessionLinkTurnDefinition } from './turn.ts'
 import { isActivityView, isCancelResult, isExtendWakeResult, isLinkView } from './rpc.ts'
 import { en, NS, zh } from './locales.ts'
@@ -148,9 +147,6 @@ export function apply(ctx: Context & { readonly connection: ConnectionHandle }):
     name: 'sidebar.workspaces.session.menu.item', id: 'dsh-gc-duolink/menu', order: 350, locale: NS,
     inject: rowInjected,
   }, RowLinkMenu))
-  ctx.slots.inject('sidebar.workspaces.session.menu.item', () => ctx.slots.register({
-    name: 'sidebar.workspaces.session.menu.item', id: 'dsh-gc-duolink/copy-session-id', order: 500, locale: NS,
-  }, CopySessionIdMenu))
   ctx.inject(['uiConversation'], cardCtx => {
     cardCtx.uiConversation.events.register(sessionLinkTurnDefinition)
     cardCtx.slots.inject('conversation.chat.turnTail', () => cardCtx.slots.register({

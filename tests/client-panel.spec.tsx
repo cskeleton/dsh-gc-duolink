@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 /** Self-contained panel, header, and mark interactions. */
 import { useSyncExternalStore } from 'react'
-import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { SnapshotSelectorHook, TranslateNS } from '@deepseek-ai/dsh-client-ui-slots'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
@@ -80,7 +80,9 @@ function fixture(extraSessions: SessionLinkSessionView[] = []) {
     }),
     openPanel: vi.fn(), openSession: vi.fn(), t,
   }
-  return { props, source, link, setWake, unlink }
+  return { props, source, link, setWake, unlink,
+    publish: async (update: (current: SessionLinkView) => SessionLinkView) => { view = update(view); await source.refresh() },
+  }
 }
 
 beforeEach(() => {
@@ -101,6 +103,67 @@ async function settle(): Promise<void> {
 }
 
 describe('link management panel', () => {
+  it('shows three recent candidates, expands to eight, and searches the entire catalog', async () => {
+    const f = fixture(Array.from({ length: 9 }, (_, index) => session(`session-extra-${index + 1}` as SessionId, `Recent ${index + 1}`)))
+    render(<LinkTab {...f.props} />)
+    await settle()
+    fireEvent.click(screen.getByRole('button', { name: 'Link a session' }))
+    const candidates = document.querySelector('.gcdl-candidates') as HTMLElement
+    expect(within(candidates).getAllByRole('button').map(button => button.textContent)).toEqual(['Candidatenew', 'Recent 1extra-1', 'Recent 2extra-2'])
+    fireEvent.click(screen.getByRole('button', { name: 'Show more (up to 8)' }))
+    expect(within(candidates).getAllByRole('button')).toHaveLength(8)
+    fireEvent.click(within(candidates).getByRole('button', { name: /Recent 5/ }))
+    expect(screen.getByRole('button', { name: 'Link', exact: true }).hasAttribute('disabled')).toBe(false)
+    fireEvent.click(screen.getByRole('button', { name: 'Show less' }))
+    expect(within(candidates).getAllByRole('button')).toHaveLength(3)
+    expect(screen.getByRole('button', { name: 'Link', exact: true }).hasAttribute('disabled')).toBe(true)
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: 'session-extra-9' } })
+    expect(within(candidates).getAllByRole('button')).toHaveLength(1)
+    expect(within(candidates).getByRole('button', { name: /Recent 9/ })).toBeTruthy()
+    expect(screen.queryByRole('button', { name: 'Show more (up to 8)' })).toBeNull()
+  })
+
+  it('uses one peer title, supports collapse, and keeps unlink confirmation available in the header', async () => {
+    const f = fixture()
+    render(<LinkTab {...f.props} />)
+    await settle()
+    const group = screen.getByRole('region', { name: 'Peer' })
+    expect(within(group).getAllByText('Peer')).toHaveLength(1)
+    expect(group.querySelector('.gcdl-peer-main .gcdl-peer-title')).toBeNull()
+    expect(within(group).getByText('peer · Idle')).toBeTruthy()
+    expect(within(group).getByText('My messages → wake peer')).toBeTruthy()
+    expect(within(group).queryByText('My messages → wake peer · Peer')).toBeNull()
+    const heading = group.querySelector('header') as HTMLElement
+    const toggle = within(heading).getByRole('button', { name: 'Collapse "Peer"' })
+    fireEvent.click(toggle)
+    expect(toggle.getAttribute('aria-expanded')).toBe('false')
+    expect(within(group).queryByRole('switch')).toBeNull()
+    fireEvent.click(within(heading).getByRole('button', { name: 'Unlink', exact: true }))
+    expect(f.unlink).not.toHaveBeenCalled()
+    expect(within(group).getByRole('button', { name: 'Confirm unlink' })).toBeTruthy()
+    fireEvent.click(within(group).getByRole('button', { name: 'Cancel', exact: true }))
+    fireEvent.click(within(heading).getByRole('button', { name: 'Expand "Peer"' }))
+    expect(within(group).getByRole('switch', { name: 'My messages → wake peer · Peer' })).toBeTruthy()
+  })
+
+  it('retains group and receiving-member identities for multi-member permissions', async () => {
+    const f = fixture()
+    await f.publish(view => ({ ...view, links: [{ ...view.links[0]!, name: 'Research team', memberIds: [SELF, PEER, CANDIDATE] }] }))
+    const rendered = render(<LinkTab {...f.props} />)
+    await settle()
+    const group = screen.getByRole('region', { name: 'Research team' })
+    expect(within(group).getByText('Peer')).toBeTruthy()
+    expect(within(group).getByText('Candidate')).toBeTruthy()
+    fireEvent.click(within(group).getByRole('switch', { name: 'Allow group messages to wake this member · Candidate' }))
+    await settle()
+    expect(f.setWake).toHaveBeenCalledWith(LINK, CANDIDATE, true)
+    expect(within(group).getByRole('switch', { name: 'Allow group messages to wake me' })).toBeTruthy()
+    fireEvent.click(within(group).getByRole('button', { name: 'Collapse "Research team"' }))
+    rendered.rerender(<LinkTab {...f.props} sessionId={PEER} />)
+    await settle()
+    expect(screen.getByRole('button', { name: 'Collapse "Research team"' }).getAttribute('aria-expanded')).toBe('true')
+  })
+
   it('offers eligible peers, sends the chosen wake value, and publishes the new peer', async () => {
     const f = fixture([
       session('archived' as SessionId, 'Archived', { archived: true }),
@@ -119,7 +182,7 @@ describe('link management panel', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Link', exact: true }))
     await settle()
     expect(f.link).toHaveBeenCalledWith(CANDIDATE, false, true)
-    expect(screen.getByText('Added')).toBeTruthy()
+    expect(screen.getByRole('region', { name: 'Candidate' })).toBeTruthy()
     expect(screen.queryByRole('textbox')).toBeNull()
   })
 
@@ -235,6 +298,25 @@ describe('quick header and right-side row entry', () => {
     expect(screen.getByRole('button').className).toContain('gcdl-row-linked')
   })
 
+  it('only shows the row action while linked and keeps the menu available when unlinked', async () => {
+    const f = fixture()
+    const openPanelFor = vi.fn()
+    render(<>
+      <RowLinkAction sessionId={CANDIDATE} useLinks={f.props.useLinks} openPanelFor={openPanelFor} t={t} />
+      <RowLinkMenu sessionId={CANDIDATE} useLinks={f.props.useLinks} openPanelFor={openPanelFor}
+        useMenuOpenState={() => [true, vi.fn()]} t={t} />
+    </>)
+    await settle()
+    expect(screen.queryByRole('button')).toBeNull()
+    expect(screen.getByRole('menuitem', { name: 'Session links…' })).toBeTruthy()
+    await act(async () => { await f.link(CANDIDATE, false, false) })
+    fireEvent.click(screen.getByRole('button', { name: '1 linked session(s) · Manage links' }))
+    expect(openPanelFor).toHaveBeenCalledWith(CANDIDATE)
+    await act(async () => { await f.unlink(SessionLinkId('link-added')) })
+    expect(screen.queryByRole('button')).toBeNull()
+    expect(screen.getByRole('menuitem', { name: 'Session links…' })).toBeTruthy()
+  })
+
   it('offers an unlinked row and joins the formal menu with dismissal', async () => {
     const f = fixture()
     const openPanelFor = vi.fn()
@@ -242,7 +324,10 @@ describe('quick header and right-side row entry', () => {
     render(<RowLinkMenu sessionId={CANDIDATE} useLinks={f.props.useLinks} openPanelFor={openPanelFor}
       useMenuOpenState={() => [true, close]} t={t} />)
     await settle()
-    fireEvent.click(screen.getByRole('menuitem', { name: 'Session links…' }))
+    const menu = screen.getByRole('menuitem', { name: 'Session links…' })
+    expect(menu.hasAttribute('data-host-menu-item')).toBe(true)
+    expect(menu.classList.contains('gcdl-menu-item')).toBe(false)
+    fireEvent.click(menu)
     expect(openPanelFor).toHaveBeenCalledWith(CANDIDATE)
     expect(close).toHaveBeenCalledWith(false)
   })

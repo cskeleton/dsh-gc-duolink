@@ -1,3 +1,35 @@
+# 0.6.1-beta release regression — 2026-10-18
+
+PASS on the installed Desktop 0.2.1-rc.2 runtime with a disposable Web profile and Brave. This run used the full default scenario, including mail, cancellation, human wake-budget extension, reload/retry, unlink, namespace isolation, invalid configuration and removal/history. Latest bilingual/compact/native-menu/linked-only-row UI checks also passed. [Result](../../output/playwright-beta-release/installed-smoke-result.json).
+
+`pnpm test`: client 109/109, initial-model unit 56/56, contracts 3/3; native and linked-directory proofs make 19 and 46 mock requests respectively, with zero paid calls. Typecheck/build and the 1/1 release-packaging contract pass. Publication uses tag `v0.6.1-beta` as a GitHub prerelease. The actual user's Desktop/profile and all previous archives remain untouched.
+
+---
+
+# Linked-only sidebar action — 2026-10-18
+
+PASS with the installed Desktop 0.2.1-rc.2 runtime, a disposable Web profile and Brave. The sidebar chain action is absent before linking, appears after linking even with wake disabled, and disappears after the last unlink; the Session links menu remains available. [Result](../../output/playwright-linked-row/installed-smoke-result.json), [unlinked row](../../output/playwright-linked-row/ui-row-unlinked.png).
+
+Client: 109/109; typecheck/build: PASS; contracts: 3/3. Zero model calls. UI-only run: full mailbox scenario NOT_RUN. No package/version change, commit, push or actual user-profile change.
+
+---
+
+# Native menu and copy removal — 2026-10-18
+
+PASS with the installed Desktop **0.2.1-rc.1** runtime/asar, an isolated Web profile and Brave. DuoLink's menu row matches native typography and spacing in both languages: 13px font, 20px line-height, 6px vertical padding, 34px minimum height. Only one native Copy Session ID entry remains; DuoLink's copy registration/implementation/strings/tests are removed. [English menu](../../output/playwright-native-menu/ui-menu-en.png), [Chinese menu](../../output/playwright-native-menu/ui-menu-zh.png).
+
+[Result](../../output/playwright-native-menu/installed-smoke-result.json): 0 model calls, `SMOKE_UI_ONLY=1`; full mailbox scenario NOT_RUN. Compact UI, actual Host locale changes, invalid configuration and removal/history checks pass. Client: 108/108; typecheck/build: PASS; built contracts: 3/3. Version remains 0.6.1; all existing archives and standalone copy-plugin sources are unchanged. No new package, commit, push, actual Desktop interaction or user-profile change. [Verification](../../VERIFICATION.md).
+
+---
+
+# Compact bilingual UI working tree — 2026-10-18
+
+PASS on official DSH 0.2.0-rc.2 + Brave with a disposable profile and linked build. Actual Host locale changes update the mounted popup and panel without reload; recent candidates show 3 then 8, search finds a ninth candidate, Open Session stays on one line, group headers hold Unlink, cards collapse, and pair titles are not repeated. Sample expanded/collapsed card heights: 188/34px. English, Chinese, narrow popup and dark screenshots are under `output/playwright-ui-compact/`.
+
+[Result](../../output/playwright-ui-compact/installed-smoke-result.json): 0 model calls; `SMOKE_UI_ONLY=1`, so the full mailbox scenario is explicitly NOT_RUN. Plugin removal/history and invalid-config/core checks still passed. Client: 114/114; typecheck/build: PASS; built contracts: 3/3. No version bump, archive generation, commit, push or actual Desktop/profile change. [Full verification](../../VERIFICATION.md).
+
+---
+
 # DuoLink isolation working tree — 2026-10-18
 
 The old-package compatibility decision in earlier records below is superseded. No new archive or version bump was made.

@@ -18,6 +18,7 @@ const temp = await mkdtemp(join(tmpdir(), 'dsh-gc-duolink-installed-'))
 const home = join(temp, 'home')
 const workspace = join(temp, 'workspace')
 const profile = 'gc-duolink-smoke'
+const uiOnly = process.env.SMOKE_UI_ONLY === '1'
 const env = { ...process.env, DSH_HOME: home, DSH_TELEMETRY_DISABLED: '1', npm_config_cache: join(temp, 'npm-cache') }
 const artifactDir = resolve(process.env.SMOKE_ARTIFACT_DIR ?? join(pluginDir, 'output', 'playwright'))
 const alphaId = 'session-link-smoke-alpha'
@@ -61,15 +62,17 @@ async function command(args, cwd = workspace) {
 async function seedSessions() {
   const { stdout } = await runFile('which', [binary])
   const launcher = await realpath(stdout.trim())
-  const installationRequire = createRequire(join(dirname(dirname(launcher)), 'package.json'))
+  const installationRequire = createRequire(process.env.DSH_RUNTIME_PACKAGE ?? join(dirname(dirname(launcher)), 'package.json'))
   const { Context } = installationRequire('@deepseek-ai/cordis')
   const { SessionId, SESSION_FORMAT_VERSION } = installationRequire('@deepseek-ai/dsh-session')
   const { createSystemMessage } = installationRequire('@deepseek-ai/dsh-llm')
-  const Persistence = installationRequire('@deepseek-ai/dsh-session-persistence-jsonl').default
+  const persistenceModule = installationRequire('@deepseek-ai/dsh-session-persistence-jsonl')
+  const Persistence = persistenceModule.default ?? persistenceModule
   const ctx = new Context()
   try {
     await ctx.plugin(Persistence, { root: join(home, 'sessions') })
-    for (const [id, title] of [[alphaId, 'Link alpha'], [betaId, 'Link beta'], [gammaId, 'Link gamma']]) {
+    for (const [id, title] of [[alphaId, 'Link alpha'], [betaId, 'Link beta'], [gammaId, 'Link gamma'],
+      ...Array.from({ length: 9 }, (_, index) => [`session-ui-recent-${index + 1}`, `Recent candidate ${index + 1}`])]) {
       const at = Date.now() - 60_000
       const header = { version: SESSION_FORMAT_VERSION, id: SessionId(id), createdAt: at, isSeeded: false, cwd: workspace, delegationDepth: 0 }
       const handle = await ctx.sessionPersistence.create(header)
@@ -175,7 +178,13 @@ async function selectSession(title) {
   const ungrouped = page.getByRole('treeitem', { name: /^Ungrouped/ })
   if (await ungrouped.count() > 0 && await ungrouped.getAttribute('aria-expanded') === 'false') await ungrouped.click()
   const row = page.getByRole('treeitem').filter({ hasText: title }).last()
-  await row.waitFor({ timeout: 15_000 })
+  // Sidebar data arrives asynchronously after reload. Expand its native disclosure as rows appear.
+  await eventually(async () => {
+    if (await row.isVisible()) return true
+    const more = page.getByRole('button', { name: /^Show \d+ more sessions$/ })
+    if (await more.count() > 0) await more.first().click()
+    return false
+  }, `sidebar Session ${title} becomes visible`)
   await row.click()
   await page.getByText(`${title}.`, { exact: true }).waitFor({ timeout: 15_000 })
 }
@@ -292,7 +301,9 @@ try {
   assert.ok(view.sessions.some(session => session.id === alphaId && session.title === 'Link alpha'))
   assert.ok(view.sessions.some(session => session.id === betaId && session.ordinary && !session.blank))
   // The final UI assertions are kept below so every browser action uses the installed bundle.
-  await runScenario({ page, rpc, requireRpc, eventually, selectSession, alphaId, betaId, gammaId, artifactDir })
+  if (!uiOnly) await runScenario({ page, rpc, requireRpc, eventually, selectSession, alphaId, betaId, gammaId, artifactDir })
+  const { verifyCompactUi } = await import('./ui-compact-proof.mjs')
+  const compactUi = await verifyCompactUi({ page, requireRpc, eventually, alphaId, betaId, gammaId, artifactDir })
   assert.equal(await readFile(oldStoragePath, 'utf8'), oldStorage, 'new mail never writes to the old domain')
   assert.ok((await readFile(join(home, 'storages/gc_duolink.json'), 'utf8')).includes('dsh-gc-duolink'), 'new store carries its own product identity')
   await page.screenshot({ path: join(artifactDir, 'installed-session-link.png') })
@@ -320,9 +331,8 @@ try {
   assert.ok(JSON.stringify(absentHistory).includes('gc-duolink-message'), 'history preserves the removed producer attribution')
   await missingLinkRpc()
   assert.equal(await page.locator('[data-gc-duolink-action]').count(), 0, 'removed plugin has no header action')
-  assert.equal(await page.locator('[data-duolink-copy-session-id]').count(), 0, 'removed plugin has no copy menu')
   assert.deepEqual(failures, [], 'plugin-free browser emitted no unhandled JavaScript errors')
-  const summary = JSON.stringify({ result: 'PASS', packageName: 'dsh-gc-duolink', isolatedFromOldPlugin: true, oldConfigIgnored: true, oldStorageUntouched: true, oldRpcAbsent: true, copySessionId: true, dshVersion: version.trim(), installation: 'built directory link', modelCalls: 0, toolsScopedToListedPresets: true, explicitSessionIdAdopted: true, invalidPluginConfigCoreUsable: true, pluginAbsentSessionsReadable: true, activityViewPaged: true, activityCursorRejected: true, mailSurface: true, mailFailureRetained: true, quickPeerOpen: true, managedSessionOpen: true, unlinkRevokesQueuedMail: true, humanMessageCancellation: true, noWakeActivity: true, chainWakeDialog: true, chainWakeExtension: true, artifactDir })
+  const summary = JSON.stringify(uiOnly ? { result: 'PASS', compactUi, dshVersion: version.trim(), installation: 'built directory link', modelCalls: 0, fullMailboxScenario: 'NOT_RUN', pluginAbsentSessionsReadable: true, invalidPluginConfigCoreUsable: true } : { result: 'PASS', compactUi, packageName: 'dsh-gc-duolink', isolatedFromOldPlugin: true, oldConfigIgnored: true, oldStorageUntouched: true, oldRpcAbsent: true, dshVersion: version.trim(), installation: 'built directory link', modelCalls: 0, toolsScopedToListedPresets: true, explicitSessionIdAdopted: true, invalidPluginConfigCoreUsable: true, pluginAbsentSessionsReadable: true, activityViewPaged: true, activityCursorRejected: true, mailSurface: true, mailFailureRetained: true, quickPeerOpen: true, managedSessionOpen: true, unlinkRevokesQueuedMail: true, humanMessageCancellation: true, noWakeActivity: true, chainWakeDialog: true, chainWakeExtension: true, artifactDir })
   await writeFile(join(artifactDir, 'installed-smoke-result.json'), `${summary}\n`)
   await removeGenerated(join(artifactDir, 'installed-session-link-failure.png'), { force: true })
   console.log(summary)
@@ -342,19 +352,6 @@ try {
 }
 
 async function runScenario({ page, rpc, requireRpc, eventually, selectSession, alphaId, betaId, gammaId, artifactDir }) {
-  assert.equal((await requireRpc('gcDuolink/view')).links.length, 0, 'copy works before any link is created')
-  await page.context().grantPermissions(['clipboard-read', 'clipboard-write'], { origin: new URL(page.url()).origin })
-  const copyRow = page.locator(`[data-row-key="session:${betaId}"]`)
-  await copyRow.hover()
-  await copyRow.getByRole('button', { name: 'Session actions for Link beta', exact: true }).click()
-  const copy = page.getByRole('menuitem', { name: 'Copy Session ID', exact: true })
-  await copy.waitFor()
-  assert.equal(await copy.count(), 1, 'exactly one copy entry is installed')
-  await page.screenshot({ path: join(artifactDir, 'duolink-copy-session-id.png') })
-  await copy.click()
-  await copy.waitFor({ state: 'hidden' })
-  assert.equal(await page.evaluate(() => navigator.clipboard.readText()), betaId, 'system clipboard contains the clicked row ID')
-  assert.ok(await page.getByText('Link alpha.', { exact: true }).isVisible(), 'copy leaves the foreground conversation unchanged')
   const concurrent = await Promise.all([
     rpc('gcDuolink/linkFrom', { callerId: alphaId, peerId: betaId, autoWake: false }),
     rpc('gcDuolink/linkFrom', { callerId: betaId, peerId: alphaId, autoWake: false }),
@@ -668,7 +665,7 @@ async function runScenario({ page, rpc, requireRpc, eventually, selectSession, a
   await panel.getByRole('button', { name: 'Unlink', exact: true }).click()
   await panel.getByRole('button', { name: 'Confirm unlink', exact: true }).click()
   await eventually(async () => (await requireRpc('gcDuolink/view')).links.length === 0, 'UI revoke removes the durable group')
-  await eventually(async () => await page.locator('[data-gc-duolink-row-action].gcdl-row-linked').count() === 0, 'revoke clears membership color without removing quick-link actions')
+  await eventually(async () => await page.locator('[data-gc-duolink-row-action]').count() === 0, 'last unlink removes the sidebar row actions')
   const selfLink = await rpc('gcDuolink/linkFrom', { callerId: alphaId, peerId: alphaId, autoWake: false })
   assert.equal(selfLink.ok, false, 'the Host rejects a self link over the real wire')
 }

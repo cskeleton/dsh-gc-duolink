@@ -1,6 +1,6 @@
 {
   "name": "dsh-gc-duolink",
-  "version": "0.6.1",
+  "version": "0.6.1-beta",
   "private": true,
   "description": "DuoLink: bidirectional Session messaging and utilities for DeepSeek Harness Desktop and Web",
   "license": "MIT",
@@ -48,6 +48,7 @@
       "patch": "./gc-duolink.patch.yml"
     },
     "client": {
+      "inject": ["@deepseek-ai/dsh-client-ui-renderer"],
       "platform": "web"
     }
   },

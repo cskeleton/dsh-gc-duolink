@@ -118,9 +118,8 @@ describe('client slot registration', () => {
       expect(f.openTab).toHaveBeenCalledWith('gcDuolink', { params: { sessionId: PEER } })
       expect(f.openSession).not.toHaveBeenCalled()
       const menu = f.registrations.filter(entry => entry.name === 'sidebar.workspaces.session.menu.item')
-      expect(menu.map(entry => entry.id)).toEqual(['dsh-gc-duolink/menu', 'dsh-gc-duolink/copy-session-id'])
-      expect(menu[1].order).toBe(500)
-      expect(menu[1].inject).toBeUndefined()
+      expect(menu.map(entry => entry.id)).toEqual(['dsh-gc-duolink/menu'])
+      expect(menu[0].order).toBe(350)
     } finally { f.cleanup() }
   })
 
