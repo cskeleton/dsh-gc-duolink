@@ -1,7 +1,7 @@
 /**
- * The Session Link service (`ctx.sessionLinks`): link-group lifecycle and the
+ * The Session Link service (`ctx.gcDuolink`): link-group lifecycle and the
  * durable mailbox that admits, orders, and acknowledges peer deliveries.
- * @module dsh-session-link/link
+ * @module dsh-gc-duolink/link
  */
 
 import { createHash, randomUUID } from 'node:crypto'
@@ -18,6 +18,7 @@ import type {} from '@deepseek-ai/dsh-workspace'
 import z from '@deepseek-ai/schemastery'
 import {
   sessionLinkDomainSpec,
+  initializeDuolinkDomain,
   SESSION_LINK_LEDGER_KEY,
 } from './spec.ts'
 import type {
@@ -39,6 +40,11 @@ import type {
   SessionLinkAddRequest,
   SessionLinkAddResult,
   SessionLinkBlockingReason,
+  SessionLinkCancelRequest,
+  SessionLinkCancelResult,
+  SessionLinkWakeBudget,
+  SessionLinkExtendWakeRequest,
+  SessionLinkExtendWakeResult,
   SessionLinkGrant,
   SessionLinkMessageSource,
   SessionLinkRevokeRequest,
@@ -55,6 +61,14 @@ const wireLinkId = wire.string().min(1).transform(value => SessionLinkId(value))
 const addRequestSchema = wire.strictObject({ callerId: wireSessionId, peerId: wireSessionId, autoWake: wire.boolean(), autoWakeCaller: wire.boolean().optional() })
 const revokeRequestSchema = wire.strictObject({ callerId: wireSessionId, linkId: wireLinkId })
 const wakeRequestSchema = wire.strictObject({ callerId: wireSessionId, linkId: wireLinkId, peerId: wireSessionId, on: wire.boolean() })
+const cancelRequestSchema = wire.strictObject({ sessionId: wireSessionId, messageId: wire.string().min(1).transform(value => SessionLinkMessageId(value)) })
+const extendWakeRequestSchema = wire.strictObject({
+  sessionId: wireSessionId,
+  messageId: wire.string().min(1).transform(value => SessionLinkMessageId(value)),
+  additional: wire.number().int().min(1).max(100),
+  expectedExtra: wire.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  requestId: wire.string().min(1).max(128),
+})
 const activityRequestSchema = wire.strictObject({
   sessionId: wireSessionId,
   section: wire.enum(['pending', 'recent']),
@@ -80,9 +94,9 @@ export const Config: z<SessionLinkConfigShape> = z.object({
   maxLinkMembers: z.natural().min(2).default(8),
   maxPendingPerTarget: z.natural().min(1).default(16),
   maxMessageBytes: z.natural().min(1).default(16 * 1024),
-  maxAutoWakesPerSessionPerDay: z.natural().min(1).default(6),
+  maxAutoWakesPerSessionPerDay: z.natural().min(1).default(12),
   maxAutoWakesPerMessage: z.natural().min(1).default(1),
-  maxAutoWakesPerChain: z.natural().min(1).default(4),
+  maxAutoWakesPerChain: z.natural().min(1).max(Number.MAX_SAFE_INTEGER).default(8),
   maxDeliveryAttempts: z.natural().min(1).default(3),
 })
 
@@ -91,9 +105,9 @@ const DEFAULTS: SessionLinkLimits = {
   maxLinkMembers: 8,
   maxPendingPerTarget: 16,
   maxMessageBytes: 16 * 1024,
-  maxAutoWakesPerSessionPerDay: 6,
+  maxAutoWakesPerSessionPerDay: 12,
   maxAutoWakesPerMessage: 1,
-  maxAutoWakesPerChain: 4,
+  maxAutoWakesPerChain: 8,
   maxDeliveryAttempts: 3,
 }
 
@@ -130,7 +144,7 @@ function dayKey(now: Date): string {
 /**
  * Frame a peer body so the receiving model attributes the sender without
  * trusting the text, and can reply: the frame names the sender Session id and
- * the message id that `session_send_session_message` takes as `in_reply_to`.
+ * the message id that `gc_duolink_send_message` takes as `in_reply_to`.
  * @param frame - sender title and id, the minted message id, and the caller's complete body.
  * @returns the sender-framed body stored in the mailbox and delivered to the target.
  */
@@ -140,9 +154,20 @@ export function frameSessionLinkText(frame: {
   readonly messageId: SessionLinkMessageId
   readonly text: string
 }): string {
+  return frameSessionLinkHeader(frame) + REPLY_GUIDANCE + frame.text
+}
+
+const REPLY_GUIDANCE = '无需纯礼貌确认，有实质结果、问题或阻塞再回复；纯信息同步可设置 wake:false，不申请唤醒空闲对端。\n'
+
+/** Exact pre-M2 prefix retained for reading already persisted messages. */
+function frameSessionLinkHeader(frame: {
+  readonly senderTitle: string
+  readonly senderId: SessionId
+  readonly messageId: SessionLinkMessageId
+}): string {
   return `[会话消息] 来自会话「${frame.senderTitle}」（${frame.senderId}）的协作消息，非本机人类直接输入。\n`
-    + `消息 ID：${frame.messageId}。如需回复，调用 session_send_session_message，`
-    + `session_id 填 ${frame.senderId}，in_reply_to 填 ${frame.messageId}。\n${frame.text}`
+    + `消息 ID：${frame.messageId}。如需回复，调用 gc_duolink_send_message，`
+    + `session_id 填 ${frame.senderId}，in_reply_to 填 ${frame.messageId}。\n`
 }
 
 /** Walk a reply chain to its root identity, used for per-chain wake accounting. */
@@ -290,13 +315,15 @@ function previewText(record: SessionLinkMessageRecordData, messageId: SessionLin
     messageId,
     text: '',
   })
-  const body = record.text.startsWith(frame) ? record.text.slice(frame.length) : record.text
+  const oldFrame = frameSessionLinkHeader({ senderTitle: record.senderTitle, senderId: record.senderId, messageId })
+  const body = record.text.startsWith(frame) ? record.text.slice(frame.length)
+    : record.text.startsWith(oldFrame) ? record.text.slice(oldFrame.length) : record.text
   return flattenForDisplay(body, 160)
 }
 
 /**
  * Durable link registry plus mailbox. Cross-session state lives in the
- * `session-link` storage domain; delivery to a live target uses the Agent
+ * `gc_duolink` storage domain; delivery to a live target uses the Agent
  * inbox channel with a dedicated non-human source, and acceptance is recorded
  * only after the target write handle flushes.
  */
@@ -326,7 +353,7 @@ export class SessionLinkService extends TypertRemoteService {
    * @param config - deployment limits; omitted fields fall back to {@link DEFAULTS}.
    */
   constructor(ctx: Context, config: SessionLinkConfigShape = {}) {
-    super(ctx, 'sessionLinks')
+    super(ctx, 'gcDuolink')
     this.resolved = resolveLimits(config)
     this.uiPollIntervalMs = config.uiPollIntervalMs ?? 30000
     if (!Number.isSafeInteger(this.uiPollIntervalMs) || this.uiPollIntervalMs < 1000 || this.uiPollIntervalMs > 2147483647) {
@@ -346,12 +373,13 @@ export class SessionLinkService extends TypertRemoteService {
       this.disposed = true
       await this.tail
       await domain.close()
-    }, 'sessionLinks.close')
+    }, 'gcDuolink.close')
+    await initializeDuolinkDomain(domain)
     this.ctx.on('agent/created', ({ agent }) => {
       // Auto-wake policy never applies to recovery-triggered replays: a boot
       // that resumes Sessions must not silently spend model calls.
       void this.tryDeliverPending(agent.id).catch((error: unknown) => {
-        this.ctx.logger.warn(`session-link: recovery delivery to "${agent.id}" failed: ${String(error)}`)
+        this.ctx.logger.warn(`gc-duolink: recovery delivery to "${agent.id}" failed: ${String(error)}`)
       })
     })
     this.ctx.on('agent/status', ({ agent, status }) => {
@@ -359,7 +387,7 @@ export class SessionLinkService extends TypertRemoteService {
       // its deferred mail as a follow-up behind the active turn.
       if (status !== 'running') return
       void this.tryDeliverPending(agent.id).catch((error: unknown) => {
-        this.ctx.logger.warn(`session-link: deferred delivery to "${agent.id}" failed: ${String(error)}`)
+        this.ctx.logger.warn(`gc-duolink: deferred delivery to "${agent.id}" failed: ${String(error)}`)
       })
     })
     await this.recoverPending()
@@ -438,7 +466,7 @@ export class SessionLinkService extends TypertRemoteService {
         throw new SessionLinkError(`会话已在互联组 ${shared.id} 中互联`, 'LINK_ALREADY_LINKED')
       }
     }
-    const id = options.createAs ?? SessionLinkId(`session-link-${randomUUID()}`)
+    const id = options.createAs ?? SessionLinkId(`gc-duolink-${randomUUID()}`)
     const record: SessionLinkRecordData = {
       name: trimmed,
       memberIds: unique,
@@ -710,6 +738,7 @@ export class SessionLinkService extends TypertRemoteService {
     const entries: SessionLinkActivityEntry[] = page.map(([messageId, record]) => {
       const pending = record.status === 'pending'
       const lastError = errorSummary(record.error)
+      const wakeBudget = this.wakeBudget(messageId, record)
       return {
         messageId,
         linkId: record.linkId,
@@ -724,6 +753,7 @@ export class SessionLinkService extends TypertRemoteService {
         ...(lastError === undefined ? {} : { lastError }),
         canCancel: pending && !this.mayBeHeld(messageId, record, this.ctx.agents.get(record.targetId)),
         blockingReasons: pending ? this.blockingReasons(messageId, record) : [],
+        ...(wakeBudget === undefined ? {} : { wakeBudget }),
       }
     })
     const now = new Date()
@@ -780,7 +810,7 @@ export class SessionLinkService extends TypertRemoteService {
 
   /**
    * Remote: link the caller's Session with one peer as `{ kind: 'human' }`,
-   * mirroring the `/session-link add` command's validation and naming. Both
+   * mirroring the `/gc-duolink add` command's validation and naming. Both
    * Sessions must exist and be ordinary and unarchived; a pair that already
    * shares a group rejects atomically. Domain refusals throw
    * {@link SessionLinkError}; the Gateway carries their message to the caller.
@@ -880,6 +910,46 @@ export class SessionLinkService extends TypertRemoteService {
     }
     if (spawn === undefined) return undefined
     return { sessionId: spawn.sessionId, linkId: spawn.linkId, removed: this.spawnRemoved(spawn, callerId) }
+  }
+
+  /**
+   * Place a new spawn before its first task. Completed/legacy tasks never
+   * restore membership a human later removed. Pending retries use the saved
+   * Workspace identity rather than recreating a deleted registration.
+   * @param callerId - exact spawning Session.
+   * @param callKey - spawn tool call identity.
+   * @param cwd - directory used to create the target Session.
+   * @param inherit - use the caller's membership, including Ungrouped.
+   */
+  async placeSpawnWorkspace(callerId: SessionId, callKey: string, cwd: string, inherit: boolean): Promise<void> {
+    await this.chain(async () => {
+      if (this.disposed) throw new SessionLinkError('Session Link service is disposing', 'DISPOSED')
+      const key = `${callerId}:${callKey}`
+      const spawn = this.readLedgers().spawns[key]
+      if (spawn === undefined) throw new Error('spawn has no recorded Session/link')
+      if (this.spawnRemoved(spawn, callerId)) throw new SessionLinkError('spawn link was removed', 'LINK_REVOKED')
+      if (spawn.workspacePlacement?.completed === true || this.findAdmitted(callerId, callKey) !== undefined) return
+      let placement = spawn.workspacePlacement
+      const save = async (next: NonNullable<typeof placement>) => {
+        const ledger = this.readLedgers()
+        await this.writeLedgers({
+          ...ledger,
+          spawns: { ...ledger.spawns, [key]: { ...ledger.spawns[key]!, workspacePlacement: next } },
+        })
+      }
+      if (placement === undefined) {
+        const workspace = inherit
+          ? this.ctx.workspaceRegistry.list().find(candidate => candidate.sessionIds.includes(callerId))
+          : await this.ctx.workspaceRegistry.create(cwd)
+        placement = { ...(workspace === undefined ? {} : { workspaceId: workspace.id }), completed: workspace === undefined }
+        await save(placement)
+      }
+      if (placement.completed) return
+      const workspace = this.ctx.workspaceRegistry.get(placement.workspaceId!)
+      if (workspace === undefined) throw new Error(`recorded workspace '${placement.workspaceId}' was removed; it will not be recreated`)
+      await workspace.attachSession(spawn.sessionId)
+      await save({ ...placement, completed: true })
+    })
   }
 
   /** Read the immutable bootstrap intent, without activating or changing a model. */
@@ -982,7 +1052,7 @@ export class SessionLinkService extends TypertRemoteService {
       const ledger = this.readLedgers()
       // A 0.3.1 attempt may have linked this hash-derived Session before spawn records existed.
       const earlier = this.list(callerId).find(link => link.memberIds.includes(sessionId))
-      const linkId = earlier?.id ?? SessionLinkId(`session-link-${randomUUID()}`)
+      const linkId = earlier?.id ?? SessionLinkId(`gc-duolink-${randomUUID()}`)
       // The call record commits first; the group follows under the recorded id.
       await this.writeLedgers({
         ...ledger,
@@ -995,16 +1065,13 @@ export class SessionLinkService extends TypertRemoteService {
 
   /**
    * The message one sender admitted under one idempotency key: the key stored
-   * on the message, or an earlier version's idempotency-ledger entry.
+   * on that message; no external or old-version ledger is consulted.
    */
   private findAdmitted(senderId: SessionId, idempotencyKey: string): SessionLinkMessageId | undefined {
     for (const [id, candidate] of this.messages.entries()) {
       if (candidate.senderId === senderId && candidate.idempotencyKey === idempotencyKey) return id
     }
-    const legacy = this.readLedgers().idempotency[`${senderId}:${idempotencyKey}`]
-    return legacy !== undefined && this.messages.get(SessionLinkMessageId(legacy)) !== undefined
-      ? SessionLinkMessageId(legacy)
-      : undefined
+    return undefined
   }
 
   /** Whether one group still exists and contains both Sessions. */
@@ -1051,23 +1118,128 @@ export class SessionLinkService extends TypertRemoteService {
    * @param messageId - the message to cancel.
    */
   async cancel(caller: Agent | undefined, messageId: SessionLinkMessageId): Promise<void> {
-    await this.chain(async () => {
+    await this.chain(() => this.cancelStored(caller?.id, messageId, false))
+  }
+
+  /** Trusted human RPC; sessionId scopes the UI, it is not model authentication. */
+  @Remote('cancelMessageFrom')
+  async cancelMessageFrom(request: SessionLinkCancelRequest): Promise<SessionLinkCancelResult> {
+    request = cancelRequestSchema.parse(request)
+    return await this.chain(() => this.cancelStored(request.sessionId, request.messageId, true))
+  }
+
+  /** Human-only append receipt; authorization, CAS, persistence and continuation share one write slot. */
+  @Remote('extendChainWakeFrom')
+  async extendChainWakeFrom(request: SessionLinkExtendWakeRequest): Promise<SessionLinkExtendWakeResult> {
+    request = extendWakeRequestSchema.parse(request)
+    return await this.chain(async () => {
       if (this.disposed) throw new SessionLinkError('Session Link service is disposing', 'DISPOSED')
-      const record = this.messages.get(messageId)
-      if (record === undefined) {
-        throw new SessionLinkError(`message "${messageId}" not found`, 'MESSAGE_NOT_FOUND')
+      const record = this.messages.get(request.messageId)
+      if (record === undefined || (record.senderId !== request.sessionId && record.targetId !== request.sessionId)) {
+        throw new SessionLinkError('message not found for this participant', 'MESSAGE_NOT_FOUND')
       }
-      if (caller !== undefined && record.senderId !== caller.id && record.targetId !== caller.id) {
-        throw new SessionLinkError('only the sender or target Session may cancel a message', 'MESSAGE_NOT_FOUND')
+      if (legacyTaskReport(record)) throw new SessionLinkError('legacy experimental reports are read-only', 'LEGACY_TASK_MESSAGE_BLOCKED')
+      let budget = this.wakeBudget(request.messageId, record)
+      if (budget === undefined) throw new SessionLinkError('reply chain cannot be reliably resolved', 'WAKE_CHAIN_INVALID')
+      const ledger = this.readLedgers()
+      const prior = Object.hasOwn(ledger.chainWakeExtensions, request.requestId) ? ledger.chainWakeExtensions[request.requestId] : undefined
+      if (prior !== undefined && (prior.rootId !== budget.rootId || prior.sessionId !== request.sessionId
+        || prior.messageId !== request.messageId || prior.additional !== request.additional || prior.expectedExtra !== request.expectedExtra)) {
+        throw new SessionLinkError('requestId already belongs to a different extension confirmation', 'WAKE_EXTENSION_REQUEST_CONFLICT')
       }
-      if (record.status !== 'pending') return
-      const target = this.ctx.agents.get(record.targetId)
-      if (this.mayBeHeld(messageId, record, target)) {
-        if (target !== undefined) await this.confirmDurable(target, [messageId])
-        return
+      const outcome = prior === undefined ? 'applied' : 'replayed'
+      if (prior === undefined) {
+        if (!budget.canExtend) this.assertExtensionGrant(record)
+        if (request.expectedExtra !== budget.chain.extra) {
+          return {
+            messageId: request.messageId, requestId: request.requestId, outcome: 'conflict', budget,
+            continuation: 'not_attempted', status: record.status,
+            blockingReasons: record.status === 'pending' ? this.blockingReasons(request.messageId, record) : [],
+          }
+        }
+        if (!Number.isSafeInteger(budget.chain.extra + request.additional) || !Number.isSafeInteger(budget.chain.limit + request.additional)) {
+          throw new SessionLinkError('chain extension exceeds the safe integer limit', 'WAKE_EXTENSION_INVALID')
+        }
+        await this.writeLedgers({
+          ...ledger,
+          chainWakeExtensions: {
+            ...ledger.chainWakeExtensions,
+            [request.requestId]: {
+              rootId: budget.rootId, sessionId: request.sessionId, messageId: request.messageId,
+              additional: request.additional, expectedExtra: request.expectedExtra, createdAt: new Date().toISOString(),
+            },
+          },
+        })
       }
-      await this.messages.put(messageId, { ...record, status: 'cancelled' })
+      // A terminal message only retains the grant for later replies. Replays after
+      // unlink/archive never restore permission or deliver a previously revoked queue.
+      let continuation: SessionLinkExtendWakeResult['continuation'] = 'not_pending'
+      if (record.status === 'pending') {
+        continuation = 'queued'
+        if (this.extensionGrantAllowed(record)) {
+          try {
+            await this.deliverTarget(record.targetId, { wakeFor: request.messageId })
+          } catch {
+            // Receipt is committed. Report only fixed delivery facts, never internal errors.
+            this.ctx.logger.warn(`gc-duolink: extension continuation for "${request.messageId}" stays unconfirmed`)
+          }
+        }
+      }
+      const current = this.messages.get(request.messageId)!
+      if (record.status === 'pending' && current.status === 'delivered') continuation = 'accepted'
+      else if (current.status !== 'pending') continuation = 'not_pending'
+      budget = this.wakeBudget(request.messageId, current)!
+      return {
+        messageId: request.messageId, requestId: request.requestId, outcome, budget, continuation,
+        status: current.status, blockingReasons: current.status === 'pending' ? this.blockingReasons(request.messageId, current) : [],
+      }
     })
+  }
+
+  /** Existing membership plus known ordinary/unarchived participants, without cold inspection. */
+  private extensionGrantAllowed(record: SessionLinkMessageRecordData): boolean {
+    const link = this.links.get(record.linkId)
+    if (link === undefined || !link.memberIds.includes(record.senderId) || !link.memberIds.includes(record.targetId)) return false
+    return [record.senderId, record.targetId].every(id => {
+      const live = this.ctx.agents.get(id)
+      return !this.ctx.workspaceRegistry.archivedSessionIds.includes(id)
+        && (live === undefined || !subagentOwned(this.ctx, id, live.session.header))
+    })
+  }
+
+  private assertExtensionGrant(record: SessionLinkMessageRecordData): void {
+    const link = this.links.get(record.linkId)
+    if (link === undefined || !link.memberIds.includes(record.senderId) || !link.memberIds.includes(record.targetId)) {
+      throw new SessionLinkError('the message group no longer grants both participants', 'LINK_REVOKED')
+    }
+    for (const id of [record.senderId, record.targetId]) {
+      if (this.ctx.workspaceRegistry.archivedSessionIds.includes(id)) throw new SessionLinkError('a participant is archived', 'TARGET_ARCHIVED')
+      const live = this.ctx.agents.get(id)
+      if (live !== undefined) this.assertOrdinaryTarget(id, live.session.header)
+    }
+  }
+
+  /** Check ownership and the actual target receipt inside the same serial write slot. */
+  private async cancelStored(sessionId: SessionId | undefined, messageId: SessionLinkMessageId, ordinaryOnly: boolean): Promise<SessionLinkCancelResult> {
+    if (this.disposed) throw new SessionLinkError('Session Link service is disposing', 'DISPOSED')
+    const record = this.messages.get(messageId)
+    if (record === undefined) {
+      throw new SessionLinkError(`message "${messageId}" not found`, 'MESSAGE_NOT_FOUND')
+    }
+    if (sessionId !== undefined && record.senderId !== sessionId && record.targetId !== sessionId) {
+      throw new SessionLinkError('only the sender or target Session may cancel a message', 'MESSAGE_NOT_FOUND')
+    }
+    if (ordinaryOnly && legacyTaskReport(record)) {
+      throw new SessionLinkError('legacy experimental reports are read-only', 'LEGACY_TASK_MESSAGE_BLOCKED')
+    }
+    if (record.status !== 'pending') return { messageId, outcome: 'already_terminal', status: record.status }
+    const target = this.ctx.agents.get(record.targetId)
+    if (this.mayBeHeld(messageId, record, target)) {
+      if (target !== undefined) await this.confirmDurable(target, [messageId])
+      return { messageId, outcome: 'too_late', status: this.messages.get(messageId)!.status }
+    }
+    await this.messages.put(messageId, { ...record, status: 'cancelled' })
+    return { messageId, outcome: 'cancelled', status: 'cancelled' }
   }
 
   /**
@@ -1147,7 +1319,7 @@ export class SessionLinkService extends TypertRemoteService {
     if (this.ctx.workspaceRegistry.archivedSessionIds.includes(targetId)) {
       throw new SessionLinkError(`session "${targetId}" is archived`, 'TARGET_ARCHIVED')
     }
-    const messageId = SessionLinkMessageId(`session-link-message-${randomUUID()}`)
+    const messageId = SessionLinkMessageId(`gc-duolink-message-${randomUUID()}`)
     const senderTitle = this.titleOf(caller)
     const framed = frameSessionLinkText({ senderTitle, senderId: caller.id, messageId, text: request.text })
     if (Buffer.byteLength(framed, 'utf8') > this.resolved.maxMessageBytes) {
@@ -1183,6 +1355,7 @@ export class SessionLinkService extends TypertRemoteService {
       targetId,
       ...(inReplyTo === undefined ? {} : { inReplyTo }),
       text: framed,
+      wake: request.wake ?? true,
       status: 'pending',
       wakesUsed: 0,
       chainLength,
@@ -1213,7 +1386,7 @@ export class SessionLinkService extends TypertRemoteService {
       await this.deliverTarget(record.targetId, { wakeFor: messageId, ...(signal === undefined ? {} : { signal }) })
     } catch (error: unknown) {
       if (this.messages.get(messageId)?.status === 'cancelled') throw error
-      this.ctx.logger.warn(`session-link: delivery of "${messageId}" stays queued: ${String(error)}`)
+      this.ctx.logger.warn(`gc-duolink: delivery of "${messageId}" stays queued: ${String(error)}`)
     }
     const status = this.messages.get(messageId)?.status
     if (status === 'delivered') return { messageId, status: 'accepted' }
@@ -1264,7 +1437,7 @@ export class SessionLinkService extends TypertRemoteService {
     const triggerRecord = trigger === undefined ? undefined : this.messages.get(trigger)
     const triggerLink = triggerRecord === undefined ? undefined : this.links.get(triggerRecord.linkId)
     const archived = this.ctx.workspaceRegistry.archivedSessionIds.includes(targetId)
-    const wakeGranted = !archived && triggerRecord !== undefined && triggerLink !== undefined
+    const wakeGranted = !archived && triggerRecord !== undefined && triggerRecord.wake !== false && triggerLink !== undefined
       && (triggerLink.autoWakeSessionIds.includes(targetId) || this.firstWakeOwed(triggerRecord.linkId, triggerLink, targetId))
     if (target === undefined && wakeGranted && trigger !== undefined) {
       // Cold target with a wake grant: resume through the formal path (write ownership first).
@@ -1403,7 +1576,8 @@ export class SessionLinkService extends TypertRemoteService {
       if (!archived) {
         const wakeGranted = link.autoWakeSessionIds.includes(record.targetId)
           || this.firstWakeOwed(record.linkId, link, record.targetId)
-        if (!wakeGranted) reasons.push('wake-unauthorized')
+        if (record.wake === false) reasons.push('wake-not-requested')
+        else if (!wakeGranted) reasons.push('wake-unauthorized')
         else if (this.wakeBudgetExhausted(messageId, record)) reasons.push('wake-budget')
       }
     } else if (target.status !== 'running' && !archived) {
@@ -1411,7 +1585,8 @@ export class SessionLinkService extends TypertRemoteService {
       // group's grant and the wake budgets.
       const wakeGranted = link.autoWakeSessionIds.includes(record.targetId)
         || this.firstWakeOwed(record.linkId, link, record.targetId)
-      if (!wakeGranted) reasons.push('wake-unauthorized')
+      if (record.wake === false) reasons.push('wake-not-requested')
+      else if (!wakeGranted) reasons.push('wake-unauthorized')
       else if (this.wakeBudgetExhausted(messageId, record)) reasons.push('wake-budget')
     }
     // A running target needs none of these; delivery follows as a follow-up.
@@ -1435,7 +1610,7 @@ export class SessionLinkService extends TypertRemoteService {
     const record = this.messages.get(messageId)
     if (record === undefined) throw new SessionLinkError(`message "${messageId}" not found`, 'MESSAGE_NOT_FOUND')
     const source: SessionLinkMessageSource = {
-      kind: 'session-link-message',
+      kind: 'gc-duolink-message',
       messageId,
       linkId: record.linkId,
       senderId: record.senderId,
@@ -1522,14 +1697,72 @@ export class SessionLinkService extends TypertRemoteService {
   ): boolean {
     if (record.wakesUsed >= this.resolved.maxAutoWakesPerMessage) return true
     const root = rootIdOf(this.messages, messageId, record)
-    const chainSpent = [...this.messages.entries()]
-      // Roots are message ids, so a chain counts across every group it moved through.
-      .filter(([candidateId, candidate]) => rootIdOf(this.messages, candidateId, candidate) === root)
-      .reduce((sum, [, candidate]) => sum + candidate.wakesUsed, 0)
-    if (chainSpent >= this.resolved.maxAutoWakesPerChain) return true
+    if (this.chainWakesUsed(root) >= this.resolved.maxAutoWakesPerChain + this.chainExtra(root, ledger)) return true
     const entry = ledger.wakes[String(record.targetId)]
     const spentToday = entry !== undefined && entry.day === today ? entry.wakes : 0
     return spentToday >= this.resolved.maxAutoWakesPerSessionPerDay
+  }
+
+  /** Strict bounded read for human extension; legacy delivery's root walk stays unchanged. */
+  private extensionRoot(messageId: SessionLinkMessageId, selected: SessionLinkMessageRecordData): SessionLinkMessageId | undefined {
+    if (selected.senderId === selected.targetId) return undefined
+    const seen = new Set<SessionLinkMessageId>()
+    let current = messageId
+    for (let depth = 0; depth < 256; depth += 1) {
+      if (seen.has(current)) return undefined
+      seen.add(current)
+      const record = this.messages.get(current)
+      if (record === undefined || legacyTaskReport(record)) return undefined
+      const samePair = (record.senderId === selected.senderId && record.targetId === selected.targetId)
+        || (record.senderId === selected.targetId && record.targetId === selected.senderId)
+      if (!samePair) return undefined
+      if (record.inReplyTo === undefined) return current
+      current = record.inReplyTo
+    }
+    return undefined
+  }
+
+  /** Roots count across all groups and both directions, including the initial task. */
+  private chainWakesUsed(root: SessionLinkMessageId): number {
+    let used = 0
+    for (const [id, record] of this.messages.entries()) {
+      if (rootIdOf(this.messages, id, record) === root) used += record.wakesUsed
+    }
+    return used
+  }
+
+  /** The append facts are the only source of extra quota. */
+  private chainExtra(root: SessionLinkMessageId, ledger = this.readLedgers()): number {
+    let extra = 0
+    for (const fact of Object.values(ledger.chainWakeExtensions)) {
+      if (fact.rootId === root) extra += fact.additional
+    }
+    return extra
+  }
+
+  private wakeBudget(messageId: SessionLinkMessageId, record: SessionLinkMessageRecordData): SessionLinkWakeBudget | undefined {
+    const rootId = this.extensionRoot(messageId, record)
+    if (rootId === undefined) return undefined
+    const ledger = this.readLedgers()
+    const used = this.chainWakesUsed(rootId)
+    const extra = this.chainExtra(rootId, ledger)
+    const baseLimit = this.resolved.maxAutoWakesPerChain
+    const limit = baseLimit + extra
+    if (![used, extra, limit].every(Number.isSafeInteger)) return undefined
+    const now = new Date()
+    const day = dayKey(now)
+    const targetEntry = ledger.wakes[String(record.targetId)]
+    return {
+      rootId,
+      chain: { used, baseLimit, extra, limit, remaining: Math.max(0, limit - used) },
+      targetDay: {
+        used: targetEntry?.day === day ? targetEntry.wakes : 0,
+        limit: this.resolved.maxAutoWakesPerSessionPerDay, day,
+        resetsAt: new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1)).toISOString(),
+      },
+      message: { used: record.wakesUsed, limit: this.resolved.maxAutoWakesPerMessage },
+      canExtend: this.extensionGrantAllowed(record) && limit < Number.MAX_SAFE_INTEGER,
+    }
   }
 
   /**
@@ -1583,7 +1816,7 @@ export class SessionLinkService extends TypertRemoteService {
       if (legacyTaskReport(record)) { blocked += 1; continue }
       targets.add(record.targetId)
     }
-    if (blocked > 0) this.ctx.logger.warn(`session-link: ${blocked} legacy experimental reports retained without delivery or wake; inspect this profile before migration`)
+    if (blocked > 0) this.ctx.logger.warn(`gc-duolink: ${blocked} legacy experimental reports retained without delivery or wake; inspect this profile before migration`)
     for (const targetId of targets) {
       await this.tryDeliverPending(targetId)
     }
@@ -1622,7 +1855,10 @@ export class SessionLinkService extends TypertRemoteService {
 
   /** Read the durable ledgers row, defaulting to empty. */
   private readLedgers(): SessionLinkLedgersData {
-    return this.ledgers.get(SESSION_LINK_LEDGER_KEY) ?? { idempotency: {}, wakes: {}, spawns: {}, initialModelSpawns: {} }
+    const row = this.ledgers.get(SESSION_LINK_LEDGER_KEY)
+    return row === undefined
+      ? { wakes: {}, spawns: {}, initialModelSpawns: {}, chainWakeExtensions: {} }
+      : { ...row, chainWakeExtensions: row.chainWakeExtensions ?? {} }
   }
 
   /** Persist one ledgers row. */
@@ -1679,14 +1915,14 @@ function recordedIds(target: Agent): Set<string> {
   const ids = new Set<string>()
   // oxlint-disable-next-line typescript/no-deprecated -- Existing Session history read; migration deferred.
   for (const event of target.session.snapshotEvents(target.session.inheritedEventCount)) {
-    if (event.type === 'user/message' && event.data.source.kind === 'session-link-message') {
+    if (event.type === 'user/message' && event.data.source.kind === 'gc-duolink-message') {
       ids.add(event.data.source.messageId)
       continue
     }
     if (event.type !== 'agent/inbox/spliced') continue
     for (const message of event.data.inserted) {
       const source = (message as { source?: { kind?: string; messageId?: string } }).source
-      if (source?.kind === 'session-link-message' && source.messageId !== undefined) ids.add(source.messageId)
+      if (source?.kind === 'gc-duolink-message' && source.messageId !== undefined) ids.add(source.messageId)
     }
   }
   return ids

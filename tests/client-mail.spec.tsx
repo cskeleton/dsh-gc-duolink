@@ -96,8 +96,8 @@ describe('mail section', () => {
     expect(screen.getByText('please review the plan')).toBeTruthy()
     expect(screen.getByText('From Peer')).toBeTruthy()
     expect(screen.getByText('To Peer')).toBeTruthy()
-    expect(screen.getByText('Pending', { selector: '.slp-mail-status' })).toBeTruthy()
-    expect(screen.getByText('Failed', { selector: '.slp-mail-status' })).toBeTruthy()
+    expect(screen.getByText('Pending', { selector: '.gcdl-mail-status' })).toBeTruthy()
+    expect(screen.getByText('Failed', { selector: '.gcdl-mail-status' })).toBeTruthy()
     expect(screen.getByText('Blocked: wake budget exhausted · target not resident')).toBeTruthy()
     expect(screen.getByText(/Last error: target mailbox full/)).toBeTruthy()
     expect(screen.getByText('Inbound 1 · Outbound 1 · Wake 2/6 today, resets 00:00 UTC')).toBeTruthy()
@@ -170,7 +170,7 @@ describe('mail section', () => {
       select(useSyncExternalStore(source.subscribe, source.getSnapshot, source.getSnapshot))
     const props: LinkProps = {
       sessionId: SELF, useLinks, refresh: source.refresh, t,
-      link: vi.fn(), setWake: vi.fn(), unlink: vi.fn(), openPanel: vi.fn(), openSession: vi.fn(),
+      link: vi.fn(), setWake: vi.fn(), unlink: vi.fn(), cancelMessage: vi.fn(), openPanel: vi.fn(), openSession: vi.fn(),
       loadActivity: vi.fn(async () => mail([entry()])),
       mail: createMailController({
         load: vi.fn(async () => mail([entry()])),
@@ -188,7 +188,7 @@ describe('header mail glance', () => {
     const { snapshot } = readySnapshot()
     const props: LinkProps = {
       sessionId: SELF, useLinks: useStatic(snapshot), refresh: vi.fn(), t,
-      link: vi.fn(), setWake: vi.fn(), unlink: vi.fn(), loadActivity,
+      link: vi.fn(), setWake: vi.fn(), unlink: vi.fn(), cancelMessage: vi.fn(), loadActivity,
       mail: createMailController({
         load: (query) => loadActivity(query),
         pollIntervalMs: () => 3_600_000,

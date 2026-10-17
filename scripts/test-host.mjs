@@ -5,6 +5,7 @@ const result = spawnSync('pnpm', ['exec', 'vitest', 'run',
   'tests/link.spec.ts', 'tests/remote.spec.ts',
   'tests/tool-session-link.spec.ts', 'tests/command-session-link.spec.ts',
   'tests/review-m1-backend.spec.ts',
+  'tests/workspace-spawn.spec.ts',
 ], { stdio: 'inherit', env: process.env })
 if (result.error) throw result.error
 if (result.signal) throw new Error(`Host tests terminated by ${result.signal}`)

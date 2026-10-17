@@ -140,7 +140,7 @@ async function harness(options: {
     autoWakeSessionIds: [],
     revision: 1,
   }])
-  ctx.provide('sessionLinks', links as never)
+  ctx.provide('gcDuolink', links as never)
   const presets = new Map(Object.entries(options.presets ?? {}))
   if (options.presets !== undefined) {
     ctx.provide('agentPresets', {
@@ -159,9 +159,9 @@ async function harness(options: {
   return { ctx, agent, links, row, presets }
 }
 
-/** Whether `/session-link` resolves for one Agent. */
+/** Whether `/gc-duolink` resolves for one Agent. */
 async function hasCommand(ctx: Context, agent: Agent): Promise<boolean> {
-  return await ctx.commands.execute(agent, '/session-link', [], new AbortController().signal) !== undefined
+  return await ctx.commands.execute(agent, '/gc-duolink', [], new AbortController().signal) !== undefined
 }
 
 /** Dispatch one raw command line through the real registry. */
@@ -174,7 +174,7 @@ async function run(ctx: Context, agent: Agent, line: string) {
 describe('dsh-command-session-link', () => {
   it('lists the caller’s links with peer status and wake flags', async () => {
     const { ctx, agent } = await harness()
-    const done = await run(ctx, agent, '/session-link')
+    const done = await run(ctx, agent, '/gc-duolink')
     expect(done.result.kind).toBe('success')
     expect(done.result.text).toContain('session-link-pair')
     expect(done.result.text).toContain('session-bob')
@@ -184,14 +184,14 @@ describe('dsh-command-session-link', () => {
 
   it('explains the empty state instead of pretending links exist', async () => {
     const { ctx, agent } = await harness({ links: [] })
-    const done = await run(ctx, agent, '/session-link list')
+    const done = await run(ctx, agent, '/gc-duolink list')
     expect(done.result.kind).toBe('success')
     expect(done.result.text).toContain('不属于任何会话互联组')
   })
 
   it('turns auto-wake on for a linked peer', async () => {
     const { ctx, agent, links } = await harness()
-    const done = await run(ctx, agent, '/session-link wake session-bob on')
+    const done = await run(ctx, agent, '/gc-duolink wake session-bob on')
     expect(done.result.kind).toBe('success')
     expect(links.wakeChanges.length).toBe(1)
     expect(links.wakeChanges[0]!.autoWake).toEqual([SessionId('session-bob')])
@@ -207,44 +207,44 @@ describe('dsh-command-session-link', () => {
         revision: 2,
       }],
     })
-    const done = await run(ctx, agent, '/session-link wake session-bob off')
+    const done = await run(ctx, agent, '/gc-duolink wake session-bob off')
     expect(done.result.kind).toBe('success')
     expect(links.wakeChanges[0]!.autoWake).toEqual([])
   })
 
   it('refuses wake changes for unlinked or self sessions', async () => {
     const { ctx, agent } = await harness()
-    const self = await run(ctx, agent, '/session-link wake session-alice on')
+    const self = await run(ctx, agent, '/gc-duolink wake session-alice on')
     expect(self.result.kind).toBe('error')
-    const stranger = await run(ctx, agent, '/session-link wake session-eve on')
+    const stranger = await run(ctx, agent, '/gc-duolink wake session-eve on')
     expect(stranger.result.kind).toBe('error')
     expect(stranger.result.text).toContain('不在同一互联组')
   })
 
   it('revokes one of the caller’s links by id', async () => {
     const { ctx, agent, links } = await harness()
-    const done = await run(ctx, agent, '/session-link revoke session-link-pair')
+    const done = await run(ctx, agent, '/gc-duolink revoke session-link-pair')
     expect(done.result.kind).toBe('success')
     expect(links.unlinked).toEqual([SessionLinkId('session-link-pair')])
   })
 
   it('refuses to revoke a link the caller does not belong to', async () => {
     const { ctx, agent, links } = await harness()
-    const done = await run(ctx, agent, '/session-link revoke session-link-other')
+    const done = await run(ctx, agent, '/gc-duolink revoke session-link-other')
     expect(done.result.kind).toBe('error')
     expect(links.unlinked.length).toBe(0)
   })
 
   it('reports grammar errors with usage instead of guessing', async () => {
     const { ctx, agent } = await harness()
-    const done = await run(ctx, agent, '/session-link wake session-bob')
+    const done = await run(ctx, agent, '/gc-duolink wake session-bob')
     expect(done.result.kind).toBe('error')
     expect(done.result.text).toContain('Usage')
   })
 
   it('links an existing ordinary session to the caller with human grant', async () => {
     const { ctx, agent, links } = await harness({ links: [] })
-    const done = await run(ctx, agent, '/session-link add session-eve')
+    const done = await run(ctx, agent, '/gc-duolink add session-eve')
     expect(done.result.kind).toBe('success')
     expect(done.result.text).toContain('session-link-new-1')
     expect(links.granted.length).toBe(1)
@@ -255,16 +255,16 @@ describe('dsh-command-session-link', () => {
 
   it('links with the wake flag enabling auto-wake for the peer', async () => {
     const { ctx, agent, links } = await harness({ links: [] })
-    const done = await run(ctx, agent, '/session-link add session-eve wake')
+    const done = await run(ctx, agent, '/gc-duolink add session-eve wake')
     expect(done.result.kind).toBe('success')
     expect(links.granted[0]!.autoWake).toEqual([SessionId('session-eve')])
   })
 
   it('refuses to link the caller to itself or an unknown session', async () => {
     const { ctx, agent, links } = await harness({ links: [] })
-    const self = await run(ctx, agent, '/session-link add session-alice')
+    const self = await run(ctx, agent, '/gc-duolink add session-alice')
     expect(self.result.kind).toBe('error')
-    const missing = await run(ctx, agent, '/session-link add session-ghost')
+    const missing = await run(ctx, agent, '/gc-duolink add session-ghost')
     expect(missing.result.kind).toBe('error')
     expect(missing.result.text).toContain('找不到会话')
     expect(links.granted.length).toBe(0)
@@ -272,7 +272,7 @@ describe('dsh-command-session-link', () => {
 
   it('refuses to link a session already linked to the caller', async () => {
     const { ctx, agent, links } = await harness()
-    const done = await run(ctx, agent, '/session-link add session-bob')
+    const done = await run(ctx, agent, '/gc-duolink add session-bob')
     expect(done.result.kind).toBe('error')
     expect(done.result.text).toContain('已与本会话互联')
     expect(links.granted.length).toBe(0)

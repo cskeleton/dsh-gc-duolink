@@ -82,14 +82,14 @@ async function stack(config: SessionLinkConfigShape = {}): Promise<Stack> {
   await ctx.plugin(SessionLinkService, config)
   const alice = await ctx.agentLoop.create(SessionId('session-alice'), { provider: 'mock', model: 'mock' })
   const bob = await ctx.agentLoop.create(SessionId('session-bob'), { provider: 'mock', model: 'mock' })
-  return { ctx, links: ctx.sessionLinks, alice, bob, listCalls, archived }
+  return { ctx, links: ctx.gcDuolink, alice, bob, listCalls, archived }
 }
 
 describe('dsh-session-link remote surface', () => {
   it('linkFrom creates a human-granted pair with the peer wake flag', async () => {
     const s = await stack()
     const result = await s.links.linkFrom({ callerId: s.alice.id, peerId: s.bob.id, autoWake: true })
-    expect(result.linkId).toMatch(/^session-link-/)
+    expect(result.linkId).toMatch(/^gc-duolink-/)
     const summary = s.links.list(s.alice.id).find(link => link.id === result.linkId)
     expect(summary?.name).toBe('互联-bob')
     expect(summary?.memberIds).toEqual([s.alice.id, s.bob.id])
@@ -244,7 +244,94 @@ describe('dsh-session-link remote surface', () => {
   })
 })
 
-describe('sessionLinks/activityView', () => {
+describe('gcDuolink/cancelMessageFrom', () => {
+  it.each(['sender', 'target'] as const)('allows the original %s to cancel pending ordinary mail', async participant => {
+    const s = await stack()
+    await s.links.link('pair', [s.alice.id, s.bob.id], { kind: 'human' })
+    const sent = await s.links.send(s.alice, s.bob.id, { targetId: s.bob.id, text: 'cancel this queue' })
+    const before = s.links.message(sent.messageId)!
+    const wakes = s.links['ledgers'].get(SESSION_LINK_LEDGER_KEY)
+    const sessionId = participant === 'sender' ? s.alice.id : s.bob.id
+    await expect(s.links.cancelMessageFrom({ sessionId, messageId: sent.messageId }))
+      .resolves.toEqual({ messageId: sent.messageId, outcome: 'cancelled', status: 'cancelled' })
+    expect(s.links.message(sent.messageId)).toEqual({ ...before, status: 'cancelled' })
+    expect(s.links['ledgers'].get(SESSION_LINK_LEDGER_KEY)).toEqual(wakes)
+    expect((await s.links.activityView({ sessionId, section: 'pending' })).entries).toEqual([])
+    expect((await s.links.activityView({ sessionId, section: 'recent' })).entries[0])
+      .toMatchObject({ status: 'cancelled', canCancel: false })
+    await expect(s.links.cancelMessageFrom({ sessionId, messageId: sent.messageId }))
+      .resolves.toEqual({ messageId: sent.messageId, outcome: 'already_terminal', status: 'cancelled' })
+  })
+
+  it('rejects even a third group member without exposing or changing the message', async () => {
+    const s = await stack()
+    const eve = await s.ctx.agentLoop.create(SessionId('session-eve'), { provider: 'mock', model: 'mock' })
+    await s.links.link('trio', [s.alice.id, s.bob.id, eve.id], { kind: 'human' })
+    const sent = await s.links.send(s.alice, s.bob.id, { targetId: s.bob.id, text: 'private queue' })
+    const before = s.links.message(sent.messageId)
+    const write = vi.spyOn(s.links['messages'], 'put')
+    await expect(s.links.cancelMessageFrom({ sessionId: eve.id, messageId: sent.messageId }))
+      .rejects.toMatchObject({ code: 'MESSAGE_NOT_FOUND' })
+    await expect(s.links.cancelMessageFrom({ sessionId: s.alice.id, messageId: SessionLinkMessageId('missing') }))
+      .rejects.toMatchObject({ code: 'MESSAGE_NOT_FOUND' })
+    expect(write).not.toHaveBeenCalled()
+    expect(s.links.message(sent.messageId)).toEqual(before)
+  })
+
+  it.each(['delivered', 'cancelled', 'failed', 'revoked'] as const)('reports the existing %s terminal state without a write', async status => {
+    const s = await stack()
+    const { id: linkId } = await s.links.link('pair', [s.alice.id, s.bob.id], { kind: 'human' })
+    const messageId = SessionLinkMessageId('terminal-message')
+    const record = {
+      linkId, senderId: s.alice.id, senderTitle: 'alice', targetId: s.bob.id, text: 'terminal',
+      status, wakesUsed: 1, chainLength: 1, attempts: 2, createdAt: new Date().toISOString(),
+    }
+    await s.links['messages'].put(messageId, record)
+    const write = vi.spyOn(s.links['messages'], 'put')
+    await expect(s.links.cancelMessageFrom({ sessionId: s.bob.id, messageId }))
+      .resolves.toEqual({ messageId, outcome: 'already_terminal', status })
+    expect(write).not.toHaveBeenCalled()
+    expect(s.links.message(messageId)).toEqual(record)
+  })
+
+  it.each([
+    { statusKind: 'task-status' }, { statusKind: null }, { statusKind: false }, { statusKind: 42 },
+    { statusKind: { legacy: true } }, { taskStatus: null }, { taskStatus: { taskId: 'legacy-task' } },
+  ])('keeps legacy report markers read-only even when the marker is not a string: %j', async markers => {
+    const s = await stack()
+    const { id: linkId } = await s.links.link('pair', [s.alice.id, s.bob.id], { kind: 'human' })
+    const messageId = SessionLinkMessageId('legacy-message')
+    const record = {
+      linkId, senderId: s.alice.id, senderTitle: 'alice', targetId: s.bob.id, text: 'legacy report',
+      status: 'pending' as const, wakesUsed: 0, chainLength: 1, attempts: 0,
+      createdAt: new Date().toISOString(), ...markers,
+    }
+    await s.links['messages'].put(messageId, record)
+    const write = vi.spyOn(s.links['messages'], 'put')
+    for (const sessionId of [s.alice.id, s.bob.id]) {
+      await expect(s.links.cancelMessageFrom({ sessionId, messageId }))
+        .rejects.toMatchObject({ code: 'LEGACY_TASK_MESSAGE_BLOCKED' })
+    }
+    expect(write).not.toHaveBeenCalled()
+    expect(s.links.message(messageId)).toEqual(record)
+  })
+
+  it('strictly validates malformed requests before reading or mutating the mailbox', async () => {
+    const s = await stack()
+    const read = vi.spyOn(s.links['messages'], 'get')
+    const write = vi.spyOn(s.links['messages'], 'put')
+    for (const request of [
+      undefined, null, [], {}, { sessionId: '', messageId: 'message' },
+      { sessionId: 42, messageId: 'message' }, { sessionId: s.alice.id, messageId: '' },
+      { sessionId: s.alice.id, messageId: 42 }, { sessionId: s.alice.id },
+      { sessionId: s.alice.id, messageId: 'message', extra: true },
+    ]) await expect(s.links.cancelMessageFrom(request as never)).rejects.toThrow()
+    expect(read).not.toHaveBeenCalled()
+    expect(write).not.toHaveBeenCalled()
+  })
+})
+
+describe('gcDuolink/activityView', () => {
   const aliceId = SessionId('session-alice')
   const bobId = SessionId('session-bob')
   const eveId = SessionId('session-eve')
@@ -285,7 +372,7 @@ describe('sessionLinks/activityView', () => {
     expect(view.entries[1]!.blockingReasons).toEqual([])
     expect(view.entries[1]!.canCancel).toBe(false)
     expect(view.summary).toMatchObject({ pendingInbound: 1, pendingOutbound: 0, firstTaskWakeOwed: false, legacyBlocked: 0 })
-    expect(view.summary.wake).toMatchObject({ used: 0, limit: 6, day: new Date().toISOString().slice(0, 10) })
+    expect(view.summary.wake).toMatchObject({ used: 0, limit: 12, day: new Date().toISOString().slice(0, 10) })
     const reset = Date.parse(view.summary.wake.resetsAt)
     expect(view.summary.wake.resetsAt.endsWith('T00:00:00.000Z')).toBe(true)
     expect(reset).toBeGreaterThan(Date.now())
@@ -375,11 +462,11 @@ describe('sessionLinks/activityView', () => {
     const s = await stack()
     const today = new Date().toISOString().slice(0, 10)
     await s.links['ledgers'].put(SESSION_LINK_LEDGER_KEY, {
-      idempotency: {}, spawns: {}, initialModelSpawns: {},
+      spawns: {}, initialModelSpawns: {},
       wakes: { [aliceId]: { day: today, wakes: 2 }, [bobId]: { day: '2020-01-01', wakes: 5 } },
     })
     const asAlice = await s.links.activityView({ sessionId: aliceId, section: 'recent' })
-    expect(asAlice.summary.wake).toMatchObject({ used: 2, limit: 6, day: today })
+    expect(asAlice.summary.wake).toMatchObject({ used: 2, limit: 12, day: today })
     const asBob = await s.links.activityView({ sessionId: bobId, section: 'recent' })
     expect(asBob.summary.wake.used).toBe(0)
   })
@@ -411,6 +498,51 @@ describe('sessionLinks/activityView', () => {
     // The granter itself is owed nothing.
     const asAlice = await s.links.activityView({ sessionId: aliceId, section: 'pending' })
     expect(asAlice.summary.firstTaskWakeOwed).toBe(false)
+  })
+
+  it('projects explicit no-wake intent for idle and cold targets without suggesting a grant or budget fix', async () => {
+    const s = await stack()
+    const { id: liveLink } = await s.links.link('live', [aliceId, bobId], { kind: 'human' })
+    const { id: coldLink } = await s.links.link('cold', [aliceId, coldId], { kind: 'human' })
+    await mail(s, 'm-quiet-idle', { linkId: liveLink, senderId: aliceId, targetId: bobId, wake: false, seq: 1 })
+    await mail(s, 'm-quiet-cold', { linkId: coldLink, senderId: aliceId, targetId: coldId, wake: false, seq: 2 })
+    let view = await s.links.activityView({ sessionId: aliceId, section: 'pending' })
+    expect(view.entries.find(entry => entry.messageId === SessionLinkMessageId('m-quiet-idle'))!.blockingReasons)
+      .toEqual(['wake-not-requested'])
+    expect(view.entries.find(entry => entry.messageId === SessionLinkMessageId('m-quiet-cold'))!.blockingReasons)
+      .toEqual(['cold-target', 'wake-not-requested'])
+    await s.links.setMemberAutoWake(liveLink, bobId, true)
+    await s.links.setMemberAutoWake(coldLink, coldId, true)
+    await s.links['ledgers'].put(SESSION_LINK_LEDGER_KEY, {
+      spawns: {}, initialModelSpawns: {},
+      wakes: { [bobId]: { day: new Date().toISOString().slice(0, 10), wakes: 6 } },
+    })
+    view = await s.links.activityView({ sessionId: aliceId, section: 'pending' })
+    expect(view.entries.find(entry => entry.messageId === SessionLinkMessageId('m-quiet-idle'))!.blockingReasons)
+      .toEqual(['wake-not-requested'])
+    Object.defineProperty(s.bob, 'status', { configurable: true, value: 'running' })
+    view = await s.links.activityView({ sessionId: aliceId, section: 'pending' })
+    expect(view.entries.find(entry => entry.messageId === SessionLinkMessageId('m-quiet-idle'))!.blockingReasons).toEqual([])
+    await mail(s, 'm-quiet-held', { linkId: coldLink, senderId: aliceId, targetId: coldId, wake: false, inserted: true, seq: 3 })
+    view = await s.links.activityView({ sessionId: aliceId, section: 'pending' })
+    expect(view.entries.find(entry => entry.messageId === SessionLinkMessageId('m-quiet-held'))!.blockingReasons)
+      .toEqual(['delivery-unverified'])
+  })
+
+  it('strips both exact old and new frames while preserving their stored bodies', async () => {
+    const s = await stack()
+    const { id: linkId } = await s.links.link('pair', [aliceId, bobId], { kind: 'human' })
+    const oldId = SessionLinkMessageId('m-old-frame')
+    const newId = SessionLinkMessageId('m-new-frame')
+    const oldBody = '[会话消息] 来自会话「Sender」（session-bob）的协作消息，非本机人类直接输入。\n'
+      + `消息 ID：${oldId}。如需回复，调用 gc_duolink_send_message，session_id 填 session-bob，in_reply_to 填 ${oldId}。\n旧正文`
+    const newBody = frameSessionLinkText({ senderTitle: 'Sender', senderId: bobId, messageId: newId, text: '新正文' })
+    await mail(s, oldId, { linkId, senderId: bobId, targetId: aliceId, text: oldBody, seq: 1 })
+    await mail(s, newId, { linkId, senderId: bobId, targetId: aliceId, text: newBody, seq: 2 })
+    const view = await s.links.activityView({ sessionId: aliceId, section: 'recent' })
+    expect(view.entries.map(entry => entry.preview)).toEqual(['新正文', '旧正文'])
+    expect(s.links.message(oldId)?.text).toBe(oldBody)
+    expect(s.links.message(newId)?.text).toBe(newBody)
   })
 
   it('keeps legacy report markers out of entries and counts them separately', async () => {
@@ -449,7 +581,7 @@ describe('sessionLinks/activityView', () => {
     await s.links.link('pair', [aliceId, bobId], { kind: 'human' })
     const linkId = s.links.list()[0]!.id
     const framed = '[会话消息] 来自会话「Sender」（session-bob）的协作消息，非本机人类直接输入。\n'
-      + '消息 ID：m-framed。如需回复，调用 session_send_session_message，session_id 填 session-bob，in_reply_to 填 m-framed。\n'
+      + '消息 ID：m-framed。如需回复，调用 gc_duolink_send_message，session_id 填 session-bob，in_reply_to 填 m-framed。\n'
       + `line one\nline two\t${'x'.repeat(200)}`
     const rawError = `boom\n${'y'.repeat(300)}`
     await mail(s, 'm-framed', { linkId, senderId: bobId, targetId: aliceId, seq: 1, text: framed,
@@ -579,7 +711,7 @@ describe('sessionLinks/activityView', () => {
     const linkId = s.links.list()[0]!.id
     // A human pastes a frame quoting another message id; it is body text.
     const lookalike = '[会话消息] 来自会话「Sender」（session-bob）的协作消息，非本机人类直接输入。\n'
-      + '消息 ID：m-other。如需回复，调用 session_send_session_message，session_id 填 session-bob，in_reply_to 填 m-other。\n'
+      + '消息 ID：m-other。如需回复，调用 gc_duolink_send_message，session_id 填 session-bob，in_reply_to 填 m-other。\n'
       + 'quoted body'
     await mail(s, 'm-quote', { linkId, senderId: bobId, targetId: aliceId, seq: 1, text: lookalike })
     const view = await s.links.activityView({ sessionId: aliceId, section: 'recent' })
@@ -595,5 +727,24 @@ describe('sessionLinks/activityView', () => {
     })
     const titledView = await s.links.activityView({ sessionId: aliceId, section: 'recent' })
     expect(titledView.entries[0]!.preview).toBe('真实正文')
+  })
+})
+
+
+describe('gcDuolink/extendChainWakeFrom strict boundary', () => {
+  it('rejects malformed confirmations before any mailbox read or write', async () => {
+    const s = await stack()
+    const valid = { sessionId: s.alice.id, messageId: SessionLinkMessageId('message'), additional: 4, expectedExtra: 0, requestId: 'intent' }
+    const read = vi.spyOn(s.links['messages'], 'get')
+    const writes = (['messages', 'ledgers'] as const).map(name => vi.spyOn(s.links[name], 'put'))
+    for (const request of [
+      null, undefined, [], {},
+      ...[0, -1, 1.5, 101, '4', Infinity, NaN].map(additional => ({ ...valid, additional })),
+      ...[-1, 0.5, Number.MAX_SAFE_INTEGER + 1, '0'].map(expectedExtra => ({ ...valid, expectedExtra })),
+      ...['', 'x'.repeat(129), 42].map(requestId => ({ ...valid, requestId })),
+      { ...valid, sessionId: '' }, { ...valid, messageId: '' }, { ...valid, privileged: true },
+    ]) await expect(s.links.extendChainWakeFrom(request as never)).rejects.toThrow()
+    expect(read).not.toHaveBeenCalled()
+    for (const write of writes) expect(write).not.toHaveBeenCalled()
   })
 })

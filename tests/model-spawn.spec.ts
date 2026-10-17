@@ -64,7 +64,7 @@ function fixture(failAt?: 'append' | 'flush' | 'close' | 'create' | 'activate') 
     submit: vi.fn(), selectModel: vi.fn(),
   }
   const agents = { get: vi.fn(() => undefined as unknown) }
-  const sessionLinks = {
+  const gcDuolink = {
     initialModelSpawn: vi.fn(() => ledger.record && structuredClone(ledger.record)),
     reserveInitialModelSpawn: vi.fn(async (_caller: unknown, _key: unknown, intent: InitialModelSpawnRecord) => {
       if (ledger.record && ledger.record.digest !== intent.digest) throw new Error('INITIAL_MODEL_REPLAY_CONFLICT')
@@ -82,7 +82,7 @@ function fixture(failAt?: 'append' | 'flush' | 'close' | 'create' | 'activate') 
   const services: Record<string, unknown> = {
     sessions, sessionPersistence: persistence, agentPresets: { resolve: vi.fn(async () => ({ id: 'standard' })) },
   }
-  const ctx = { ...services, get: (name: string) => services[name], sessionController: controller, agents, sessionLinks } as unknown as Context
+  const ctx = { ...services, get: (name: string) => services[name], sessionController: controller, agents, gcDuolink } as unknown as Context
   const prime = (headerCreated: boolean, seedConfirmed = false) => {
     ledger.record = {
       ...request, digest: initialModelSpawnDigest(request), preset: 'standard', createdAt: 1234,
@@ -99,17 +99,25 @@ function fixture(failAt?: 'append' | 'flush' | 'close' | 'create' | 'activate') 
     }
   }
   const run = (value = request) => bootstrapInitialModel(ctx, callerId, callKey, value)
-  return { ctx, request, ledger, disk, sessions, agents, persistence, controller, sessionLinks, services, append, flush, close, prime, run }
+  return { ctx, request, ledger, disk, sessions, agents, persistence, controller, gcDuolink, services, append, flush, close, prime, run }
 }
 
 describe('native initial model bootstrap failures and ownership', () => {
+  it('distinguishes inherited Workspace semantics while preserving old explicit-directory digests', async () => {
+    const f = fixture()
+    const explicit = initialModelSpawnDigest(f.request)
+    expect(initialModelSpawnDigest({ ...f.request, inheritWorkspace: false })).toBe(explicit)
+    expect(initialModelSpawnDigest({ ...f.request, inheritWorkspace: true })).not.toBe(explicit)
+    await f.run()
+    await expect(f.run({ ...f.request, inheritWorkspace: true })).rejects.toThrow('INITIAL_MODEL_REPLAY_CONFLICT')
+  })
   it('an already aborted request neither reserves an intent nor creates or activates a Session', async () => {
     const f = fixture()
     const controller = new AbortController()
     controller.abort(new Error('cancelled before spawn'))
     await expect(bootstrapInitialModel(f.ctx, callerId, callKey, f.request, controller.signal))
       .rejects.toThrow('cancelled before spawn')
-    expect(f.sessionLinks.reserveInitialModelSpawn).not.toHaveBeenCalled()
+    expect(f.gcDuolink.reserveInitialModelSpawn).not.toHaveBeenCalled()
     expect(f.persistence.create).not.toHaveBeenCalled()
     expect(f.sessions.prepare).not.toHaveBeenCalled()
     expect(f.controller.create).not.toHaveBeenCalled()
@@ -157,15 +165,15 @@ describe('native initial model bootstrap failures and ownership', () => {
     const f = fixture()
     f.prime(true, true)
     f.disk.stored!.events = []
-    f.sessionLinks.spawnReplay.mockReturnValue({ task: { status: 'accepted' } } as never)
-    f.sessionLinks.list.mockReturnValue([{ memberIds: [f.request.sessionId] }] as never)
+    f.gcDuolink.spawnReplay.mockReturnValue({ task: { status: 'accepted' } } as never)
+    f.gcDuolink.list.mockReturnValue([{ memberIds: [f.request.sessionId] }] as never)
     await expect(f.run()).rejects.toThrow(/linked=true.*taskStored=true.*taskDelivery=accepted/)
     expect(f.controller.create).not.toHaveBeenCalled()
   })
 
   it('a spawn intent without an actual group is reported as unlinked', async () => {
     const f = fixture('activate')
-    f.sessionLinks.spawnReplay.mockReturnValue({ sessionId: f.request.sessionId } as never)
+    f.gcDuolink.spawnReplay.mockReturnValue({ sessionId: f.request.sessionId } as never)
     await expect(f.run()).rejects.toThrow(/linked=false.*taskStored=false/)
   })
 
@@ -176,7 +184,7 @@ describe('native initial model bootstrap failures and ownership', () => {
     detached.append('model/selection', f.request.selection)
     detached.append('agent-preset/selected', { agentPreset: 'later-preset' } as never)
     f.disk.stored!.events = [...detached.snapshotEvents()]
-    f.sessionLinks.spawnReplay.mockReturnValue({ task: { status: 'accepted' } } as never)
+    f.gcDuolink.spawnReplay.mockReturnValue({ task: { status: 'accepted' } } as never)
     const resolve = (f.services.agentPresets as { resolve: ReturnType<typeof vi.fn> }).resolve
     resolve.mockRejectedValue(new Error('original preset removed'))
     await f.run()
@@ -257,7 +265,7 @@ describe('native initial model bootstrap failures and ownership', () => {
     const f = fixture()
     delete f.services.sessionPersistence
     await expect(f.run()).rejects.toThrow('INITIAL_MODEL_CAPABILITY_UNAVAILABLE')
-    expect(f.sessionLinks.reserveInitialModelSpawn).not.toHaveBeenCalled()
+    expect(f.gcDuolink.reserveInitialModelSpawn).not.toHaveBeenCalled()
     expect(f.sessions.prepare).not.toHaveBeenCalled()
     expect(f.controller.create).not.toHaveBeenCalled()
   })

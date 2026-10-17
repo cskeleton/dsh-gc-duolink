@@ -7,9 +7,11 @@ import { SessionId } from '@deepseek-ai/dsh-session'
 import Storage from '@deepseek-ai/dsh-storage'
 import { DomainFacility } from '@deepseek-ai/dsh-storage-domain'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
-import SessionLinkService, { SESSION_LINK_LEDGER_KEY, SessionLinkError, SessionLinkId, SessionLinkMessageId, sessionLinkLedgersSchema } from '../src/index.ts'
+import SessionLinkService, { SESSION_LINK_LEDGER_KEY, SessionLinkError, SessionLinkId, SessionLinkMessageId, sessionLinkLedgersSchema, sessionLinkDomainSpec } from '../src/index.ts'
 import type { Config } from '../src/index.ts'
 import { MemoryMediaPool, MemoryStorageBackend } from './helpers/memory-backend.ts'
+import { Config as ConfigSchema, frameSessionLinkText } from '../src/link.ts'
+import { initializeDuolinkDomain } from '../src/spec.ts'
 
 const contexts = new Set<Context>()
 
@@ -53,7 +55,7 @@ async function stack(config?: Config, sharedPool?: MemoryMediaPool, controller?:
   const linkFiber = await ctx.plugin(SessionLinkService, config)
   const alice = await ctx.agentLoop.create(SessionId('session-alice'), { provider: 'mock', model: 'mock' })
   const bob = await ctx.agentLoop.create(SessionId('session-bob'), { provider: 'mock', model: 'mock' })
-  return { ctx, links: ctx.sessionLinks, alice, bob, root: SessionId('session-alice'), archived, disposeLinks: () => linkFiber.dispose() }
+  return { ctx, links: ctx.gcDuolink, alice, bob, root: SessionId('session-alice'), archived, disposeLinks: () => linkFiber.dispose() }
 }
 
 /** Grant one two-member link between alice and bob. */
@@ -74,7 +76,7 @@ function mailTexts(agent: Agent): string[] {
   const texts: string[] = []
   const collect = (source: unknown, content: readonly { type: string; text?: string }[]): void => {
     const mailSource = source as { kind?: string; messageId?: string }
-    if (mailSource.kind !== 'session-link-message' || seen.has(mailSource.messageId ?? '')) return
+    if (mailSource.kind !== 'gc-duolink-message' || seen.has(mailSource.messageId ?? '')) return
     seen.add(mailSource.messageId ?? '')
     for (const block of content) {
       if (block.type === 'text' && block.text !== undefined) texts.push(block.text)
@@ -97,14 +99,66 @@ function mailSource(agent: Agent): { kind?: string; senderId?: string; messageId
     if (event.type === 'agent/inbox/spliced') {
       for (const message of event.data.inserted) {
         const source = (message as { source?: { kind?: string; senderId?: string; messageId?: string; inReplyTo?: string } }).source
-        if (source?.kind === 'session-link-message') return source
+        if (source?.kind === 'gc-duolink-message') return source
       }
     }
   }
   return undefined
 }
 
-describe('dsh-session-link', () => {
+describe('dsh-gc-duolink', () => {
+  it('starts with separate storage and leaves an incompatible old domain untouched', async () => {
+    const pool = new MemoryMediaPool()
+    const oldMedium = {
+      global: { initialized: true },
+      tables: new Map([['links', new Map([['old-link', { foreign: 'must not be read' }]])]]),
+    }
+    pool.media.set('session_link', oldMedium)
+    pool.versions.set('session_link', 99)
+    const before = structuredClone(oldMedium)
+    const s = await stack(undefined, pool)
+    expect(s.ctx.get('sessionLinks')).toBeUndefined()
+    expect(s.links.typertRemote.namespace).toBe('gcDuolink')
+    expect(s.links.list()).toEqual([])
+    await grantBoth(s)
+    await s.links.send(s.alice, s.bob.id, { targetId: s.bob.id, text: 'new domain only' })
+    expect(pool.media.get('gc_duolink')?.tables.get('links')?.size).toBe(1)
+    expect(pool.media.get('gc_duolink')?.global).toEqual({ product: 'dsh-gc-duolink', initialized: true })
+    expect(pool.media.get('session_link')).toEqual(before)
+    expect(pool.versions.get('session_link')).toBe(99)
+  })
+
+  it('rejects an old store copied into the new domain name instead of adopting it', async () => {
+    const ctx = new Context()
+    contexts.add(ctx)
+    await ctx.plugin(Storage)
+    const pool = new MemoryMediaPool()
+    pool.media.set('gc_duolink', { global: { initialized: true }, tables: new Map() })
+    ctx.storage.backend.register('memory', new MemoryStorageBackend(pool))
+    const facility = new DomainFacility(ctx, { backend: 'memory', routes: {} })
+    ctx.storage.mount('domain', facility)
+    await expect(facility.open(sessionLinkDomainSpec)).rejects.toMatchObject({ code: 'invalid-record' })
+    expect(pool.media.get('gc_duolink')?.global).toEqual({ initialized: true })
+  })
+
+  it('does not stamp or adopt nonempty storage with a null global slot', async () => {
+    const ctx = new Context()
+    contexts.add(ctx)
+    await ctx.plugin(Storage)
+    const pool = new MemoryMediaPool()
+    pool.media.set('gc_duolink', { global: null,
+      tables: new Map([['ledgers', new Map([['ledger', { wakes: {} }]])]]) })
+    const before = structuredClone(pool.media.get('gc_duolink'))
+    ctx.storage.backend.register('memory', new MemoryStorageBackend(pool))
+    const facility = new DomainFacility(ctx, { backend: 'memory', routes: {} })
+    ctx.storage.mount('domain', facility)
+    const domain = await facility.open(sessionLinkDomainSpec)
+    try {
+      await expect(initializeDuolinkDomain(domain)).rejects.toThrow('storage ownership marker')
+      expect(pool.media.get('gc_duolink')).toEqual(before)
+    } finally { await domain.close() }
+  })
+
   it.each([
     { statusKind: 'task-status' },
     { taskStatus: { taskId: 'legacy-task', nested: { fact: true } } },
@@ -162,7 +216,7 @@ describe('dsh-session-link', () => {
     expect(s.links.message(result.messageId)?.status).toBe('delivered')
     expect(mailTexts(s.bob).some(text => text.includes('hello bob'))).toBe(true)
     const source = mailSource(s.bob)
-    expect(source?.kind).toBe('session-link-message')
+    expect(source?.kind).toBe('gc-duolink-message')
     expect(source?.senderId).toBe(s.alice.id)
   })
 
@@ -253,7 +307,7 @@ describe('dsh-session-link', () => {
     await s.links.deliverPending(s.bob.id)
     expect(s.links.message(result.messageId)?.status).toBe('cancelled')
     expect(mailTexts(s.bob).length).toBe(0)
-    await expect(s.links.cancel(s.bob, SessionLinkMessageId('session-link-message-none')))
+    await expect(s.links.cancel(s.bob, SessionLinkMessageId('gc-duolink-message-none')))
       .rejects.toBeInstanceOf(SessionLinkError)
   })
 
@@ -268,7 +322,7 @@ describe('dsh-session-link', () => {
         for (const message of event.data.inserted) kinds.push(message.source.kind)
       }
     }
-    expect(kinds).toContain('session-link-message')
+    expect(kinds).toContain('gc-duolink-message')
     expect(kinds.filter(kind => kind === 'user').length).toBe(1) // only the human wake above
   })
 
@@ -302,12 +356,12 @@ describe('dsh-session-link', () => {
     await ctx.plugin(AgentLoop, { agents: [] })
     await ctx.plugin(SessionLinkService)
     const bob = await ctx.agentLoop.create(SessionId('session-bob'), { provider: 'mock', model: 'mock' })
-    await ctx.sessionLinks.deliverPending(bob.id)
-    expect(ctx.sessionLinks.message(result.messageId)?.status).toBe('pending')
+    await ctx.gcDuolink.deliverPending(bob.id)
+    expect(ctx.gcDuolink.message(result.messageId)?.status).toBe('pending')
     // The target starts a human turn: deferred mail delivers as a follow-up behind it.
     bob.followup(createUserMessage({ content: [{ type: 'text', text: 'human turn' }], source: { kind: 'user' } }))
-    await ctx.sessionLinks.deliverPending(bob.id)
-    expect(ctx.sessionLinks.message(result.messageId)?.status).toBe('delivered')
+    await ctx.gcDuolink.deliverPending(bob.id)
+    expect(ctx.gcDuolink.message(result.messageId)?.status).toBe('delivered')
     expect(mailTexts(bob).some(text => text.includes('survive restart'))).toBe(true)
   })
 
@@ -366,6 +420,8 @@ describe('dsh-session-link', () => {
     await expect(s.links.unlink(linkId)).rejects.toMatchObject({ code: 'DISPOSED' })
     await expect(s.links.setAutoWake(linkId, [s.bob.id])).rejects.toMatchObject({ code: 'DISPOSED' })
     await expect(s.links.cancel(s.alice, sent.messageId)).rejects.toMatchObject({ code: 'DISPOSED' })
+    await expect(s.links.cancelMessageFrom({ sessionId: s.alice.id, messageId: sent.messageId }))
+      .rejects.toMatchObject({ code: 'DISPOSED' })
     await expect(s.links.send(s.alice, s.bob.id, { targetId: s.bob.id, text: 'after disposal' }))
       .rejects.toMatchObject({ code: 'DISPOSED' })
   })
@@ -402,7 +458,7 @@ describe('dsh-session-link', () => {
     const record = s.links.message(first.messageId)
     if (record === undefined) throw new Error('expected an admitted mailbox record')
     await s.disposeLinks()
-    const messages = pool.media.get('session_link')?.tables.get('messages')
+    const messages = pool.media.get('gc_duolink')?.tables.get('messages')
     if (messages === undefined) throw new Error('expected the persisted messages table')
     messages.set(String(first.messageId), { ...record, status })
     const reopened = await stack(undefined, pool)
@@ -434,7 +490,7 @@ describe('dsh-session-link', () => {
   })
 
   it('a spawn grant owes its spawned member one wake that survives a refused first task', async () => {
-    const s = await stack({ maxMessageBytes: 400 })
+    const s = await stack({ maxMessageBytes: 700 })
     await s.links.link('spawned', [s.alice.id, s.bob.id], { kind: 'session', sessionId: s.alice.id })
     await expect(s.links.send(s.alice, s.bob.id, { targetId: s.bob.id, text: 'x'.repeat(800) }))
       .rejects.toMatchObject({ code: 'MESSAGE_TOO_LARGE' })
@@ -517,11 +573,10 @@ describe('dsh-session-link', () => {
     expect(s.links.list()[0]!.autoWakeSessionIds).toEqual([s.bob.id])
   })
 
-  it('reads ledger rows written before the spawn ledger existed', () => {
-    // Storage parses every stored row through this schema; a 0.3.0/0.3.1 row has no `spawns`.
-    const legacy = sessionLinkLedgersSchema.parse({ idempotency: { 'session-alice:k': 'm' }, wakes: {} })
-    expect(legacy.spawns).toEqual({})
-    expect(legacy.idempotency).toEqual({ 'session-alice:k': 'm' })
+  it('rejects the old idempotency-ledger format instead of migrating it', () => {
+    expect(sessionLinkLedgersSchema.safeParse({
+      idempotency: { 'session-alice:k': 'm' }, wakes: {},
+    }).success).toBe(false)
   })
 
   describe('storage write failures', () => {
@@ -576,7 +631,7 @@ describe('dsh-session-link', () => {
     it('legacy incomplete intent recovers conservatively without grants from new args', async () => {
       const s = await stack()
       await s.links['ledgers'].put(SESSION_LINK_LEDGER_KEY, {
-        idempotency: {}, wakes: {}, spawns: {
+        wakes: {}, spawns: {
           'session-alice:legacy-intent': { sessionId: s.bob.id, linkId: SessionLinkId('old-intent'), intent: true },
         },
       })
@@ -603,22 +658,10 @@ describe('dsh-session-link', () => {
       expect(s.links.list()).toEqual([])
     })
 
-    it('a message keyed only in the pre-0.3.3 idempotency ledger is still found', async () => {
-      const s = await stack()
-      await grantBoth(s)
-      const earlier = await s.links.send(s.alice, s.bob.id, { targetId: s.bob.id, text: 'legacy' })
-      await s.links['ledgers'].put(SESSION_LINK_LEDGER_KEY, {
-        idempotency: { 'session-alice:legacy-key': String(earlier.messageId) }, wakes: {}, spawns: {},
-      })
-      const retry = await s.links.send(s.alice, s.bob.id, { targetId: s.bob.id, text: 'legacy', idempotencyKey: 'legacy-key' })
-      expect(retry.messageId).toBe(earlier.messageId)
-      expect(s.links.spawnReplay(s.alice.id, 'legacy-key')?.task?.messageId).toBe(earlier.messageId)
-    })
-
     it('a 0.3.2 spawn record without intent reads its missing group as removed', async () => {
       const s = await stack()
       await s.links['ledgers'].put(SESSION_LINK_LEDGER_KEY, {
-        idempotency: {}, wakes: {},
+        wakes: {},
         spawns: { 'session-alice:call-old': { sessionId: s.bob.id, linkId: SessionLinkId('session-link-gone') } },
       })
       expect(s.links.spawnReplay(s.alice.id, 'call-old')?.removed).toBe(true)
@@ -669,6 +712,584 @@ describe('dsh-session-link', () => {
       const stored = [...s.links['messages'].entries()].filter(([, record]) => record.idempotencyKey === 'k2')
       expect(stored.map(([id]) => id)).toEqual([retry.messageId])
       expect(mailTexts(s.bob).filter(text => text.endsWith('task'))).toHaveLength(1)
+    })
+  })
+
+  describe('per-message wake intent', () => {
+    describe.each(['cold', 'idle', 'running'] as const)('%s target', residency => {
+      it.each([
+        { label: 'omitted', wake: undefined }, { label: 'true', wake: true }, { label: 'false', wake: false },
+      ])('persists wake=$label and replays the same admission with the expected wake budget', async ({ wake }) => {
+        let ctxRef: Context | undefined
+        const resolveAgent = vi.fn(async (id: SessionId) => ({ agent: await ctxRef!.agentLoop.create(id, { provider: 'mock', model: 'mock' }) }))
+        const s = await stack(undefined, undefined, { resolveAgent })
+        ctxRef = s.ctx
+        const targetId = residency === 'cold' ? SessionId('session-cold') : s.bob.id
+        await s.links.link('wake-intent', [s.alice.id, targetId], { kind: 'human' }, { autoWakeSessionIds: [targetId] })
+        if (residency === 'running') {
+          s.bob.followup(createUserMessage({ content: [{ type: 'text', text: 'human work' }], source: { kind: 'user' } }))
+          expect(s.bob.status).toBe('running')
+        }
+        const request = { targetId, text: 'wake matrix', idempotencyKey: 'wake-matrix', ...(wake === undefined ? {} : { wake }) }
+        const sent = await s.links.send(s.alice, targetId, request)
+        const expectedStatus = wake === false && residency !== 'running' ? 'queued' : 'accepted'
+        expect(sent.status).toBe(expectedStatus)
+        expect(s.links.message(sent.messageId)).toMatchObject({ wake: wake ?? true, wakesUsed: expectedStatus === 'accepted' && residency !== 'running' ? 1 : 0 })
+        expect(resolveAgent).toHaveBeenCalledTimes(residency === 'cold' && wake !== false ? 1 : 0)
+        expect((await s.links.activityView({ sessionId: targetId, section: 'recent' })).summary.wake.used)
+          .toBe(expectedStatus === 'accepted' && residency !== 'running' ? 1 : 0)
+        await expect(s.links.send(s.alice, targetId, request)).resolves.toEqual(sent)
+        const target = s.ctx.agents.get(targetId)
+        expect(target === undefined ? [] : mailTexts(target).filter(text => text.endsWith('wake matrix')))
+          .toHaveLength(expectedStatus === 'accepted' ? 1 : 0)
+        if (target !== undefined) await target.whenIdle()
+      })
+    })
+
+    it.each(['cold', 'idle'] as const)('cannot escalate a persisted false intent by replaying wake:true to a %s target', async residency => {
+      const resolveAgent = vi.fn(() => { throw new Error('false intent must not resume a target') })
+      const s = await stack(undefined, undefined, { resolveAgent })
+      const targetId = residency === 'cold' ? SessionId('session-cold') : s.bob.id
+      await s.links.link('wake-intent', [s.alice.id, targetId], { kind: 'human' }, { autoWakeSessionIds: [targetId] })
+      const request = { targetId, text: 'information only', wake: false, idempotencyKey: 'cannot-escalate' }
+      const sent = await s.links.send(s.alice, targetId, request)
+      for (const wake of [undefined, true]) {
+        await expect(s.links.send(s.alice, targetId, { ...request, wake })).resolves.toEqual(sent)
+      }
+      await s.links.deliverPending(targetId)
+      expect(resolveAgent).not.toHaveBeenCalled()
+      expect(s.links.message(sent.messageId)).toMatchObject({ wake: false, status: 'pending', wakesUsed: 0 })
+      expect([...s.links['messages'].entries()]).toHaveLength(1)
+      expect((await s.links.activityView({ sessionId: targetId, section: 'recent' })).summary.wake.used).toBe(0)
+      await expect(s.links.cancelMessageFrom({ sessionId: targetId, messageId: sent.messageId }))
+        .resolves.toMatchObject({ outcome: 'cancelled', status: 'cancelled' })
+    })
+
+    it.each(['peer wake', 'human turn'] as const)('co-delivers earlier wake:false mail in FIFO order on a later %s', async trigger => {
+      const s = await stack()
+      await grantBoth(s, { autoWake: [s.bob.id] })
+      const first = await s.links.send(s.alice, s.bob.id, { targetId: s.bob.id, text: 'first info', wake: false })
+      const second = await s.links.send(s.alice, s.bob.id, { targetId: s.bob.id, text: 'second info', wake: false })
+      expect(first.status).toBe('queued')
+      expect(second.status).toBe('queued')
+      if (trigger === 'peer wake') {
+        await expect(s.links.send(s.alice, s.bob.id, { targetId: s.bob.id, text: 'wake trigger' }))
+          .resolves.toMatchObject({ status: 'accepted' })
+      } else {
+        s.bob.followup(createUserMessage({ content: [{ type: 'text', text: 'human ping' }], source: { kind: 'user' } }))
+        await s.links.deliverPending(s.bob.id)
+      }
+      expect(mailTexts(s.bob).map(text => text.split('\n').at(-1)))
+        .toEqual(trigger === 'peer wake' ? ['first info', 'second info', 'wake trigger'] : ['first info', 'second info'])
+      for (const messageId of [first.messageId, second.messageId]) {
+        expect(s.links.message(messageId)).toMatchObject({ wake: false, status: 'delivered', wakesUsed: 0 })
+      }
+      expect((await s.links.activityView({ sessionId: s.bob.id, section: 'recent' })).summary.wake.used)
+        .toBe(trigger === 'peer wake' ? 1 : 0)
+      await s.bob.whenIdle()
+    })
+
+    it('keeps false across restart while old absent intent still wakes on replay without rewriting its body', async () => {
+      const pool = new MemoryMediaPool()
+      const first = await stack(undefined, pool)
+      const linkId = await grantBoth(first, { autoWake: [first.bob.id] })
+      const request = { targetId: first.bob.id, text: 'persisted info', wake: false, idempotencyKey: 'persisted-no-wake' }
+      const sent = await first.links.send(first.alice, first.bob.id, request)
+      const legacyId = SessionLinkMessageId('legacy-no-intent')
+      await first.links['messages'].put(legacyId, {
+        linkId, senderId: first.alice.id, senderTitle: 'alice', targetId: first.bob.id,
+        text: 'legacy body', status: 'pending', wakesUsed: 0, chainLength: 1, attempts: 0,
+        createdAt: new Date().toISOString(), idempotencyKey: 'legacy-intent', seq: 2,
+      })
+      await first.ctx.fiber.dispose()
+      contexts.delete(first.ctx)
+      const restarted = await stack(undefined, pool)
+      await restarted.links.deliverPending(restarted.bob.id)
+      await expect(restarted.links.send(restarted.alice, restarted.bob.id, { ...request, wake: true }))
+        .resolves.toEqual(sent)
+      expect(mailTexts(restarted.bob)).toEqual([])
+      expect(restarted.links.message(sent.messageId)).toMatchObject({ wake: false, status: 'pending', wakesUsed: 0 })
+      await expect(restarted.links.send(restarted.alice, restarted.bob.id, {
+        targetId: restarted.bob.id, text: 'ignored replay body', wake: false, idempotencyKey: 'legacy-intent',
+      })).resolves.toEqual({ messageId: legacyId, status: 'accepted' })
+      expect(restarted.links.message(legacyId)).toMatchObject({ text: 'legacy body', status: 'delivered', wakesUsed: 1 })
+      expect(restarted.links.message(legacyId)?.wake).toBeUndefined()
+      expect(restarted.links.message(sent.messageId)).toMatchObject({ wake: false, status: 'delivered', wakesUsed: 0 })
+      expect(mailTexts(restarted.bob).map(text => text.split('\n').at(-1))).toEqual(['persisted info', 'legacy body'])
+    })
+
+    it('wake:true still needs receiver authorization and wake:false consumes no exhausted wake budget', async () => {
+      const s = await stack({ maxAutoWakesPerSessionPerDay: 1 })
+      const linkId = await grantBoth(s)
+      const unauthorized = await s.links.send(s.alice, s.bob.id, { targetId: s.bob.id, text: 'no permission', wake: true })
+      expect(unauthorized.status).toBe('queued')
+      await s.links.setMemberAutoWake(linkId, s.bob.id, true)
+      await s.links['ledgers'].put(SESSION_LINK_LEDGER_KEY, {
+        spawns: {}, initialModelSpawns: {},
+        wakes: { [s.bob.id]: { day: new Date().toISOString().slice(0, 10), wakes: 1 } },
+      })
+      const budget = s.links['ledgers'].get(SESSION_LINK_LEDGER_KEY)
+      const quiet = await s.links.send(s.alice, s.bob.id, { targetId: s.bob.id, text: 'no requested wake', wake: false })
+      expect(quiet.status).toBe('queued')
+      expect(s.links.message(quiet.messageId)).toMatchObject({ wake: false, wakesUsed: 0 })
+      expect(s.links['ledgers'].get(SESSION_LINK_LEDGER_KEY)).toEqual(budget)
+      expect(mailTexts(s.bob)).toEqual([])
+    })
+
+    it('a false send neither spends the spawn-granted first wake nor blocks a later initial task', async () => {
+      const s = await stack()
+      await s.links.link('spawned', [s.alice.id, s.bob.id], { kind: 'session', sessionId: s.alice.id })
+      const quiet = await s.links.send(s.alice, s.bob.id, { targetId: s.bob.id, text: 'setup info', wake: false })
+      expect(quiet.status).toBe('queued')
+      expect((await s.links.activityView({ sessionId: s.bob.id, section: 'pending' })).summary.firstTaskWakeOwed).toBe(true)
+      const task = await s.links.send(s.alice, s.bob.id, { targetId: s.bob.id, text: 'initial task' })
+      expect(task.status).toBe('accepted')
+      expect(s.links.message(quiet.messageId)).toMatchObject({ wake: false, status: 'delivered', wakesUsed: 0 })
+      expect(s.links.message(task.messageId)?.wakesUsed).toBe(1)
+      expect(mailTexts(s.bob).map(text => text.split('\n').at(-1))).toEqual(['setup info', 'initial task'])
+    })
+
+    it('counts the courtesy guidance in the exact framed-message byte limit', async () => {
+      const s = await stack()
+      await grantBoth(s)
+      const sent = await s.links.send(s.alice, s.bob.id, { targetId: s.bob.id, text: 'byte limit', wake: false })
+      const body = s.links.message(sent.messageId)!.text
+      expect(body).toContain('wake:false')
+      expect(body).toContain('实质')
+      expect(body.endsWith('byte limit')).toBe(true)
+      const bytes = Buffer.byteLength(body, 'utf8')
+      const limit = await stack({ maxMessageBytes: bytes })
+      await grantBoth(limit)
+      await expect(limit.links.send(limit.alice, limit.bob.id, { targetId: limit.bob.id, text: 'byte limit', wake: false }))
+        .resolves.toMatchObject({ status: 'queued' })
+      const tooSmall = await stack({ maxMessageBytes: bytes - 1 })
+      await grantBoth(tooSmall)
+      await expect(tooSmall.links.send(tooSmall.alice, tooSmall.bob.id, { targetId: tooSmall.bob.id, text: 'byte limit', wake: false }))
+        .rejects.toMatchObject({ code: 'MESSAGE_TOO_LARGE' })
+      expect([...tooSmall.links['messages'].entries()]).toEqual([])
+      expect(frameSessionLinkText({ senderTitle: 'title', senderId: s.alice.id, messageId: sent.messageId, text: 'payload' }))
+        .toContain('wake:false')
+    })
+  })
+
+  describe('human chain wake extensions', () => {
+    async function exhausted(s: Stack, overrides: Record<string, unknown> = {}) {
+      const linkId = await grantBoth(s, { autoWake: [s.alice.id, s.bob.id] })
+      const rootId = SessionLinkMessageId('extension-root')
+      const messageId = SessionLinkMessageId('extension-selected')
+      const base = { linkId, senderTitle: 'participant', text: 'mail', attempts: 0, createdAt: new Date().toISOString() }
+      await s.links['messages'].put(rootId, {
+        ...base, senderId: s.bob.id, targetId: s.alice.id, status: 'delivered', wakesUsed: 1, chainLength: 1,
+      })
+      await s.links['messages'].put(messageId, {
+        ...base, senderId: s.alice.id, targetId: s.bob.id, status: 'pending', wakesUsed: 0, chainLength: 2,
+        inReplyTo: rootId, ...overrides,
+      })
+      return { linkId, rootId, messageId, request: { sessionId: s.alice.id, messageId, additional: 4, expectedExtra: 0, requestId: 'confirm-one' } }
+    }
+
+    it('resolves new defaults and preserves explicitly configured limits', async () => {
+      expect(ConfigSchema({})).toMatchObject({ maxAutoWakesPerChain: 8, maxAutoWakesPerSessionPerDay: 12, maxAutoWakesPerMessage: 1 })
+      expect(ConfigSchema({ maxAutoWakesPerChain: 4, maxAutoWakesPerSessionPerDay: 6 })).toMatchObject({ maxAutoWakesPerChain: 4, maxAutoWakesPerSessionPerDay: 6 })
+      expect((await stack()).links.limits).toMatchObject({ maxAutoWakesPerChain: 8, maxAutoWakesPerSessionPerDay: 12, maxAutoWakesPerMessage: 1 })
+      expect((await stack({ maxAutoWakesPerChain: 4, maxAutoWakesPerSessionPerDay: 6, maxAutoWakesPerMessage: 2 })).links.limits)
+        .toMatchObject({ maxAutoWakesPerChain: 4, maxAutoWakesPerSessionPerDay: 6, maxAutoWakesPerMessage: 2 })
+      expect(sessionLinkLedgersSchema.parse({ wakes: {} }).chainWakeExtensions).toEqual({})
+    })
+
+    it('extends once under duplicate concurrency and resumes only the selected direction', async () => {
+      const s = await stack({ maxAutoWakesPerChain: 1 })
+      const { request, rootId } = await exhausted(s)
+      const deliver = vi.spyOn(s.links as never, 'deliverTarget')
+      const results = await Promise.all([s.links.extendChainWakeFrom(request), s.links.extendChainWakeFrom(request)])
+      expect(results.map(r => r.outcome)).toEqual(['applied', 'replayed'])
+      expect(results[0]).toMatchObject({ continuation: 'accepted', status: 'delivered', budget: { rootId, chain: { used: 2, baseLimit: 1, extra: 4, limit: 5, remaining: 3 } } })
+      expect(deliver.mock.calls.filter(call => call[1]?.wakeFor !== undefined)).toEqual([[s.bob.id, { wakeFor: request.messageId }]])
+      expect(Object.keys(s.links['ledgers'].get(SESSION_LINK_LEDGER_KEY)!.chainWakeExtensions)).toEqual(['confirm-one'])
+      expect(mailTexts(s.bob)).toEqual(['mail'])
+    })
+
+    it('serializes compare-and-set races and refuses mismatched receipt reuse', async () => {
+      const s = await stack({ maxAutoWakesPerChain: 1 })
+      const { request } = await exhausted(s, { wake: false })
+      const delivery = vi.spyOn(s.links as never, 'deliverTarget')
+      const [first, stale] = await Promise.all([
+        s.links.extendChainWakeFrom(request), s.links.extendChainWakeFrom({ ...request, requestId: 'other-confirm' }),
+      ])
+      expect(first.outcome).toBe('applied')
+      expect(stale).toMatchObject({ outcome: 'conflict', continuation: 'not_attempted', budget: { chain: { extra: 4 } } })
+      expect(delivery).toHaveBeenCalledTimes(1)
+      expect(Object.keys(s.links['ledgers'].get(SESSION_LINK_LEDGER_KEY)!.chainWakeExtensions)).toHaveLength(1)
+      for (const change of [{ additional: 8 }, { expectedExtra: 4 }, { sessionId: s.bob.id }]) {
+        await expect(s.links.extendChainWakeFrom({ ...request, ...change })).rejects.toMatchObject({ code: 'WAKE_EXTENSION_REQUEST_CONFLICT' })
+      }
+      expect((await s.links.extendChainWakeFrom({ ...request, expectedExtra: 4, requestId: 'new-confirm' })).budget.chain.extra).toBe(8)
+    })
+
+    it('supports either original participant, hides missing mail from third parties, and accepts ordinary string IDs', async () => {
+      const s = await stack({ maxAutoWakesPerChain: 1 })
+      const { request } = await exhausted(s, { wake: false })
+      await expect(s.links.extendChainWakeFrom({ ...request, sessionId: SessionId('third-party') })).rejects.toMatchObject({ code: 'MESSAGE_NOT_FOUND' })
+      await expect(s.links.extendChainWakeFrom({ ...request, messageId: SessionLinkMessageId('missing') })).rejects.toMatchObject({ code: 'MESSAGE_NOT_FOUND' })
+      expect((await s.links.extendChainWakeFrom({ ...request, sessionId: s.bob.id, requestId: 'constructor' })).outcome).toBe('applied')
+    })
+
+    it('shares persistent extras across reverse replies and groups without changing other roots', async () => {
+      const s = await stack({ maxAutoWakesPerChain: 1 })
+      const { request, rootId } = await exhausted(s, { status: 'delivered', wakesUsed: 1 })
+      const { id: secondLink } = await s.links.link('second', [s.alice.id, s.bob.id], { kind: 'human' }, { autoWakeSessionIds: [s.alice.id] })
+      const reverse = SessionLinkMessageId('reverse')
+      const independent = SessionLinkMessageId('independent')
+      const common = { linkId: secondLink, senderId: s.bob.id, targetId: s.alice.id, senderTitle: 'bob', text: 'reverse mail', status: 'pending' as const, wakesUsed: 0, chainLength: 3, attempts: 0, createdAt: new Date().toISOString() }
+      await s.links['messages'].put(reverse, { ...common, inReplyTo: request.messageId })
+      await s.links['messages'].put(independent, { ...common, wake: false, chainLength: 1 })
+      expect((await s.links.extendChainWakeFrom(request)).continuation).toBe('not_pending')
+      const page = await s.links.activityView({ sessionId: s.alice.id, section: 'recent' })
+      expect(page.entries.find(e => e.messageId === reverse)!.wakeBudget).toMatchObject({ rootId, chain: { used: 2, extra: 4 } })
+      expect(page.entries.find(e => e.messageId === independent)!.wakeBudget!.chain.extra).toBe(0)
+      expect((await s.links.extendChainWakeFrom({ ...request, messageId: reverse, expectedExtra: 4, requestId: 'reverse-confirm', additional: 1 })).continuation).toBe('accepted')
+    })
+
+    it('fails a rejected append write before any delivery and safely retries the original intent', async () => {
+      const pool = new MemoryMediaPool()
+      const s = await stack({ maxAutoWakesPerChain: 1 }, pool)
+      const { request } = await exhausted(s)
+      const followup = vi.spyOn(s.bob, 'followup')
+      pool.failWritesTo('ledgers', 1)
+      await expect(s.links.extendChainWakeFrom(request)).rejects.toThrow('injected write failure')
+      expect(s.links['ledgers'].get(SESSION_LINK_LEDGER_KEY)?.chainWakeExtensions ?? {}).toEqual({})
+      expect(followup).not.toHaveBeenCalled()
+      expect((await s.links.extendChainWakeFrom(request)).continuation).toBe('accepted')
+    })
+
+    it('keeps a committed append through continuation failure and restart replay', async () => {
+      const pool = new MemoryMediaPool()
+      const first = await stack({ maxAutoWakesPerChain: 1 }, pool)
+      const { request } = await exhausted(first)
+      const delivery = vi.spyOn(first.links as never, 'deliverTarget').mockRejectedValueOnce(new Error('secret internal detail'))
+      const result = await first.links.extendChainWakeFrom(request)
+      expect(result).toMatchObject({ outcome: 'applied', continuation: 'queued', status: 'pending', budget: { chain: { extra: 4 } } })
+      expect(JSON.stringify(result)).not.toContain('secret internal detail')
+      delivery.mockRestore()
+      await first.disposeLinks()
+      const restarted = await stack({ maxAutoWakesPerChain: 1 }, pool)
+      const replay = await restarted.links.extendChainWakeFrom(request)
+      expect(replay).toMatchObject({ outcome: 'replayed', continuation: 'accepted', budget: { chain: { extra: 4, used: 2 } } })
+      expect(Object.keys(restarted.links['ledgers'].get(SESSION_LINK_LEDGER_KEY)!.chainWakeExtensions)).toHaveLength(1)
+    })
+
+    it('reports final failed status when a cold resume exhausts its attempt bound', async () => {
+      const resolveAgent = vi.fn(async () => ({ error: 'unavailable' }))
+      const s = await stack({ maxAutoWakesPerChain: 1, maxDeliveryAttempts: 1 }, undefined, { resolveAgent })
+      const { request, linkId } = await exhausted(s)
+      const coldId = SessionId('session-extension-cold')
+      await s.links.link('pair', [s.alice.id, coldId], { kind: 'human' }, { linkId, autoWakeSessionIds: [coldId] })
+      const selected = s.links.message(request.messageId)!
+      const root = s.links.message(SessionLinkMessageId('extension-root'))!
+      await s.links['messages'].put(SessionLinkMessageId('extension-root'), { ...root, senderId: coldId })
+      await s.links['messages'].put(request.messageId, { ...selected, targetId: coldId, status: 'pending' })
+      const result = await s.links.extendChainWakeFrom(request)
+      expect(result).toMatchObject({ outcome: 'applied', continuation: 'not_pending', status: 'failed', budget: { chain: { extra: 4, used: 1 } } })
+      expect(resolveAgent).toHaveBeenCalledTimes(1)
+      const replay = await s.links.extendChainWakeFrom(request)
+      expect(replay).toMatchObject({ outcome: 'replayed', continuation: 'not_pending', status: 'failed' })
+      expect(resolveAgent).toHaveBeenCalledTimes(1)
+    })
+
+    it('does not inspect, resume, flush or mutate while projecting target-day and chain facts', async () => {
+      const controller = { inspect: vi.fn(), resolveAgent: vi.fn(), list: vi.fn() }
+      const s = await stack({ maxAutoWakesPerChain: 1 }, undefined, controller)
+      const { request } = await exhausted(s, { wake: false })
+      await s.links['ledgers'].put(SESSION_LINK_LEDGER_KEY, sessionLinkLedgersSchema.parse({ wakes: {
+        [s.alice.id]: { day: new Date().toISOString().slice(0, 10), wakes: 7 },
+        [s.bob.id]: { day: new Date().toISOString().slice(0, 10), wakes: 2 },
+      } }))
+      const flush = vi.spyOn(s.ctx.sessions, 'flush')
+      const writes = ['links', 'messages', 'ledgers'].map(name => vi.spyOn(s.links[name as 'links'], 'put'))
+      for (const sessionId of [s.alice.id, s.bob.id]) {
+        const view = await s.links.activityView({ sessionId, section: 'recent' })
+        expect(view.entries.find(e => e.messageId === request.messageId)!.wakeBudget).toMatchObject({
+          chain: { used: 1, limit: 1, remaining: 0 }, targetDay: { used: 2, limit: 12 }, message: { used: 0, limit: 1 },
+        })
+      }
+      for (const fn of Object.values(controller)) expect(fn).not.toHaveBeenCalled()
+      for (const write of writes) expect(write).not.toHaveBeenCalled()
+      expect(flush).not.toHaveBeenCalled()
+    })
+
+    it.each(['daily', 'message', 'wake:false', 'permission'] as const)('retains the %s restriction after extending', async blocker => {
+      const s = await stack({ maxAutoWakesPerChain: 1, maxAutoWakesPerSessionPerDay: 1 })
+      const { request, linkId } = await exhausted(s, blocker === 'message' ? { wakesUsed: 1 } : blocker === 'wake:false' ? { wake: false } : {})
+      if (blocker === 'daily') await s.links['ledgers'].put(SESSION_LINK_LEDGER_KEY, sessionLinkLedgersSchema.parse({ wakes: { [s.bob.id]: { day: new Date().toISOString().slice(0, 10), wakes: 1 } } }))
+      if (blocker === 'permission') await s.links.setAutoWake(linkId, [])
+      const result = await s.links.extendChainWakeFrom(request)
+      expect(result).toMatchObject({ outcome: 'applied', continuation: 'queued', status: 'pending', budget: { chain: { extra: 4 } } })
+      expect(result.blockingReasons).toContain(blocker === 'permission' ? 'wake-unauthorized' : blocker === 'wake:false' ? 'wake-not-requested' : 'wake-budget')
+      expect(mailTexts(s.bob)).toEqual([])
+      if (blocker === 'daily') expect(result.budget.targetDay.used).toBe(1)
+    })
+
+    it.each(['cancelled', 'revoked', 'failed'] as const)('never resends selected terminal %s mail', async status => {
+      const s = await stack({ maxAutoWakesPerChain: 1 })
+      const { request } = await exhausted(s, { status })
+      const delivery = vi.spyOn(s.links as never, 'deliverTarget')
+      expect((await s.links.extendChainWakeFrom(request))).toMatchObject({ continuation: 'not_pending', status })
+      expect(delivery).not.toHaveBeenCalled()
+    })
+
+    it.each(['archive-sender', 'archive-target', 'unlink', 'nonordinary'] as const)('does not grant or revive after %s', async restriction => {
+      const s = await stack({ maxAutoWakesPerChain: 1 })
+      const { request, linkId } = await exhausted(s, { wake: false })
+      await s.links.extendChainWakeFrom(request)
+      if (restriction === 'archive-sender') s.archived.push(s.alice.id)
+      if (restriction === 'archive-target') s.archived.push(s.bob.id)
+      if (restriction === 'unlink') await s.links.unlink(linkId)
+      if (restriction === 'nonordinary') Object.defineProperty(s.bob.session, 'header', { value: { ...s.bob.session.header, origin: 'subagent' } })
+      const delivery = vi.spyOn(s.links as never, 'deliverTarget')
+      expect((await s.links.extendChainWakeFrom(request)).outcome).toBe('replayed')
+      expect(delivery).not.toHaveBeenCalled()
+      await expect(s.links.extendChainWakeFrom({ ...request, requestId: 'later', expectedExtra: 4 })).rejects.toMatchObject({ code: restriction === 'unlink' ? 'LINK_REVOKED' : restriction === 'nonordinary' ? 'TARGET_OWNED_BY_SUBAGENT' : 'TARGET_ARCHIVED' })
+    })
+
+    it.each(['missing-parent', 'cycle', 'other-pair', 'legacy-parent', 'legacy-selected', 'too-deep'] as const)('omits and rejects unreliable %s chains', async invalid => {
+      const s = await stack({ maxAutoWakesPerChain: 1 })
+      const { request, rootId } = await exhausted(s)
+      const selected = s.links.message(request.messageId)!
+      const root = s.links.message(rootId)!
+      if (invalid === 'missing-parent') await s.links['messages'].put(request.messageId, { ...selected, inReplyTo: SessionLinkMessageId('absent') })
+      if (invalid === 'cycle') await s.links['messages'].put(rootId, { ...root, inReplyTo: request.messageId })
+      if (invalid === 'other-pair') await s.links['messages'].put(rootId, { ...root, senderId: SessionId('stranger') })
+      if (invalid === 'legacy-parent') await s.links['messages'].put(rootId, { ...root, taskStatus: null })
+      if (invalid === 'legacy-selected') await s.links['messages'].put(request.messageId, { ...selected, statusKind: 'legacy' })
+      if (invalid === 'too-deep') {
+        let parent = rootId
+        for (let i = 0; i < 256; i += 1) {
+          const id = SessionLinkMessageId('ancestor-' + i)
+          await s.links['messages'].put(id, { ...root, wakesUsed: 0, inReplyTo: parent })
+          parent = id
+        }
+        await s.links['messages'].put(request.messageId, { ...selected, inReplyTo: parent })
+      }
+      const writes = vi.spyOn(s.links['ledgers'], 'put')
+      const delivery = vi.spyOn(s.links as never, 'deliverTarget')
+      const page = await s.links.activityView({ sessionId: s.alice.id, section: 'recent', limit: 50 })
+      expect(page.entries.find(e => e.messageId === request.messageId)?.wakeBudget).toBeUndefined()
+      await expect(s.links.extendChainWakeFrom(request)).rejects.toMatchObject({ code: invalid === 'legacy-selected' ? 'LEGACY_TASK_MESSAGE_BLOCKED' : 'WAKE_CHAIN_INVALID' })
+      expect(writes).not.toHaveBeenCalled()
+      expect(delivery).not.toHaveBeenCalled()
+    })
+
+    it('rejects extensions whose effective limit would overflow', async () => {
+      const s = await stack({ maxAutoWakesPerChain: Number.MAX_SAFE_INTEGER })
+      const { request } = await exhausted(s)
+      await expect(s.links.extendChainWakeFrom(request)).rejects.toMatchObject({ code: 'WAKE_EXTENSION_INVALID' })
+      expect(s.links['ledgers'].get(SESSION_LINK_LEDGER_KEY)).toBeUndefined()
+    })
+  })
+
+  describe('human cancellation contract', () => {
+    it('persists cancellation across restart, recovery, and replay without changing wake budgets', async () => {
+      const pool = new MemoryMediaPool()
+      const first = await stack(undefined, pool)
+      const linkId = await grantBoth(first)
+      const request = { targetId: first.bob.id, text: 'must never run', idempotencyKey: 'human-cancel-replay' }
+      const sent = await first.links.send(first.alice, first.bob.id, request)
+      const before = first.links.message(sent.messageId)!
+      const budget = first.links['ledgers'].get(SESSION_LINK_LEDGER_KEY)
+      await expect(first.links.cancelMessageFrom({ sessionId: first.bob.id, messageId: sent.messageId }))
+        .resolves.toEqual({ messageId: sent.messageId, outcome: 'cancelled', status: 'cancelled' })
+      await first.ctx.fiber.dispose()
+      contexts.delete(first.ctx)
+      const restarted = await stack(undefined, pool)
+      await restarted.links.setMemberAutoWake(linkId, restarted.bob.id, true)
+      await restarted.links.deliverPending(restarted.bob.id)
+      await expect(restarted.links.send(restarted.alice, restarted.bob.id, request))
+        .rejects.toMatchObject({ code: 'MESSAGE_UNDELIVERABLE' })
+      await expect(restarted.links.cancelMessageFrom({ sessionId: restarted.alice.id, messageId: sent.messageId }))
+        .resolves.toEqual({ messageId: sent.messageId, outcome: 'already_terminal', status: 'cancelled' })
+      expect(restarted.links.message(sent.messageId)).toEqual({ ...before, status: 'cancelled' })
+      expect([...restarted.links['messages'].entries()]).toHaveLength(1)
+      expect(restarted.links['ledgers'].get(SESSION_LINK_LEDGER_KEY)).toEqual(budget)
+      expect(mailTexts(restarted.bob)).toEqual([])
+      expect(restarted.bob.session.snapshotEvents().some(event => event.type === 'turn/start')).toBe(false)
+    })
+
+    it('exposes a failed cancellation write and leaves pending mail available to retry', async () => {
+      const pool = new MemoryMediaPool()
+      const s = await stack(undefined, pool)
+      await grantBoth(s)
+      const sent = await s.links.send(s.alice, s.bob.id, { targetId: s.bob.id, text: 'pending' })
+      const before = s.links.message(sent.messageId)
+      pool.failWritesTo('messages', 1)
+      await expect(s.links.cancelMessageFrom({ sessionId: s.alice.id, messageId: sent.messageId }))
+        .rejects.toThrow('injected write failure')
+      expect(s.links.message(sent.messageId)).toEqual(before)
+      await expect(s.links.cancelMessageFrom({ sessionId: s.alice.id, messageId: sent.messageId }))
+        .resolves.toMatchObject({ outcome: 'cancelled', status: 'cancelled' })
+    })
+
+    it('lets either original participant cancel an orphaned pending row after its grant disappeared', async () => {
+      const s = await stack()
+      const linkId = await grantBoth(s)
+      for (const sessionId of [s.alice.id, s.bob.id]) {
+        const messageId = SessionLinkMessageId(`orphan-for-${sessionId}`)
+        await s.links['messages'].put(messageId, {
+          linkId: SessionLinkId('removed-link'), senderId: s.alice.id, senderTitle: 'alice', targetId: s.bob.id,
+          text: 'orphaned queue', status: 'pending', wakesUsed: 0, chainLength: 1, attempts: 0,
+          createdAt: new Date().toISOString(),
+        })
+        await expect(s.links.cancelMessageFrom({ sessionId, messageId }))
+          .resolves.toEqual({ messageId, outcome: 'cancelled', status: 'cancelled' })
+      }
+      expect(s.links.list()[0]?.id).toBe(linkId)
+    })
+
+    it('refuses uncertain cold inserted mail but cancels a live speculative marker with no target receipt', async () => {
+      const s = await stack()
+      const cold = SessionId('session-cold')
+      const { id: linkId } = await s.links.link('cold', [s.alice.id, cold], { kind: 'human' })
+      const messageId = SessionLinkMessageId('uncertain-insertion')
+      const record = {
+        linkId, senderId: s.alice.id, senderTitle: 'alice', targetId: cold, text: 'uncertain', status: 'pending' as const,
+        wakesUsed: 1, chainLength: 1, attempts: 0, createdAt: new Date().toISOString(), inserted: true,
+      }
+      await s.links['messages'].put(messageId, record)
+      const flush = vi.spyOn(s.ctx.sessions, 'flush')
+      await expect(s.links.cancelMessageFrom({ sessionId: s.alice.id, messageId }))
+        .resolves.toEqual({ messageId, outcome: 'too_late', status: 'pending' })
+      expect(s.links.message(messageId)).toEqual(record)
+      expect(flush).not.toHaveBeenCalled()
+      const resumed = await s.ctx.agentLoop.create(cold, { provider: 'mock', model: 'mock' })
+      expect(mailTexts(resumed)).toEqual([])
+      await expect(s.links.cancelMessageFrom({ sessionId: cold, messageId }))
+        .resolves.toEqual({ messageId, outcome: 'cancelled', status: 'cancelled' })
+      expect(s.links.message(messageId)).toEqual({ ...record, status: 'cancelled' })
+      expect(flush).not.toHaveBeenCalled()
+    })
+
+    it('reports too_late while a held receipt cannot flush, then returns its confirmed latest state', async () => {
+      const s = await stack()
+      await grantBoth(s, { autoWake: [s.bob.id] })
+      const flush = vi.spyOn(s.ctx.sessions, 'flush').mockRejectedValue(new Error('disk offline'))
+      const sent = await s.links.send(s.alice, s.bob.id, { targetId: s.bob.id, text: 'held receipt' })
+      expect(sent.status).toBe('queued')
+      await expect(s.links.cancelMessageFrom({ sessionId: s.bob.id, messageId: sent.messageId }))
+        .resolves.toEqual({ messageId: sent.messageId, outcome: 'too_late', status: 'pending' })
+      expect(s.links.message(sent.messageId)?.status).toBe('pending')
+      flush.mockRestore()
+      await expect(s.links.cancelMessageFrom({ sessionId: s.alice.id, messageId: sent.messageId }))
+        .resolves.toEqual({ messageId: sent.messageId, outcome: 'too_late', status: 'delivered' })
+      await expect(s.links.cancelMessageFrom({ sessionId: s.bob.id, messageId: sent.messageId }))
+        .resolves.toEqual({ messageId: sent.messageId, outcome: 'already_terminal', status: 'delivered' })
+      expect(mailTexts(s.bob).filter(text => text.endsWith('held receipt'))).toHaveLength(1)
+    })
+
+    it('serializes a human cancel requested during insertion until the target receipt is known', async () => {
+      const s = await stack()
+      await grantBoth(s, { autoWake: [s.bob.id] })
+      const gate = Promise.withResolvers<void>()
+      const entered = Promise.withResolvers<SessionLinkMessageId>()
+      const table = s.links['messages']
+      const put = table.put.bind(table)
+      const marker = vi.spyOn(table, 'put').mockImplementation(async (key, value) => {
+        await put(key, value)
+        if (value.inserted === true && value.status === 'pending') {
+          entered.resolve(key)
+          await gate.promise
+        }
+      })
+      const flush = vi.spyOn(s.ctx.sessions, 'flush').mockRejectedValue(new Error('disk offline'))
+      const sending = s.links.send(s.alice, s.bob.id, { targetId: s.bob.id, text: 'insertion race' })
+      const messageId = await entered.promise
+      const cancelling = s.links.cancelMessageFrom({ sessionId: s.alice.id, messageId })
+      expect(mailTexts(s.bob)).toEqual([])
+      gate.resolve()
+      await expect(sending).resolves.toEqual({ messageId, status: 'queued' })
+      await expect(cancelling).resolves.toEqual({ messageId, outcome: 'too_late', status: 'pending' })
+      marker.mockRestore()
+      flush.mockRestore()
+      expect(s.links.message(messageId)?.status).toBe('pending')
+      expect(mailTexts(s.bob).filter(text => text.endsWith('insertion race'))).toHaveLength(1)
+    })
+
+    it('waits for an in-flight receipt flush before answering a competing cancel', async () => {
+      const s = await stack()
+      await grantBoth(s, { autoWake: [s.bob.id] })
+      const gate = Promise.withResolvers<void>()
+      const entered = Promise.withResolvers<void>()
+      const flush = s.ctx.sessions.flush.bind(s.ctx.sessions)
+      let held = false
+      const spy = vi.spyOn(s.ctx.sessions, 'flush').mockImplementation(async session => {
+        if (session === s.bob.session && !held) {
+          held = true
+          entered.resolve()
+          await gate.promise
+        }
+        await flush(session)
+      })
+      const sending = s.links.send(s.alice, s.bob.id, { targetId: s.bob.id, text: 'flush race' })
+      await entered.promise
+      const [[messageId]] = [...s.links['messages'].entries()]
+      expect(s.links.message(messageId)?.status).toBe('pending')
+      expect(mailTexts(s.bob).filter(text => text.endsWith('flush race'))).toHaveLength(1)
+      const cancelling = s.links.cancelMessageFrom({ sessionId: s.bob.id, messageId })
+      gate.resolve()
+      await expect(sending).resolves.toEqual({ messageId, status: 'accepted' })
+      await expect(cancelling).resolves.toEqual({ messageId, outcome: 'already_terminal', status: 'delivered' })
+      spy.mockRestore()
+      expect(s.links.message(messageId)?.status).toBe('delivered')
+      expect(mailTexts(s.bob).filter(text => text.endsWith('flush race'))).toHaveLength(1)
+    })
+
+    it('makes cancellation durable before a competing delivery can inspect the queue', async () => {
+      const s = await stack()
+      await grantBoth(s)
+      const sent = await s.links.send(s.alice, s.bob.id, { targetId: s.bob.id, text: 'cancel wins' })
+      const gate = Promise.withResolvers<void>()
+      const entered = Promise.withResolvers<void>()
+      const table = s.links['messages']
+      const put = table.put.bind(table)
+      vi.spyOn(table, 'put').mockImplementationOnce(async (key, value) => {
+        entered.resolve()
+        await gate.promise
+        await put(key, value)
+      })
+      const cancelling = s.links.cancelMessageFrom({ sessionId: s.bob.id, messageId: sent.messageId })
+      await entered.promise
+      Object.defineProperty(s.bob, 'status', { configurable: true, value: 'running' })
+      const delivery = s.links.deliverPending(s.bob.id)
+      gate.resolve()
+      await expect(cancelling).resolves.toMatchObject({ outcome: 'cancelled', status: 'cancelled' })
+      await delivery
+      expect(s.links.message(sent.messageId)?.status).toBe('cancelled')
+      expect(mailTexts(s.bob)).toEqual([])
+    })
+
+    it.each(['cancel', 'unlink'] as const)('uses the terminal write that wins the %s-first unlink race', async firstOperation => {
+      const s = await stack()
+      const linkId = await grantBoth(s)
+      const sent = await s.links.send(s.alice, s.bob.id, { targetId: s.bob.id, text: 'unlink race' })
+      const gate = Promise.withResolvers<void>()
+      const entered = Promise.withResolvers<void>()
+      const table = s.links['messages']
+      const put = table.put.bind(table)
+      vi.spyOn(table, 'put').mockImplementationOnce(async (key, value) => {
+        entered.resolve()
+        await gate.promise
+        await put(key, value)
+      })
+      const cancel = () => s.links.cancelMessageFrom({ sessionId: s.alice.id, messageId: sent.messageId })
+      const first = firstOperation === 'cancel' ? cancel() : s.links.unlink(linkId)
+      await entered.promise
+      const second = firstOperation === 'cancel' ? s.links.unlink(linkId) : cancel()
+      gate.resolve()
+      const results = await Promise.all([first, second])
+      const result = results[firstOperation === 'cancel' ? 0 : 1]
+      const status = firstOperation === 'cancel' ? 'cancelled' : 'revoked'
+      expect(result).toEqual({ messageId: sent.messageId, outcome: firstOperation === 'cancel' ? 'cancelled' : 'already_terminal', status })
+      expect(s.links.message(sent.messageId)?.status).toBe(status)
+      expect(s.links.list()).toEqual([])
+      expect(mailTexts(s.bob)).toEqual([])
     })
   })
 
@@ -861,7 +1482,7 @@ describe('dsh-session-link', () => {
       const s = await stack()
       const cold = SessionId('session-cold')
       const { id: linkId } = await s.links.link('cold', [s.alice.id, cold], { kind: 'human' })
-      const messageId = SessionLinkMessageId('session-link-message-held')
+      const messageId = SessionLinkMessageId('gc-duolink-message-held')
       await s.links['messages'].put(messageId, {
         linkId, senderId: s.alice.id, senderTitle: 'alice', targetId: cold, text: 'held', status: 'pending',
         wakesUsed: 1, chainLength: 1, attempts: 0, createdAt: new Date().toISOString(), seq: 1, inserted: true,
@@ -878,8 +1499,8 @@ describe('dsh-session-link', () => {
       const at = new Date().toISOString()
       const earlier = new Date(Date.now() - 60_000).toISOString()
       const base = { linkId, senderId: s.alice.id, senderTitle: 'alice', targetId: s.bob.id, status: 'pending' as const, wakesUsed: 0, chainLength: 1, attempts: 0 }
-      await s.links['messages'].put(SessionLinkMessageId('session-link-message-b'), { ...base, text: 'second', createdAt: earlier, seq: 2 })
-      await s.links['messages'].put(SessionLinkMessageId('session-link-message-a'), { ...base, text: 'first', createdAt: at, seq: 1 })
+      await s.links['messages'].put(SessionLinkMessageId('gc-duolink-message-b'), { ...base, text: 'second', createdAt: earlier, seq: 2 })
+      await s.links['messages'].put(SessionLinkMessageId('gc-duolink-message-a'), { ...base, text: 'first', createdAt: at, seq: 1 })
       s.bob.followup(createUserMessage({ content: [{ type: 'text', text: 'human ping' }], source: { kind: 'user' } }))
       await s.links.deliverPending(s.bob.id)
       expect(mailTexts(s.bob)).toEqual(['first', 'second'])

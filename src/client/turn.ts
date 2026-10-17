@@ -1,5 +1,5 @@
 /**
- * Turn-scoped linked-session projection for the `session_spawn_linked_session` card.
+ * Turn-scoped linked-session projection for the `gc_duolink_spawn_session` card.
  *
  * This Definition publishes the link a settled spawn call created against its
  * Turn, so the card renders as a turn-level element through ui-chat's
@@ -7,7 +7,7 @@
  * surface of the Host tool, which the conversation contract freezes, so the
  * card narrows the linked Session's identity from that text; Session-log
  * replay reproduces the card with no Host change. A link the human operator
- * makes through the panel or the `/session-link` command runs no tool call, so
+ * makes through the panel or the `/gc-duolink` command runs no tool call, so
  * it produces no card.
  */
 import type {
@@ -17,14 +17,14 @@ import type { SessionId } from '@deepseek-ai/dsh-session/types'
 import type { SessionLinkId, SessionLinkMessageId } from '../types.ts'
 
 /** Wire Tool name whose settled result announces one spawned-and-linked Session. */
-export const SPAWN_LINKED_SESSION_TOOL = 'session_spawn_linked_session'
+export const SPAWN_LINKED_SESSION_TOOL = 'gc_duolink_spawn_session'
 
 /** Immutable linked-session facts published against one Turn. */
 export interface SessionLinkTurnData {
   readonly created: readonly LinkedSpawn[]
 }
 
-/** One settled `session_spawn_linked_session` result the card renders. */
+/** One settled `gc_duolink_spawn_session` result the card renders. */
 export interface LinkedSpawn {
   /** Sequence of the settling `tool/result`, for the closing-boundary filter. */
   readonly seq: number
@@ -51,8 +51,8 @@ export interface InitialSessionModel {
 
 declare module '@deepseek-ai/dsh-client-ui-conversation/client' {
   interface ConversationTurnDataMap {
-    /** `session_spawn_linked_session` results settled in this Turn, in settlement order. */
-    'session-link-external-created': SessionLinkTurnData
+    /** `gc_duolink_spawn_session` results settled in this Turn, in settlement order. */
+    'gc-duolink-created': SessionLinkTurnData
   }
 }
 
@@ -77,7 +77,7 @@ function initialSessionModel(text: string | undefined): InitialSessionModel | un
   try { data = JSON.parse(text) } catch { return undefined }
   if (typeof data !== 'object' || data === null || Array.isArray(data)) return undefined
   const sidecar = data as Record<string, unknown>
-  if (sidecar.type !== 'session-link/initial-model' || sidecar.version !== 1) return undefined
+  if (sidecar.type !== 'gc-duolink/initial-model' || sidecar.version !== 1) return undefined
   if (typeof sidecar.initialModel !== 'object' || sidecar.initialModel === null || Array.isArray(sidecar.initialModel)) return undefined
   const model = sidecar.initialModel as Record<string, unknown>
   if (typeof model.provider !== 'string' || model.provider.trim().length === 0
@@ -119,7 +119,7 @@ function linkedSpawn(content: readonly { type: string; text?: string }[]): Pick<
  * @returns created links, or null when the Turn created none.
  */
 export function selectLinkedSpawns(owner: SessionLinkTurnOwner): SessionLinkTurnData | null {
-  const created = owner.turn.data.get('session-link-external-created')?.created
+  const created = owner.turn.data.get('gc-duolink-created')?.created
     .filter(item => item.seq <= (owner.turn.end?.seq ?? owner.seq))
   return created === undefined || created.length === 0 ? null : { created }
 }
@@ -135,9 +135,9 @@ interface SessionLinkTurnState {
   readonly created: readonly LinkedSpawn[]
 }
 
-/** Turn-local `session_spawn_linked_session` accumulator; it publishes no view Node. */
+/** Turn-local `gc_duolink_spawn_session` accumulator; it publishes no view Node. */
 export const sessionLinkTurnDefinition: ConversationNodeDefinition<SessionLinkTurnState> = {
-  kind: 'session-link-external-created',
+  kind: 'gc-duolink-created',
   match: (event) => {
     if (event.type === 'turn/start') return { id: String(event.data.turn), role: 'start' }
     if (event.type === 'tool/call') return { id: String(event.data.turn), role: 'update' }
@@ -147,7 +147,7 @@ export const sessionLinkTurnDefinition: ConversationNodeDefinition<SessionLinkTu
     return null
   },
   start: (_context, match) => {
-    if (match.event.type !== 'turn/start') throw new Error('session-link-external-created start requires turn/start')
+    if (match.event.type !== 'turn/start') throw new Error('gc-duolink-created start requires turn/start')
     return { turn: match.event.data.turn, calls: new Map(), created: [] }
   },
   update: (context, match) => {
@@ -174,12 +174,12 @@ export const sessionLinkTurnDefinition: ConversationNodeDefinition<SessionLinkTu
     if (scope !== 'turn' || context.state === undefined) return null
     if (previous?.kind === 'turn'
       && previous.turn === context.state.turn
-      && previous.key === 'session-link-external-created'
+      && previous.key === 'gc-duolink-created'
       && previous.value.created === context.state.created) return previous
     return {
       kind: 'turn',
       turn: context.state.turn,
-      key: 'session-link-external-created',
+      key: 'gc-duolink-created',
       value: { created: context.state.created },
     }
   },

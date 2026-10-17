@@ -24,7 +24,7 @@ const LINK = SessionLinkId('link-01')
 const MSG = SessionLinkMessageId('msg-1')
 const CALL = 'call-spawn'
 const RESULT_TEXT = `session ${PEER} created and linked (${LINK}); task message msg-1 queued`
-const DATA_KEY = 'session-link-external-created'
+const DATA_KEY = 'gc-duolink-created'
 type State = ReturnType<typeof sessionLinkTurnDefinition.start>
 
 afterEach(cleanup)
@@ -114,7 +114,7 @@ describe('settled linked-spawn Definition', () => {
     const first = fold([event(1, 'turn/start', { turn: 1 }), call(2), result(3)])
     expect(first?.created).toHaveLength(1)
     const human = event(2, 'user/message', {
-      id: 'human-link', role: 'user', content: [{ type: 'text', text: '/session-link add peer' }],
+      id: 'human-link', role: 'user', content: [{ type: 'text', text: '/gc-duolink add peer' }],
       source: { kind: 'user', rpcId: 'human' },
     })
     expect(fold([event(1, 'turn/start', { turn: 2 }), human, event(4, 'turn/end', { turn: 2 })]))
@@ -123,13 +123,13 @@ describe('settled linked-spawn Definition', () => {
 
   it('projects a versioned initial-model second text block without changing legacy attribution', () => {
     const initialModel = { provider: 'test-provider', model: 'test-model', reasoningEffort: 'high' }
-    const sidecar = JSON.stringify({ type: 'session-link/initial-model', version: 1, initialModel })
+    const sidecar = JSON.stringify({ type: 'gc-duolink/initial-model', version: 1, initialModel })
     const events = [event(1, 'turn/start', { turn: 1 }), call(2)]
     expect(fold([...events, result(3, RESULT_TEXT, false, CALL, sidecar)])).toEqual({
       created: [{ seq: 3, callId: CALL, sessionId: PEER, linkId: LINK, messageId: MSG, delivery: 'queued', initialModel }],
     })
     expect(fold([...events, result(3, RESULT_TEXT.replace('queued', 'accepted'), false, CALL,
-      JSON.stringify({ type: 'session-link/initial-model', version: 1, initialModel: { provider: 'p', model: 'm' } }),
+      JSON.stringify({ type: 'gc-duolink/initial-model', version: 1, initialModel: { provider: 'p', model: 'm' } }),
     )])?.created[0]).toMatchObject({ messageId: MSG, delivery: 'accepted', initialModel: { provider: 'p', model: 'm' } })
     expect(fold([...events, result(3, 'unrecognized result', false, CALL, sidecar)])).toEqual({ created: [] })
     expect(fold([...events, result(3, RESULT_TEXT, true, CALL, sidecar)])).toEqual({ created: [] })
@@ -137,12 +137,12 @@ describe('settled linked-spawn Definition', () => {
 
   it.each([
     'malformed JSON', 'null', '[]',
-    JSON.stringify({ type: 'session-link/initial-model', version: 2, initialModel: { provider: 'p', model: 'm' } }),
+    JSON.stringify({ type: 'gc-duolink/initial-model', version: 2, initialModel: { provider: 'p', model: 'm' } }),
     JSON.stringify({ type: 'session-link/task', version: 1, initialModel: { provider: 'p', model: 'm' } }),
-    JSON.stringify({ type: 'session-link/initial-model', version: 1 }),
+    JSON.stringify({ type: 'gc-duolink/initial-model', version: 1 }),
     ...[null, [], {}, { provider: 'p' }, { provider: ' ', model: 'm' }, { provider: 'p', model: 1 },
       { provider: 'p', model: 'm', reasoningEffort: null }, { provider: 'p', model: 'm', reasoningEffort: '' },
-    ].map(initialModel => JSON.stringify({ type: 'session-link/initial-model', version: 1, initialModel })),
+    ].map(initialModel => JSON.stringify({ type: 'gc-duolink/initial-model', version: 1, initialModel })),
   ])('ignores invalid sidecar %s while keeping the legacy spawn card', sidecar => {
     expect(fold([event(1, 'turn/start', { turn: 1 }), call(2), result(3, RESULT_TEXT, false, CALL, sidecar)]))
       .toEqual({ created: [{ seq: 3, callId: CALL, sessionId: PEER, linkId: LINK, messageId: MSG, delivery: 'queued' }] })
@@ -151,7 +151,7 @@ describe('settled linked-spawn Definition', () => {
   it('reads only the second text block, without scanning other result content for metadata', () => {
     const settled = result(3)
     if (settled.type !== 'tool/result') throw new Error('tool/result fixture required')
-    const sidecar = { type: 'text' as const, text: JSON.stringify({ type: 'session-link/initial-model', version: 1,
+    const sidecar = { type: 'text' as const, text: JSON.stringify({ type: 'gc-duolink/initial-model', version: 1,
       initialModel: { provider: 'p', model: 'm' } }) }
     const withContent = (content: typeof settled.data.message.content): SessionEvent => ({
       ...settled, data: { ...settled.data, message: { ...settled.data.message, content } },
@@ -193,7 +193,7 @@ describe('Turn card Host view', () => {
       select(useSyncExternalStore(source.subscribe, source.getSnapshot, source.getSnapshot))
     const props: LinkProps = {
       sessionId: SELF, useLinks, refresh: source.refresh, t,
-      link: vi.fn(), setWake: vi.fn(), unlink: vi.fn(), loadActivity: vi.fn(), openPanel: vi.fn(), openSession: vi.fn(),
+      link: vi.fn(), setWake: vi.fn(), unlink: vi.fn(), cancelMessage: vi.fn(), loadActivity: vi.fn(), openPanel: vi.fn(), openSession: vi.fn(),
     }
     const location = turn({ created: [{ seq: 3, callId: CALL, sessionId: PEER, linkId: LINK, messageId: MSG, delivery: 'queued' }] }, 9)
     const rendered = render(<TurnCard {...props} turn={location} seq={9} />)
@@ -225,7 +225,7 @@ describe('Turn card Host view', () => {
       ] } })
     const props: LinkProps = {
       sessionId: SELF, useLinks, refresh: vi.fn(), t,
-      link: vi.fn(), setWake: vi.fn(), unlink: vi.fn(), loadActivity: vi.fn(), openPanel: vi.fn(), openSession: vi.fn(),
+      link: vi.fn(), setWake: vi.fn(), unlink: vi.fn(), cancelMessage: vi.fn(), loadActivity: vi.fn(), openPanel: vi.fn(), openSession: vi.fn(),
     }
     const rendered = render(<TurnCard {...props} turn={turn({ created: [] }, 9)} seq={9} />)
     expect(rendered.container.firstChild).toBeNull()
@@ -236,7 +236,7 @@ describe('Turn card Host view', () => {
       select({ status: 'ready', view: { pollIntervalMs: 30_000, sessions: [], links: [] } })
     const props: LinkProps = {
       sessionId: SELF, useLinks, refresh: vi.fn(), t,
-      link: vi.fn(), setWake: vi.fn(), unlink: vi.fn(), loadActivity: vi.fn(), openPanel: vi.fn(), openSession: vi.fn(),
+      link: vi.fn(), setWake: vi.fn(), unlink: vi.fn(), cancelMessage: vi.fn(), loadActivity: vi.fn(), openPanel: vi.fn(), openSession: vi.fn(),
     }
     const location = (initialModel: { provider: string; model: string; reasoningEffort?: string }) =>
       turn({ created: [{ seq: 3, callId: CALL, sessionId: PEER, linkId: LINK, messageId: MSG, delivery: 'accepted', initialModel }] }, 9)

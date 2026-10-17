@@ -1,136 +1,194 @@
-# dsh-session-link
+[中文](README.zh.md) | English
 
-[English](README.en.md) | 简体中文
+# DuoLink
 
-独立的 DeepSeek Harness 会话互联插件。0.5.0 保留原有互联、邮箱、自动唤醒、命令和 UI，新增**新会话的初始模型选择**。使用官方 `0.2.0-rc.2` 的公开接口，不修改宿主源码。
+`dsh-gc-duolink`
 
-## 使用
+Bidirectional Session messaging and utilities for DeepSeek Harness Desktop and Web: create links, exchange durable messages, manage wake budgets, spawn ordinary Sessions with an initial model and copy Session IDs. It uses official DSH `0.2.0-rc.2` public APIs without changing the Host.
 
-点击会话头栏「互联」，搜索已有会话、确认两个方向的自动唤醒，再点「建立互联」。右侧面板可打开对方会话、调整唤醒或确认解除。会话列表的右侧链条按钮和 `… → 会话互联…` 管理被点击的会话，不切换主对话。链条颜色只表示互联，与运行状态、唤醒开关无关。
+The current working tree uses independent DuoLink configuration, storage and protocol identities. It does not load or migrate old `dsh-session-link` settings, mail, link groups or ledgers. Existing archives under `output/` are historical snapshots and do not contain these working-tree changes. Development does not bump versions or create archives unless explicitly requested. See [namespace isolation](docs/plans/duolink-isolation.md) and [verification](VERIFICATION.md).
 
-双成员组按「我发消息 → 唤醒对方／对方发消息 → 唤醒我」显示；多人组按接收成员授权显示。同一成员的开关适用于该组全部发送方。新 UI 互联的两个开关默认开，需确认；旧组和人工关闭的开关不补授权。只有存在、未归档的普通顶层会话可以互联，重复会话对在串行队列内原子拒绝。
+## Usage
 
-消息带非人类来源，接收方获得消息文本，不共享模型历史或权限。运行中的接收方通过 follow-up 接收；空闲且无唤醒授权时，消息留在持久邮箱，等待下一轮工作。自动唤醒受每日、单消息和回复链预算限制。
+Choose **Copy Session ID** from a Session row's `…` menu to copy that row's full ID. No link is required. The menu closes after success; failures remain visible and retryable. The Clipboard API is preferred, with the original textarea copy fallback when unavailable or denied.
+
+Click **Links** in the Session header, find a peer, confirm the wake settings in both directions, and create the link. The right panel opens peers, changes wake settings and confirms unlinking. The sidebar's right-hand chain action and `… → Session links…` manage the clicked Session without switching the main conversation. Chain color indicates membership only, independently of execution and wake state.
+
+Two-member groups show “My messages → wake peer” and “Peer messages → wake me.” Larger groups grant wake permission per receiving member; that setting applies to every sender in the group. Both switches default to on for a new UI link and require confirmation. Existing groups and human-disabled switches receive no additional grants. Only existing, unarchived ordinary top-level Sessions can link. Duplicate Session pairs are rejected within the serialized admission queue.
+
+Messages carry non-human peer attribution. They share message text, not model history or permissions. A running peer receives a follow-up; an idle peer without a wake grant retains mail durably until its next turn. Automatic wakes obey daily, per-message and reply-chain budgets.
 
 ```text
-/session-link list
-/session-link add <peer-session-id> [wake]
-/session-link wake <peer-session-id> on|off
-/session-link revoke <link-id>
+/gc-duolink list
+/gc-duolink add <peer-session-id> [wake]
+/gc-duolink wake <peer-session-id> on|off
+/gc-duolink revoke <link-id>
 ```
 
-共五个供模型调用的工具：
+Five tools are available to the model:
 
-- `session_list_links`：查询互联。
-- `session_send_session_message`：发送或用 `in_reply_to` 回复，不能给自己发送；不支持选模。
-- `session_cancel_session_message`：取消尚未插入对方会话的消息。
-- `session_spawn_linked_session`：新建普通会话、互联并投递初始任务，可设置初始模型。
-- `session_list_models`：查询部署的 provider、model、effort 元数据，可按 `provider` 过滤。
+- `gc_duolink_list_links`: list links and reachable peers.
+- `gc_duolink_send_message`: send or reply with `in_reply_to`; self-send and model selection are rejected.
+- `gc_duolink_cancel_message`: cancel mail not yet inserted into the peer's Session.
+- `gc_duolink_spawn_session`: create an ordinary Session, link it and deliver its initial task; optionally select its initial model.
+- `gc_duolink_list_models`: query deployed provider/model/effort metadata, optionally filtered by `provider`.
 
-工具和命令按 preset 挂载到顶层 Agent 的 `agent.ctx`，不进入全局工具层。省略 `presets` 时包含 `standard`、`ptc`、`cordis` 和公开 registry 的有效默认 preset；显式列表是精确白名单，空列表禁用挂载。`minimal` 与子代理始终排除，归档会话不能执行工具。资格随 Agent 创建和 preset 切换重新检查；仅改变默认 preset 不主动重挂存量 Agent。
+Tools and commands mount in eligible top-level Agents' preset scopes, never globally. Omitting `presets` includes `standard`, `ptc`, `cordis` and the public registry's eligible effective default. An explicit list is an exact allowlist; an empty list disables mounting. Minimal and child Agents are excluded; archived Sessions cannot invoke these tools. Eligibility is checked at Agent creation and preset changes. Changing the default alone does not remount existing Agents.
 
-## 新会话的初始模型
+The managed Session's mailbox shows pending/recent mail, known blocking conditions and wake budgets. Either original participant can cancel ordinary queued mail. The button is a snapshot: the Host returns `cancelled`, `already_terminal` or `too_late` with the latest delivery state. Potentially held or delivered input cannot be recalled. Open the target's native Session to use the Host stop control when it is running. Unlinking neither stops a running Session nor recalls delivered input. Legacy experimental reports remain read-only diagnostics.
 
-先调用 `session_list_models` 查询目录，再给 spawn 传可选的严格对象：
+For information-only sends:
+
+```json
+{ "session_id": "session-peer-id", "message": "Sharing the result; no acknowledgement needed.", "wake": false }
+```
+
+Omitted `wake` or `true` retains existing behavior under link grants and budgets. `false` requests no idle wake or cold resume and spends no wake budget. Running peers still receive next-turn input, which may create another turn; other authorized wakes or human activity can also deliver queued mail in FIFO order. This is not a zero-compute guarantee. Intent is persisted with each message. Replays use the original record and cannot elevate `false` to `true`. Spawn does not accept `wake`; its initial task and independent wake grants are unchanged. New frames discourage courtesy-only replies and count the added guidance toward the byte limit; existing bodies are not rewritten. **Downgrading to a plugin that does not recognize `wake` may lose the no-wake semantics.**
+
+## Spawn directory and Workspace
+
+Omit `cwd` to inherit the caller's actual directory and Workspace, creating a peer top-level Session. An ungrouped caller produces an ungrouped peer and keeps its own membership unchanged.
+
+An explicit absolute `cwd` creates or reuses that exact directory's Workspace, even when it has never been opened in Desktop. Native Session creation makes missing directories. Workspace registration and membership are streamed to Desktop/Web without switching the current conversation. A subdirectory has its own Workspace; symlinks and dot segments reuse the canonical directory's existing registration and title.
+
+Ordinary and `initial_model` spawns share this rule. The first task is admitted only after placement succeeds. Failure reports the existing Session/link; retrying the same call finishes placement without duplicating the Session. Completed placement never restores a human's later detach or Workspace deletion. Pending placement refuses to recreate a deleted recorded Workspace. Old completed calls and historical ungrouped Sessions are not migrated. Omission without a caller directory, explicit null/blank values, and relative paths fail explicitly.
+
+```json
+{ "task": "Review this project in parallel and report the findings" }
+```
+
+## Initial model selection
+
+Query `gc_duolink_list_models`, then pass an optional strict object to spawn:
 
 ```json
 {
   "cwd": "/absolute/path/project",
-  "task": "完整、自包含的任务描述",
+  "task": "A complete, self-contained task description",
   "initial_model": {
-    "provider": "目录中的 provider ID",
-    "model": "该 provider 下的 model ID",
-    "reasoning_effort": "该模型支持的 effort ID"
+    "provider": "provider ID from the catalog",
+    "model": "model ID belonging to that provider",
+    "reasoning_effort": "effort ID supported by that exact model"
   }
 }
 ```
 
-`provider`、`model` 必填；`reasoning_effort` 可省略，省略时使用所选模型自身默认，不继承调用方 effort。对象不接受其它字段。未传 `initial_model` 时沿用原创建、建链和投递流程；所有 spawn 共用同调用并发锁，并发异参返回 `SPAWN_REPLAY_CONFLICT`，普通调用完成后的重放仍保持原兼容规则。目录存在只证明部署元数据可用，不证明鉴权有效或执行成功。
+Provider and model are required non-empty strings. Effort is optional: omission uses the selected model's own default, rather than the caller's effort. Extra nested fields are rejected. Without `initial_model`, spawn uses the original create/link/delivery flow. All spawn modes share a per-call concurrency lock: conflicting concurrent parameters return `SPAWN_REPLAY_CONFLICT`; ordinary completed-call replay retains its previous compatibility rules. Catalog membership is metadata, not proof of authentication or execution success.
 
-初始选择通过原生 `model/selection` 事件写入新会话，在第一条任务激活前持久确认；之后的请求与恢复完全交给原生 Session Controller。选择跨 turn 保留，用户后来在宿主 UI 改选的模型优先。插件不覆盖运行时模型选择，不修改应用默认模型，不提供临时任务路由、fallback 或模型失败重跑。
+The plugin writes the existing native `model/selection` event into the new Session and confirms durability before activation and task delivery. Native Session Controller owns subsequent requests and recovery. The choice persists across turns; later human model changes in the native UI take precedence. Spawn does not change the application default, override runtime selection, provide temporary task routes, perform fallback or rerun model failures.
 
-spawn 的第一段工具文本保持旧格式；第二段携带 version 1 的 `session-link/initial-model` 元数据。轨迹卡只标记**「初始会话模型」**，不把它当作当前模型或成功执行的证据。`queued` / `accepted` 仍只表示消息投递状态。
+The first spawn result text retains its original format. A second text block carries version 1 `gc-duolink/initial-model` metadata. The turn card labels it **Initial session model**, not the current model or evidence of successful execution. `queued` and `accepted` are delivery states only.
 
-同一调用重放复用原会话、互联组和任务。选模 spawn 对完整请求计算摘要，模型、完整任务、目录、标题或授权变化均拒绝；不能在重放时添加或移除 `initial_model`。未确认且已有同 ID 的会话不自动认领、修复或激活。创建成功但 ownership 确认前崩溃可能留下空的孤儿会话；报错说明需人工检查，插件不会覆盖或删除它。解除后的组不会因重放恢复。
+Replay reuses the original Session, link and task message. Selected spawn hashes the complete normalized request; changes to the model, full task, directory, title or grants are rejected. Replay cannot add or remove `initial_model`. An existing ID with unconfirmed ownership is never adopted, repaired or activated. A crash after Session creation but before ownership confirmation can leave an empty orphan Session; the error requests human inspection, and the plugin neither overwrites nor deletes it. Unlinked groups are never revived by replay.
 
-旧的顶层 `provider`、`model`、`reasoning_effort`、`model_scope`、`on_model_unavailable` 明确拒绝。发送工具也拒绝 `initial_model`。`session_get_task`、`session_resolve_task`、任务面板、任务卡和 `./tasks` 子导出已退出本版。
+Old top-level `provider`, `model`, `reasoning_effort`, `model_scope` and `on_model_unavailable` arguments are explicitly rejected. Send also rejects `initial_model`. Task decisions (`session_get_task`, `session_resolve_task`), task panels/cards and the `./tasks` export are retired.
 
-## 投递与唤醒
+## Delivery and wakes
 
-- `queued` 表示邮箱已持久保存；`accepted` 只在消息插入对方并 flush 成功后返回。两者都不表示对方已处理或完成任务。保存后投递失败保持 queued，重试投递同一条，不重复建任务。
-- 发送报错表示消息没有保存、在插入对方前已取消，或属于被阻止重放的遗留报告，不会之后偷偷投递。插入后取消不再生效；flush 失败继续恢复确认。同一目标按持久入队顺序投递。
-- 幂等 key 与消息同次写入；已取消、失败或撤销消息的 key 返回 `MESSAGE_UNDELIVERABLE`。`in_reply_to` 只能指向本会话已收到的消息；回复链预算跨组累计。
-- spawn 首任务欠一次预算内唤醒，`auto_awake` 控制后续消息，默认 false；`wake_caller` 默认跟随 `auto_awake`，可独立设为 false 或 true。首任务不会额外授予回程唤醒。重放使用首次固化的授权，不扩权。
-- UI / 命令创建 human grant，spawn 创建 session grant。解除阻止尚未投递的组内消息，已插入对方的消息不撤回。卸载先停止新操作、等待在途操作，再关闭存储。
+- `queued` means durably stored in the mailbox; `accepted` means inserted into the target and successfully flushed. Neither means processed or completed. A delivery failure after storage stays queued; retry delivers the same message.
+- A send error means the message was not stored, was cancelled before insertion, or names a blocked legacy report. It will not later be newly delivered. Cancellation after insertion cannot recall it; failed flushes retain receipt recovery. Each target receives mail in durable admission order.
+- Idempotency keys commit with their messages. Cancelled, failed and revoked keys return `MESSAGE_UNDELIVERABLE`. Replies must name a message received by this Session. Reply-chain budgets span groups.
+- Spawn owes its initial task one budgeted wake. `auto_awake` controls later messages and defaults to false. `wake_caller` defaults to `auto_awake` and can be set independently. The initial task does not add a return-direction grant. Replay preserves the original grants.
+- UI/command links carry human grants; spawn links carry Session grants. Unlinking blocks undelivered mail but cannot retract inserted input. Unload refuses new operations, waits for in-flight operations and then closes storage.
 
-## 安装
+## Installation
 
-先构建和打包。`dsh-agent-preset-registry` 和 `dsh-session-persistence` 是 optional peers，缺失时普通工具仍可挂载，带 `initial_model` 的调用明确拒绝。运行时 peers 从目标 DSH profile 解析；禁用自动安装 peers，避免拉入另一套宿主。
+Build the directory first; development installs use `link:` without archives. Preset-registry and session-persistence are optional peers: ordinary tools can mount without them; selected spawn explicitly refuses missing public bootstrap services. Runtime peers resolve from the target profile. Disable peer auto-installation to avoid a second Host dependency tree.
 
 ```sh
 pnpm install --frozen-lockfile
 env -u DSH_SOURCE_ROOT pnpm build
-pnpm pack
 ```
 
-Web 等普通 profile：
+For Web and other ordinary profiles:
 
 ```sh
-dsh plugin --profile web add --ignore-scripts --config.auto-install-peers=false /absolute/path/dsh-session-link-0.5.0.tgz
+dsh plugin --profile web add --ignore-scripts --config.auto-install-peers=false link:/absolute/path/dsh-gc-duolink
 ```
 
-Desktop profile 由 Electron 独占管理。先打开一次 Desktop 初始化 profile，再完全退出，使用应用自带 CLI：
+Electron exclusively manages Desktop profiles. Open Desktop once to initialize its profile, then quit it completely and use the bundled CLI:
 
 ```sh
 DESKTOP_DSH='/Applications/DeepSeek Harness.app/Contents/Resources/runtime/cli/bin/dsh'
-"$DESKTOP_DSH" plugin --profile desktop add --ignore-scripts --config.auto-install-peers=false /absolute/path/dsh-session-link-0.5.0.tgz
+"$DESKTOP_DSH" plugin --profile desktop add --ignore-scripts --config.auto-install-peers=false link:/absolute/path/dsh-gc-duolink
 ```
 
-重新打开后生效。Desktop 运行时不要做包操作。应用内 Plugins 页面可查看和启停插件；最后一个安装参数也可换成构建好的目录 `link:/absolute/path/dsh-session-link`。构建或隔离验证不会切换用户当前 profile。
+Reopen the application afterward. Do not perform package operations while Desktop is running. The Plugins page can inspect, enable and disable the bundle. The final argument can also be `link:/absolute/path/dsh-gc-duolink` for a built local directory. Build and isolated checks do not switch an existing profile.
 
-### 从 0.4.1 升级
+### Independent installation
 
-普通互联版 0.4.1 可用上述 `add` 命令覆盖安装同名包，无需先卸载；原互联关系和历史消息保留。Desktop 更新前完全退出应用，更新后重新打开。
+Configure DuoLink as a fresh plugin. Recreate desired links and wake permissions through its UI or `/gc-duolink`; old plugin state is not imported, renamed, copied or deleted. Only the new configuration row IDs below affect DuoLink. The shared profile file `cordis.patch.yml` belongs to DSH; old rows in that file do not override DuoLink.
 
-实验性任务路由版也使用过 0.4.1 版本号，不能只按版本号判断兼容性。若使用过顶层选模参数、task scope、fallback 或 `session_get_task` / `session_resolve_task`，先检查该 profile 的实验数据；本版不自动迁移这类 profile。
+The default JSON backend stores DuoLink state at `$DSH_HOME/storages/gc_duolink.json`. It never falls back to `session_link.json`. A persisted product marker identifies owned storage; an old or foreign nonempty file copied to the new path is rejected. Do not manually rename old data files as a migration.
 
-fork 若已内置同名服务，切换时需先关闭旧服务、旧 UI 和各 preset 的旧工具／命令，使外置插件成为唯一实现。**已运行 tracked-task 实验版的 profile 不自动原地迁移或降级**；带 `statusKind` 或 `taskStatus` 标记的遗留状态报告会保留原记录，但不投递、不唤醒；显式重放返回 `LEGACY_TASK_MESSAGE_BLOCKED`。这不覆盖未标记的任务邮件或宿主专属事件，切换前仍必须人工检查这些数据；本版不迁移、不自动清理历史存储域。
+The standalone `dsh-client-ui-copy-session-id` source remains available. Disable its separate UI contribution when using DuoLink's built-in copy action to avoid duplicate menus. Building and validation do not change actual user profiles.
 
-卸载：Web 用 `dsh plugin --profile web remove dsh-session-link`；Desktop 退出后用 `"$DESKTOP_DSH" plugin --profile desktop remove dsh-session-link`。卸载保留已记录会话消息和 `session_link` 数据，不恢复旧模型、不回滚用户的原生选择。
+Uninstall Web with `dsh plugin --profile web remove dsh-gc-duolink`; for Desktop, quit first and use `"$DESKTOP_DSH" plugin --profile desktop remove dsh-gc-duolink`. Removal retains DuoLink data and Session history.
 
-## 配置
+## Local directory and GitHub
 
-profile 的 `cordis.patch.yml` 可覆盖配置；补丁替换整行 config，需写全希望保留的自定义项。
+The real checkout is `/Users/gc/Dev/MyProject/dsh-plugin/dsh-gc-duolink`. Its `.git`, `master`, commits and uncommitted changes are retained. There is no compatibility symlink at the old directory name. Existing old-profile dependency specs are not rewritten by source changes.
+
+The existing GitHub repository has been renamed to [cskeleton/dsh-gc-duolink](https://github.com/cskeleton/dsh-gc-duolink), retaining its history, issues, tags and releases. Local `origin` now points to:
+
+```text
+https://github.com/cskeleton/dsh-gc-duolink.git
+```
+
+The former repository URL redirects to the new address; do not reuse the former name. English is the default `README.md`, with Chinese in `README.zh.md` and a language link on the first line. See [GitHub's documentation](https://docs.github.com/en/repositories/creating-and-managing-repositories/renaming-a-repository).
+
+## Configuration
+
+The plugin bundle file is `gc-duolink.patch.yml`. All externally registered identities are independent:
+
+| Surface | DuoLink identity |
+|---|---|
+| Service / tools / command configuration rows | `gc-duolink` / `tool-gc-duolink` / `command-gc-duolink` |
+| Storage domain | `gc_duolink` |
+| Service and RPC | `gcDuolink` / `gcDuolink/*` |
+| Command | `/gc-duolink` |
+| Message source | `gc-duolink-message` |
+| Initial-model metadata | `gc-duolink/initial-model` |
+
+A profile's `cordis.patch.yml` can override configuration. A patch replaces the whole row configuration, so restate custom values you want to retain.
 
 ```yaml
-- id: session-link
+- id: gc-duolink
   config:
     uiPollIntervalMs: 30000
     maxLinkMembers: 8
     maxPendingPerTarget: 16
     maxMessageBytes: 16384
-    maxAutoWakesPerSessionPerDay: 6
+    maxAutoWakesPerSessionPerDay: 12
     maxAutoWakesPerMessage: 1
-    maxAutoWakesPerChain: 4
+    maxAutoWakesPerChain: 8
     maxDeliveryAttempts: 3
 ```
 
-非默认自定义 preset 可显式列出；工具与命令两行需同时调整：
+Defaults are 8 automatic wakes per reply chain, 12 per Session per UTC day, and 1 per message. The existing fields above override those defaults; explicit configuration wins. Configuration is read when the plugin loads, so reload the plugin after editing. Initial tasks still count, both directions share a chain, and historical chain usage does not reset each day.
+
+An ordinary queued message whose chain budget is exhausted offers **Increase wake allowance**. Clicking opens a dialog with 4, 8 or a custom 1–100 additional wakes, the new limit, the receiving Session's daily budget and other known blockers. **Add and continue** persists the extension and attempts delivery of the selected message; Cancel neither writes nor wakes. The dialog never opens automatically.
+
+Extensions belong only to that reply chain, shared across directions and groups, without resetting historical usage. Durable receipts prevent retry duplication; conflicting concurrent confirmations show the new budget and require another confirmation. Daily/message limits, wake grants, `wake:false`, archive state and unsupported task-report rejection still apply. Terminal messages are not resent and removed links are not restored. A legitimate wake can still co-deliver other queued mail in existing FIFO order. Allowance results and delivery results are distinct and never certify task completion. Only the human UI extends budgets; the five model tools are unchanged.
+
+Downgrading to a version that does not recognize extension receipts may lose extra allowance and retry facts; no downgrade migration guarantee is provided. See the [development plan](docs/plans/chain-wake-budget.md).
+
+For custom presets, configure both tool and command rows:
 
 ```yaml
-- id: tool-session-link
+- id: tool-gc-duolink
   config:
     presets: [standard, ptc, cordis, coding, my-custom-preset]
-- id: command-session-link
+- id: command-gc-duolink
   config:
     presets: [standard, ptc, cordis, coding, my-custom-preset]
 ```
 
-`uiPollIntervalMs` 范围 1000–2147483647。UI 共用宿主 view，在有订阅时轮询，写入确认或连接重置后刷新；失败保留最后读到的数据并显示重试。
+The poll interval is 1000–2147483647 milliseconds. UI consumers share the Host view, poll while subscribed and refresh after confirmed writes or connection resets. Failures retain the last data and expose retry.
 
-## 开发与验证
+## Development and verification
 
-默认使用 npm `0.2.0-rc.2` 开发 SDK，不要求 source checkout 或 task-host 扩展。
+Official npm `0.2.0-rc.2` SDK packages are the default. No source checkout or task-host extension is required.
 
 ```sh
 env -u DSH_SOURCE_ROOT pnpm typecheck
@@ -138,22 +196,24 @@ env -u DSH_SOURCE_ROOT pnpm build
 env -u DSH_SOURCE_ROOT pnpm test
 ```
 
-`pnpm test` 包括客户端、初始模型单位测试、原生 proof、packed 工具验收与构建契约；构建契约需要先 build。官方原生 proof 为 19 次 mock 请求，packed 工具验收为 30 次，均无付费调用。客户端 56 项、初始模型 55 项、契约 3 项，以及另行运行的辅助 host 回归 120 项通过。浏览器 smoke 和验证边界见 [VERIFICATION.md](VERIFICATION.md)。
+The default test command runs client tests, initial-model unit tests, native proof, linked-directory tools integration and built contracts; build first. Default validation creates no install archive. Current checks include 111 client tests, 56 initial-model tests, 3 built contracts and 260 auxiliary Host tests. Installed-directory model proof makes 46 mock requests and zero paid calls. Browser evidence and exact boundaries are in [VERIFICATION.md](VERIFICATION.md).
 
 ```sh
+BROWSER_EXECUTABLE_PATH='/Applications/Brave Browser.app/Contents/MacOS/Brave Browser' pnpm test:workspace-installed
+# Full mailbox UI and old-plugin isolation scenario:
 BROWSER_EXECUTABLE_PATH='/Applications/Brave Browser.app/Contents/MacOS/Brave Browser' pnpm test:integration
 ```
 
-这些安装验证使用一次性 home/profile，不修改用户运行实例。说明见 [tests/integration/README.md](tests/integration/README.md)。`DSH_SOURCE_ROOT=/absolute/path/deepseek-harness pnpm test:host` 仅运行原四组辅助宿主回归；source declarations 可辅助开发，不能替代官方 SDK 构建和 packed 验证。
+Installation checks use disposable homes/profiles, without changing the user's running instance. See [integration documentation](tests/integration/README.md). `DSH_SOURCE_ROOT=/absolute/path/deepseek-harness pnpm test:host` runs six auxiliary Host suites, including the independent M1 review and real Workspace placement regressions. Source declarations can aid development but do not replace official SDK and linked-directory installation evidence.
 
-## 兼容性与限制
+## Isolation and limitations
 
-保留 `session_link` version 1、三张表、`session-link-message` 来源及原邮箱语义；ledger 增加可选 `initialModelSpawns`，记录完整请求摘要、`headerCreated`、`seedConfirmed` 等创建事实。旧记录缺字段按空读，无新任务域或 Session 日志格式。模型初始化使用宿主已有事件，不引入新的运行时模型 owner。
+Old package configuration rows, RPC, commands, tool names, message attribution and storage paths have no aliases. The five tools use the `gc_duolink_` prefix. Reopening the current DuoLink domain preserves its own mail, spawn facts and wake budgets; that restart behavior is separate from old-plugin compatibility. Unsafe experimental task-report payloads remain blocked as a defensive check, not an import mechanism. Model selection initialization remains native-owned.
 
-客户端运行时只加载冻结模块表中的 React、JSX runtime 和 ReactDOM；控件、样式、协议校验、状态与翻译在包内。Remote 由公开服务发现，不生成 `./typert` / `./remote` 或改宿主 allowlist。轨迹尾卡依赖可选 `uiConversation`，缺席时其它 UI 仍可用。
+The browser loads only React, JSX runtime and ReactDOM from the frozen module table. Controls, styles, parsing, state and translations are local to the package. Public services expose Remote methods; there are no generated `./typert`/`./remote` entries or Host allowlist changes. The turn-tail card depends on optional `uiConversation`; other UI remains available without it.
 
-用户停止会清空 Agent inbox，因此已送达不等于模型已读；以对方回复为准。邮箱与台账不自动清理，长期大量使用需关注规模。卸载等待在途操作没有超时。Desktop Electron 本轮未测试；未来宿主版本需重新验证。
+Stopping an Agent clears its inbox, so delivered does not mean read; rely on the peer's reply. Mail and ledgers have no automatic cleanup. Unload waits for in-flight work without a timeout. Electron and paid remote-model execution have not been verified; future Host releases require fresh checks.
 
-用户已反馈 0.5.0 初步测试通过；未提供具体环境及覆盖范围，不能据此扩大 Electron 或付费模型的验证结论。
+The user reported preliminary 0.5.0 testing passed, without specifying the environment or coverage. This does not extend the Electron or paid-model verification claims.
 
-旧模型路由计划、审查和路线图保留为历史证据，并明确标为已废弃。0.5.0 用前向源码修改取代实验版本，保留 Git 历史；DSH 仓库中的旧扩展不属于当前依赖，也不随本插件提交回退。详见 [架构与历史处理决定](docs/decisions/001-plugin-only-initial-model.md)。
+Old routing plans, reviews and the roadmap remain marked as retired historical evidence. Version 0.5.0 replaces the experiment with forward source changes and preserves Git history. Old extensions in the separate DSH repository are neither current dependencies nor reverted by this plugin commit. See the [architecture and history decision](docs/decisions/001-plugin-only-initial-model.md).

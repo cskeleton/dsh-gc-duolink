@@ -1,0 +1,7 @@
+- insert:
+    - id: gc-duolink
+      name: dsh-gc-duolink
+    - id: tool-gc-duolink
+      name: dsh-gc-duolink/tools
+    - id: command-gc-duolink
+      name: dsh-gc-duolink/command

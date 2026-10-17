@@ -1,11 +1,11 @@
 /**
- * Model-facing Session Link tools over `ctx.sessionLinks`. Link creation is
+ * Model-facing Session Link tools over `ctx.gcDuolink`. Link creation is
  * always host-authorized at the service: the spawn tool requests
  * `grantedBy: { kind: 'session' }` from the exact live caller's own turn, and
  * broad UI management grants use `kind: 'human'`. The tools register in the
  * scope of top-level Agents whose preset the row config lists, never in the
  * global tool layer. Named exports preserve loader injection metadata.
- * @module dsh-session-link/tool-session-link
+ * @module dsh-gc-duolink/tool-session-link
  */
 
 import { createHash } from 'node:crypto'
@@ -30,14 +30,14 @@ const retiredModelFields = ['provider', 'model', 'reasoning_effort', 'model_scop
 function modelParameterError(exec: Readonly<ToolExecution>, result: Readonly<ToolExecutionResult>): { type: 'text'; text: string }[] | undefined {
   if (!result.isError || exec.arguments === null || typeof exec.arguments !== 'object') return undefined
   const fields = Object.keys(exec.arguments)
-  if (!fields.some(key => retiredModelFields.includes(key) || (exec.name === 'session_send_session_message' && key === 'initial_model'))) return undefined
-  return [{ type: 'text', text: exec.name === 'session_send_session_message'
-    ? 'MODEL_PARAMETERS_REMOVED: send accepts no model selection. Use session_spawn_linked_session with initial_model to configure a new Session.'
+  if (!fields.some(key => retiredModelFields.includes(key) || (exec.name === 'gc_duolink_send_message' && key === 'initial_model'))) return undefined
+  return [{ type: 'text', text: exec.name === 'gc_duolink_send_message'
+    ? 'MODEL_PARAMETERS_REMOVED: send accepts no model selection. Use gc_duolink_spawn_session with initial_model to configure a new Session.'
     : 'MODEL_PARAMETERS_REMOVED: top-level model/task-routing parameters are retired. Use initial_model: {provider, model, reasoning_effort?} only when spawning a new Session.' }]
 }
 
-export const name = 'tool-session-link'
-export const inject = ['tools', 'agents', 'sessions', 'sessionLinks', 'sessionController', 'sessionTitle']
+export const name = 'tool-gc-duolink'
+export const inject = ['tools', 'agents', 'sessions', 'gcDuolink', 'sessionController', 'sessionTitle']
 
 /** Row configuration: which presets' top-level Agents receive the tools. */
 export type Config = PresetScopeConfig
@@ -50,7 +50,7 @@ function requireCaller(ctx: Context, exec: { agent?: Agent }): Agent {
   if (agent === undefined || ctx.agents.get(agent.id) !== agent) {
     throw new Error('this tool requires the exact live calling agent on a top-level Session')
   }
-  ctx.sessionLinks.assertOrdinaryTarget(agent.id, agent.session.header)
+  ctx.gcDuolink.assertOrdinaryTarget(agent.id, agent.session.header)
   return agent
 }
 
@@ -102,7 +102,7 @@ function reason(error: unknown): string {
  */
 export function apply(ctx: Context, config: Config = {}): void {
   const tools = definitions(ctx)
-  mountPerPresetAgent(ctx, resolvePresets(config), 'session-link-tools', ['tools'], (scoped) => {
+  mountPerPresetAgent(ctx, resolvePresets(config), 'gc-duolink-tools', ['tools'], (scoped) => {
     for (const tool of tools) scoped.tools.register(tool)
   })
 }
@@ -110,11 +110,11 @@ export function apply(ctx: Context, config: Config = {}): void {
 /** The tool definitions, bound to the row context's services. */
 function definitions(ctx: Context): ToolDefinition[] {
   return [defineTool({
-    name: 'session_list_links',
+    name: 'gc_duolink_list_links',
     description:
       'List the Session Link groups whose members this Session may peer-message, '
       + 'and the other ordinary top-level Sessions reachable through them. Links '
-      + 'are created by the human in the UI or by session_spawn_linked_session. '
+      + 'are created by the human in the UI or by gc_duolink_spawn_session. '
       + 'A link opens a message channel only; it does not share file history, '
       + 'model context, or permission overrides.',
     parameters: {},
@@ -163,7 +163,7 @@ function definitions(ctx: Context): ToolDefinition[] {
     async execute(_args, exec) {
       const caller = requireCaller(ctx, exec)
       return {
-        links: ctx.sessionLinks.list(caller.id).map(link => ({
+        links: ctx.gcDuolink.list(caller.id).map(link => ({
           linkId: String(link.id),
           name: link.name,
           peers: link.memberIds
@@ -178,7 +178,7 @@ function definitions(ctx: Context): ToolDefinition[] {
     },
     presentCall: () => ({ card: 'generic', title: 'List session links', kind: 'other' }),
   }), defineTool({
-    name: 'session_send_session_message',
+    name: 'gc_duolink_send_message',
     description:
       'Send one message to another ordinary top-level Session linked to this one, '
       + 'or reply to a message this Session received. Sender identity is derived from '
@@ -187,12 +187,15 @@ function definitions(ctx: Context): ToolDefinition[] {
       + 'Delivery never interrupts the peer mid-turn: it runs as the peer\'s own '
       + 'next turn. A peer with an auto-wake grant may be woken; otherwise the '
       + 'message waits durably for the peer\'s next turn. Returns durable acceptance, '
-      + 'not the peer\'s answer — do not assume the task ran or completed.',
+      + 'not the peer\'s answer — do not assume the task ran or completed. '
+      + 'Set wake=false for information-only mail: no idle wake or cold resume is requested. '
+      + 'Running peers still receive next-turn input; other activity may deliver queued mail. '
+      + 'Replay preserves the original wake intent. Reply only with substantive results, questions or blockers.',
     parameters: {
       session_id: {
         type: 'string',
         required: true,
-        description: 'The peer Session id, obtainable from session_list_links.',
+        description: 'The peer Session id, obtainable from gc_duolink_list_links.',
       },
       message: {
         type: 'string',
@@ -201,7 +204,11 @@ function definitions(ctx: Context): ToolDefinition[] {
       },
       in_reply_to: {
         type: 'string',
-        description: 'Message id of a session_link message this Session received, when replying.',
+        description: 'Message id of a gc_duolink message this Session received, when replying.',
+      },
+      wake: {
+        type: 'boolean',
+        description: 'Whether this message may request an idle wake under existing grants and budgets. Defaults to true. False never cold-resumes or spends wake budget, but running peers still receive next-turn input. Replays use the stored intent.',
       },
     },
     output: {
@@ -222,9 +229,10 @@ function definitions(ctx: Context): ToolDefinition[] {
         throw new Error('MODEL_PARAMETERS_REMOVED: send accepts no model selection; use initial_model on a new spawn')
       }
       const caller = requireCaller(ctx, exec)
-      const result = await ctx.sessionLinks.send(caller, brandString<SessionId>(args.session_id), {
+      const result = await ctx.gcDuolink.send(caller, brandString<SessionId>(args.session_id), {
         targetId: brandString<SessionId>(args.session_id),
         text: args.message,
+        ...(args.wake === undefined ? {} : { wake: args.wake }),
         ...(args.in_reply_to === undefined ? {} : { inReplyTo: SessionLinkMessageId(args.in_reply_to) }),
         idempotencyKey: String(exec.callId),
         signal: exec.signal,
@@ -234,7 +242,7 @@ function definitions(ctx: Context): ToolDefinition[] {
     presentCall: args => ({ card: 'generic', title: `Message session ${args.session_id}`, kind: 'other' }),
     finalizeContent: modelParameterError,
   }), defineTool({
-    name: 'session_cancel_session_message',
+    name: 'gc_duolink_cancel_message',
     description:
       'Cancel one of this Session\'s still-pending peer messages. Cancellation is '
       + 'durable and prevents any later delivery; a message already recorded by the '
@@ -243,7 +251,7 @@ function definitions(ctx: Context): ToolDefinition[] {
       message_id: {
         type: 'string',
         required: true,
-        description: 'The mailbox message id returned by session_send_session_message or session_spawn_linked_session.',
+        description: 'The mailbox message id returned by gc_duolink_send_message or gc_duolink_spawn_session.',
       },
     },
     output: {
@@ -270,13 +278,13 @@ function definitions(ctx: Context): ToolDefinition[] {
     async execute(args, exec) {
       const caller = requireCaller(ctx, exec)
       const messageId = SessionLinkMessageId(args.message_id)
-      await ctx.sessionLinks.cancel(caller, messageId)
-      const record = ctx.sessionLinks.message(messageId)
+      await ctx.gcDuolink.cancel(caller, messageId)
+      const record = ctx.gcDuolink.message(messageId)
       return { messageId: args.message_id, status: record?.status ?? 'cancelled' }
     },
     presentCall: args => ({ card: 'generic', title: `Cancel message ${args.message_id}`, kind: 'other' }),
   }), defineTool({
-    name: 'session_spawn_linked_session',
+    name: 'gc_duolink_spawn_session',
     description:
       'Create a NEW independent top-level Session in a directory you choose, assign '
       + 'it one task, and link it to this Session bidirectionally. The new Session is '
@@ -290,12 +298,13 @@ function definitions(ctx: Context): ToolDefinition[] {
       + 'Both wake directions remain subject to daily, per-message, and reply-chain budgets. '
       + 'Replaying a call never expands an existing group\'s grants or re-enables a human-disabled flag. '
       + 'Concurrent calls with the same call id must use the same complete parameters, including initial_model mode; otherwise SPAWN_REPLAY_CONFLICT is returned. '
-      + 'Returns the new Session id for session_list_links / session_send_session_message.',
+      + 'Omit cwd to inherit this Session\'s directory and Workspace (including Ungrouped). '
+      + 'An explicit cwd creates or reuses its own Workspace, visible in the desktop/web sidebar even if never opened before. '
+      + 'Returns the new Session id for gc_duolink_list_links / gc_duolink_send_message.',
     parameters: {
       cwd: {
         type: 'string',
-        required: true,
-        description: 'Fully qualified directory the new Session owns. It does not need to exist.',
+        description: 'Optional fully qualified directory. Omission inherits this Session directory and Workspace; an explicit directory gets its own Workspace. It does not need to exist.',
       },
       task: {
         type: 'string',
@@ -342,15 +351,18 @@ function definitions(ctx: Context): ToolDefinition[] {
         type: 'text',
         text: `session ${value.sessionId} created and linked (${value.linkId}); task message ${value.messageId} ${value.status}`,
       }, ...value.initialModel === undefined ? [] : [{ type: 'text' as const, text:
-        JSON.stringify({ type: 'session-link/initial-model', version: 1, initialModel: value.initialModel,
+        JSON.stringify({ type: 'gc-duolink/initial-model', version: 1, initialModel: value.initialModel,
           description: 'Initial Session configuration, not execution success. Later native UI model changes are retained.' }),
       }]],
     },
     async execute(args, exec) {
       const caller = requireCaller(ctx, exec)
-      const cwd = args.cwd.trim()
-      if (cwd === '') throw new Error('cwd must not be empty')
-      if (!cwd.startsWith('/')) throw new Error(`cwd must be fully qualified, got ${JSON.stringify(args.cwd)}`)
+      const inheritWorkspace = args.cwd === undefined
+      const directory = args.cwd ?? caller.session.header.cwd
+      if (directory === undefined) throw new Error('cwd is required because this Session has no working directory')
+      const cwd = inheritWorkspace ? directory : directory.trim()
+      if (cwd.trim() === '') throw new Error('cwd must not be empty')
+      if (!cwd.startsWith('/')) throw new Error(`cwd must be fully qualified, got ${JSON.stringify(directory)}`)
       if (args.task.trim() === '') throw new Error('task must not be empty')
       const title = args.title === undefined || args.title.trim() === ''
         ? (relative('/', cwd) || cwd).split('/').filter(part => part !== '').at(-1) ?? 'linked-session'
@@ -360,21 +372,22 @@ function definitions(ctx: Context): ToolDefinition[] {
       const request = selection === undefined ? undefined : {
         sessionId: spawnedSessionId(caller.id, callKey), cwd, task: args.task, title,
         autoWake: args.auto_awake === true, wakeCaller: args.wake_caller ?? (args.auto_awake === true), selection,
+        ...(inheritWorkspace ? { inheritWorkspace: true } : {}),
       }
       const spawn = async () => {
-        if (selection === undefined && ctx.sessionLinks.initialModelSpawn(caller.id, callKey) !== undefined) {
+        if (selection === undefined && ctx.gcDuolink.initialModelSpawn(caller.id, callKey) !== undefined) {
           throw new Error('INITIAL_MODEL_REPLAY_CONFLICT: this call was created with initial_model; replay requires the same full parameters')
         }
         let initialized: Awaited<ReturnType<typeof bootstrapInitialModel>> | undefined
         if (request !== undefined) {
           if (!hasInitialModelCapability(ctx)) throw new Error('INITIAL_MODEL_CAPABILITY_UNAVAILABLE: required public services are absent; nothing created or dispatched')
-          const reserved = ctx.sessionLinks.initialModelSpawn(caller.id, callKey)
+          const reserved = ctx.gcDuolink.initialModelSpawn(caller.id, callKey)
           if (reserved !== undefined && reserved.digest !== initialModelSpawnDigest(request)) throw new Error('INITIAL_MODEL_REPLAY_CONFLICT: spawn parameters differ from the recorded request')
           if (reserved?.seedConfirmed !== true) await validateInitialModel(ctx, request.selection)
           initialized = await bootstrapInitialModel(ctx, caller.id, callKey, request, exec.signal)
         }
         // Earlier attempts of this call decide before anything is created or linked.
-        const prior = ctx.sessionLinks.spawnReplay(caller.id, callKey)
+        const prior = ctx.gcDuolink.spawnReplay(caller.id, callKey)
         if (prior?.removed === true) throw new Error(unlinkedReplay(callKey, prior.sessionId))
         const sessionId = initialized?.sessionId ?? prior?.sessionId ?? (await ctx.sessionController.create({
           cwd,
@@ -385,26 +398,34 @@ function definitions(ctx: Context): ToolDefinition[] {
         let linkId: SessionLinkId
         try {
           linkId = prior?.task === undefined
-            ? await ctx.sessionLinks.claimSpawnLink(caller.id, sessionId, callKey, title, args.auto_awake === true, args.wake_caller ?? (args.auto_awake === true))
+            ? await ctx.gcDuolink.claimSpawnLink(caller.id, sessionId, callKey, title, args.auto_awake === true, args.wake_caller ?? (args.auto_awake === true))
             : prior.linkId
         } catch (error: unknown) {
           if (error instanceof SessionLinkError && error.code === 'LINK_REVOKED') {
             throw new Error(unlinkedReplay(callKey, sessionId))
           }
           throw new Error(`session ${sessionId} was created in ${cwd} but could not be linked: ${reason(error)}. `
-            + 'It holds no task; tell the human so they can link it with /session-link add or archive it.')
+            + 'It holds no task; tell the human so they can link it with /gc-duolink add or archive it.')
+        }
+        if (prior?.task === undefined) {
+          try {
+            await ctx.gcDuolink.placeSpawnWorkspace(caller.id, callKey, cwd, inheritWorkspace)
+          } catch (error: unknown) {
+            throw new Error(`SPAWN_WORKSPACE_FAILED: session ${sessionId} was created and linked (${linkId}), `
+              + `but workspace placement failed; no task was admitted: ${reason(error)}. Retry this spawn call to finish placement.`)
+          }
         }
         if (prior?.task === undefined) {
           try {
             await ctx.sessionController.rename({ sessionId, title })
           } catch (error: unknown) {
             // The title is cosmetic: the Session is linked and receives its task under its default title.
-            ctx.logger.warn(`session-link: renaming spawned session "${sessionId}" failed: ${reason(error)}`)
+            ctx.logger.warn(`gc-duolink: renaming spawned session "${sessionId}" failed: ${reason(error)}`)
           }
         }
-        let result: Awaited<ReturnType<typeof ctx.sessionLinks.send>>
+        let result: Awaited<ReturnType<typeof ctx.gcDuolink.send>>
         try {
-          result = await ctx.sessionLinks.send(caller, sessionId, {
+          result = await ctx.gcDuolink.send(caller, sessionId, {
             targetId: sessionId,
             text: args.task,
             idempotencyKey: callKey,
@@ -413,7 +434,7 @@ function definitions(ctx: Context): ToolDefinition[] {
         } catch (error: unknown) {
           // A send failure means the task was never stored or was cancelled before delivery.
           throw new Error(`session ${sessionId} was created and linked (${linkId}), but its task was not delivered and will not be: `
-            + `${reason(error)}. Resend the task with session_send_session_message; it still starts the new Session.`)
+            + `${reason(error)}. Resend the task with gc_duolink_send_message; it still starts the new Session.`)
         }
         return {
           sessionId: String(sessionId),
@@ -424,15 +445,15 @@ function definitions(ctx: Context): ToolDefinition[] {
         }
       }
       const flightDigest = request === undefined
-        ? createHash('sha256').update(JSON.stringify(['ordinary-spawn-flight-v1', cwd, args.task, title, args.auto_awake === true, args.wake_caller ?? (args.auto_awake === true)])).digest('hex')
+        ? createHash('sha256').update(JSON.stringify(['ordinary-spawn-flight-v1', cwd, args.task, title, args.auto_awake === true, args.wake_caller ?? (args.auto_awake === true), inheritWorkspace])).digest('hex')
         : initialModelSpawnDigest(request)
       // A Cordis service getter can return a fresh proxy; the captured row Context is stable.
       return await initialModelSpawnFlight(ctx, `${caller.id}:${callKey}`, flightDigest, spawn)
     },
-    presentCall: args => ({ card: 'generic', title: `Spawn session in ${args.cwd}`, kind: 'other' }),
+    presentCall: args => ({ card: 'generic', title: args.cwd === undefined ? 'Spawn session in current workspace' : `Spawn session in ${args.cwd}`, kind: 'other' }),
     finalizeContent: modelParameterError,
   }), defineTool({
-    name: 'session_list_models',
+    name: 'gc_duolink_list_models',
     description: 'List deployment provider/model/effort metadata for initial_model on a NEW Session. Directory presence is not authentication or execution success; no task routing or fallback is provided.',
     parameters: { provider: { type: 'string', description: 'Optional exact provider filter.' } },
     output: { schema: { type: 'json' }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
@@ -444,7 +465,7 @@ function definitions(ctx: Context): ToolDefinition[] {
   })].map(tool => {
     // defineTool's implicit root is open. Close our public spawn/catalog schemas,
     // including the same object its execution validator captures.
-    if (['session_spawn_linked_session', 'session_list_models'].includes(tool.name)) {
+    if (['gc_duolink_spawn_session', 'gc_duolink_list_models'].includes(tool.name)) {
       Object.assign(tool.parameters, { additionalProperties: false })
     }
     return tool

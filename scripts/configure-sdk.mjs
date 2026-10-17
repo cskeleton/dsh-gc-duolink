@@ -20,6 +20,7 @@ if (sdkRoot) {
     }).filter(candidate => candidate && (candidate.includes('*') || existsSync(candidate)))
     if (declarations.length) paths[name] = declarations
   }
+  // Do not let the Host's unrelated old plugin enter DuoLink's type graph.
   delete paths['@deepseek-ai/dsh-session-link']
   delete paths['@deepseek-ai/dsh-session-link/types']
 }

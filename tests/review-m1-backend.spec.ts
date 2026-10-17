@@ -32,7 +32,7 @@ async function setup() {
   await ctx.plugin(SessionLinkService, {})
   await ctx.agentLoop.create(alice, { provider: 'mock', model: 'mock' })
   const target = await ctx.agentLoop.create(bob, { provider: 'mock', model: 'mock' })
-  return { ctx, service: ctx.sessionLinks, target }
+  return { ctx, service: ctx.gcDuolink, target }
 }
 async function mail(service: SessionLinkService, id: string, patch: Partial<SessionLinkMessageRecordData>) {
   await service['messages'].put(SessionLinkMessageId(id), {

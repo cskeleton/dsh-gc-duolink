@@ -73,7 +73,7 @@ function fixture(extraSessions: SessionLinkSessionView[] = []) {
   })
   const props: LinkProps = {
     sessionId: SELF, useLinks: selector(source), refresh: source.refresh,
-    link, setWake, unlink, loadActivity: vi.fn(async () => emptyActivity()),
+    link, setWake, unlink, cancelMessage: vi.fn(), loadActivity: vi.fn(async () => emptyActivity()),
     mail: createMailController({
       load: vi.fn(async () => emptyActivity()),
       pollIntervalMs: () => 3_600_000,
@@ -232,7 +232,7 @@ describe('quick header and right-side row entry', () => {
     await act(async () => { await f.setWake(LINK, PEER, false) })
     fireEvent.click(screen.getByRole('button', { name: '1 linked session(s) · Manage links' }))
     expect(openPanelFor).toHaveBeenCalledWith(PEER)
-    expect(screen.getByRole('button').className).toContain('slp-row-linked')
+    expect(screen.getByRole('button').className).toContain('gcdl-row-linked')
   })
 
   it('offers an unlinked row and joins the formal menu with dismissal', async () => {

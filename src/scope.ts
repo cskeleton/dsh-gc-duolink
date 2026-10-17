@@ -4,7 +4,7 @@
  * `config.plugins`; instead each row registers into the scope of every live
  * top-level Agent whose bound preset is listed, and follows later preset
  * selections and plugin unload.
- * @module dsh-session-link/scope
+ * @module dsh-gc-duolink/scope
  */
 
 import type { Context } from '@deepseek-ai/cordis'

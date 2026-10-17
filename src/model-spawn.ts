@@ -16,6 +16,8 @@ export interface InitialModelSpawnRequest {
   autoWake: boolean
   wakeCaller: boolean
   selection: InitialModelSelection
+  /** Omission preserves the digest of explicit-directory calls from 0.5.0–0.5.2. */
+  inheritWorkspace?: boolean
 }
 
 /** Full normalized payload, never a prefix of the task or model name. */
@@ -24,6 +26,7 @@ export function initialModelSpawnDigest(request: InitialModelSpawnRequest): stri
     'initial-model-spawn-v1', request.sessionId, request.cwd, request.task, request.title,
     request.autoWake, request.wakeCaller, request.selection.provider, request.selection.model,
     request.selection.reasoningEffort ?? null,
+    ...(request.inheritWorkspace === true ? ['inherit-workspace'] : []),
   ])).digest('hex')
 }
 
@@ -60,7 +63,7 @@ async function readSeed(ctx: Context, record: InitialModelSpawnRecord, expected:
   const handle = await ctx.get('sessionPersistence')!.open(record.sessionId, 'read')
   try {
     if (!sameHeader(handle.header, expected) || handle.inheritedEventCount !== 0) throw new Error('INITIAL_MODEL_SESSION_CONFLICT: stored Session identity does not match this creation intent')
-    ctx.sessionLinks.assertOrdinaryTarget(record.sessionId, handle.header)
+    ctx.gcDuolink.assertOrdinaryTarget(record.sessionId, handle.header)
     const { events } = await handle.read()
     if (events[0]?.type !== 'model/selection' || !sameSelection(events[0].data, record.selection)) throw new Error('INITIAL_MODEL_SEED_UNCONFIRMED: initial selection is missing or mismatched')
     if (onlySeed && (events.length !== 1 || ctx.agents.get(record.sessionId) !== undefined || ctx.sessions.get(record.sessionId) !== undefined)) {
@@ -71,8 +74,8 @@ async function readSeed(ctx: Context, record: InitialModelSpawnRecord, expected:
 
 async function bootstrapFailure(ctx: Context, sessionId: SessionId, callerId: SessionId, callKey: string, stage: string, error: unknown): Promise<never> {
   const state = await ctx.get('sessionPersistence')!.stat(sessionId).catch(() => undefined)
-  const priorDelivery = ctx.sessionLinks.spawnReplay(callerId, callKey)?.task
-  const linked = ctx.sessionLinks.list(callerId).some(link => link.memberIds.includes(sessionId))
+  const priorDelivery = ctx.gcDuolink.spawnReplay(callerId, callKey)?.task
+  const linked = ctx.gcDuolink.list(callerId).some(link => link.memberIds.includes(sessionId))
   throw new Error(`INITIAL_MODEL_SPAWN_FAILED (${stage}): sessionId=${sessionId}, sessionExists=${state === undefined ? 'unknown-or-no' : 'yes'}, linked=${linked}, taskStored=${priorDelivery !== undefined}, taskDelivery=${priorDelivery?.status ?? 'not-dispatched'}. ${error instanceof Error ? error.message : String(error)}`, { cause: error })
 }
 
@@ -81,7 +84,7 @@ export async function bootstrapInitialModel(ctx: Context, callerId: SessionId, c
   signal?.throwIfAborted()
   if (!hasInitialModelCapability(ctx)) throw new Error('INITIAL_MODEL_CAPABILITY_UNAVAILABLE: public native bootstrap services are not mounted; no Session or task was created')
   const digest = initialModelSpawnDigest(request)
-  const prior = ctx.sessionLinks.initialModelSpawn(callerId, callKey)
+  const prior = ctx.gcDuolink.initialModelSpawn(callerId, callKey)
   let preset = prior?.preset
   if (prior?.seedConfirmed !== true) {
     try {
@@ -93,7 +96,7 @@ export async function bootstrapInitialModel(ctx: Context, callerId: SessionId, c
       return await bootstrapFailure(ctx, prior.sessionId, callerId, callKey, 'preset', error)
     }
   }
-  const record = await ctx.sessionLinks.reserveInitialModelSpawn(callerId, callKey, {
+  const record = await ctx.gcDuolink.reserveInitialModelSpawn(callerId, callKey, {
     sessionId: request.sessionId, cwd: request.cwd, digest, preset: preset!, title: request.title,
     autoWake: request.autoWake, wakeCaller: request.wakeCaller, selection: request.selection,
     createdAt: prior?.createdAt ?? Date.now(), headerCreated: false, seedConfirmed: false,
@@ -102,8 +105,8 @@ export async function bootstrapInitialModel(ctx: Context, callerId: SessionId, c
     version: SESSION_FORMAT_VERSION, id: record.sessionId, cwd: record.cwd, agentPreset: record.preset,
     createdAt: record.createdAt, isSeeded: false, delegationDepth: 0,
   }
-  ctx.sessionLinks.assertOrdinaryTarget(record.sessionId, header)
-  const replay = ctx.sessionLinks.spawnReplay(callerId, callKey)
+  ctx.gcDuolink.assertOrdinaryTarget(record.sessionId, header)
+  const replay = ctx.gcDuolink.spawnReplay(callerId, callKey)
   if (replay?.removed) throw new Error(`INITIAL_MODEL_LINK_REVOKED: session ${record.sessionId} was unlinked; replay will not restore it`)
   let stage = 'seed'
   try {
@@ -121,7 +124,7 @@ export async function bootstrapInitialModel(ctx: Context, callerId: SessionId, c
         : await ctx.get('sessionPersistence')!.open(record.sessionId, 'write')
       try {
         if (!sameHeader(handle.header, header) || handle.inheritedEventCount !== 0) throw new Error('INITIAL_MODEL_SESSION_CONFLICT: stored identity differs')
-        if (!record.headerCreated) await ctx.sessionLinks.confirmInitialModelSpawn(callerId, callKey, digest, 'headerCreated')
+        if (!record.headerCreated) await ctx.gcDuolink.confirmInitialModelSpawn(callerId, callKey, digest, 'headerCreated')
         const { events } = await handle.read()
         if (events.length === 0) {
           const detached = ctx.sessions.prepare(record.sessionId, { meta: header })
@@ -136,12 +139,12 @@ export async function bootstrapInitialModel(ctx: Context, callerId: SessionId, c
       } finally { await handle.close() }
       stage = 'verify'
       await readSeed(ctx, record, header, true)
-      await ctx.sessionLinks.confirmInitialModelSpawn(callerId, callKey, digest, 'seedConfirmed')
+      await ctx.gcDuolink.confirmInitialModelSpawn(callerId, callKey, digest, 'seedConfirmed')
     }
     stage = 'activate'
     signal?.throwIfAborted()
     // A delivered/queued receipt replays through the original send recovery path.
-    if (ctx.sessionLinks.spawnReplay(callerId, callKey)?.task !== undefined) return { ...record, headerCreated: true, seedConfirmed: true }
+    if (ctx.gcDuolink.spawnReplay(callerId, callKey)?.task !== undefined) return { ...record, headerCreated: true, seedConfirmed: true }
     // The native observation owns any later preset selection, just as it owns model selection.
     const created = await ctx.sessionController.create({ sessionId: record.sessionId, cwd: record.cwd })
     if (created.sessionId !== record.sessionId) throw new Error('INITIAL_MODEL_SESSION_CONFLICT: native controller returned another identity')

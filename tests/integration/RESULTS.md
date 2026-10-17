@@ -1,8 +1,50 @@
-# Current installed results — 0.5.0 / 2026-10-13
+# DuoLink isolation working tree — 2026-10-18
 
-Official DSH 0.2.0-rc.2 native proof: PASS, 19 mock / 0 paid calls. Packed initial-model tools: PASS, 30 mock / 0 paid calls. Packed Web/Brave smoke: PASS, 0 model calls; five tools are scoped, explicit IDs adopt, invalid plugin configuration leaves core usable, and removed plugin histories remain readable. Current light/dark screenshots were visually inspected. Electron is NOT_RUN.
+The old-package compatibility decision in earlier records below is superseded. No new archive or version bump was made.
 
-Full commands, artifact links and evidence boundaries are in [VERIFICATION.md](../../VERIFICATION.md); machine-readable results are under `output/`. No user profile was switched. The previous record below is retained as history.
+- Browser: PASS with official DSH 0.2.0-rc.2 and Brave, installing the built directory through `link:`. The invalid old configuration row is ignored, old service/RPC/tool/command aliases are absent, the old storage file remains byte-identical, and the independent new file carries a durable product marker. Full existing UI smoke including clipboard copy passes; 0 model calls. [Result](../../output/playwright-isolation/installed-smoke-result.json).
+- Installed-directory model proof: PASS, 46 mock requests / 0 paid calls; new tool names and metadata, same-domain recovery and plugin-free native resume. `installationMode` is `built directory link`. [Result](../../output/initial-model-installed-result.json).
+- Storage boundaries, failed writes and behavioral regressions: 260 Host tests; client/scope: 111; initial-model unit tests: 56; built contracts: 3. [Verification](../../VERIFICATION.md).
+- Existing archives, actual profiles, HEAD and branch retained. The old directory compatibility symlink is removed. Existing old links/settings are not migrated.
+
+Earlier records are historical and do not describe current backwards compatibility.
+
+---
+
+# DuoLink 0.6.0 — 2026-10-18
+
+- Fresh packed `dsh-gc-duolink` install: PASS on official DSH 0.2.0-rc.2 + Brave. Real Copy Session ID menu copies the clicked unlinked Session ID to the clipboard without switching the foreground conversation. Full existing UI smoke and removal/history checks passed; 0 model calls. [Result](../../output/playwright/installed-smoke-result.json).
+- Rename migration from the preserved `dsh-session-link` 0.5.3 tgz: PASS. Real old link remains readable after package replacement; storage and profile overrides retained byte for byte; only the new bundle remains enabled. Full UI smoke passed; 0 model calls. [Result](../../output/playwright-rename/installed-smoke-result.json).
+- Native model proof: PASS, 19 mock requests / 0 paid calls. Packed new-name model proof: PASS, 46 mock requests / 0 paid calls. [Full verification](../../VERIFICATION.md).
+- No user profile installation, Electron run, GitHub rename, commit, push or publication occurred.
+
+Earlier records below are historical.
+
+---
+
+# 0.5.3 Workspace placement — 2026-10-16
+
+PASS on official `dsh 0.2.0-rc.2` using a disposable home/profile and the packed plugin. The extended native/packed fixture validates omitted-cwd inheritance for ordinary and selected-model spawns under both grouped and ungrouped callers; explicit existing-unregistered and nonexistent directories; child-directory isolation; canonical symlink reuse; human detach/replay; and membership after an actual Host restart. Packed proof: five phases, 46 mock model requests, zero paid calls. Native proof: four phases, 19 mock requests, zero paid calls.
+
+The isolated Brave/shipped Web GUI subscribes before placement and observes a new directory group without reload, then opens the spawned conversation and reloads to check persistence. Evidence: [installed JSON](../../output/initial-model-installed-result.json), [native JSON](../../output/initial-model-proof-result.json), [screenshot](../../output/playwright-workspace/workspace-live-created.png). Workspace/browser verification runs with `pnpm test:workspace-installed`; preview acknowledgement is preseeded in the disposable overlay to retain the configuration-purity assertion. User profiles and the running Desktop app are untouched. Desktop Electron itself, a user-profile upgrade and the full historical mailbox UI smoke are NOT_RUN in this iteration.
+
+See [VERIFICATION.md](../../VERIFICATION.md) for 423 unit/regression/contract checks and final archive details.
+
+---
+
+# Latest installation result — 0.5.2 / 2026-10-14
+
+PASS: isolated 0.5.1→0.5.2 upgrade through the same `pluginManager/installBundle` RPC as the GUI. Repeated identical local file spec reproduced pnpm success / ambiguous-install; a new version/path identified the bundle, reported restart-required and installed current client bytes. Restarted temporary Host then passed the full browser suite including wake extension dialog, with 0 model calls. Evidence: [upgrade result](../../output/playwright-install-upgrade/installed-smoke-result.json). Build and 4 contract tests pass, including immutable release packaging. No user Desktop changes were made; actual Electron installation remains NOT_RUN.
+
+Prior functional evidence below remains applicable to the byte-identical runtime code; it is not described as a new full unit/native run for the version-only 0.5.2 delivery.
+
+# Current functional results — 0.5.1 wake extensions / 2026-10-14
+
+Official DSH 0.2.0-rc.2 native proof: PASS, 19 mock / 0 paid calls. Packed proof: PASS, 39 mock / 0 paid calls, including 8 actual bidirectional wakes, queued ninth message, human +4 continuation exactly once, concurrent request idempotency and persisted extension replay after Host restart. Client/scope 105, initial-model 55, contracts 3 and auxiliary Host 237 checks pass (400 total).
+
+Packed Web/Brave smoke: PASS, 0 model calls. The exhausted-chain dialog uses a clearly marked imported-history fixture and tests modal open/cancel/focus, choices and invalid inputs, actual append RPC, truthful continued queueing under another blocker, duplicate/stale confirmations and prior M1/M2 scenarios. Light/dark/narrow modal screenshots were visually inspected under output/playwright-wake-extension/. Electron is NOT_RUN.
+
+See [VERIFICATION.md](../../VERIFICATION.md) for commands, artifacts and exact boundaries. No user profile was changed. The local 0.5.1 package and integrity manifest are under output/0.5.1/; older records below are historical.
 
 <details>
 <summary>Earlier installed-smoke record</summary>

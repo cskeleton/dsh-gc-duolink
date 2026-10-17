@@ -19,6 +19,9 @@ const phases = (process.env.INITIAL_MODEL_PROOF_PHASES ?? (packedPlugin ? 'seed,
 const timeoutMs = Number(process.env.INITIAL_MODEL_PROOF_TIMEOUT_MS ?? 60_000)
 const reports = []
 const configurationIntegrity = []
+const checkWorkspaceBrowser = packedPlugin && process.env.WORKSPACE_PLACEMENT_BROWSER === '1'
+let workspaceBrowser
+let workspaceBrowserEvidence
 let temp
 let child
 let installation
@@ -108,6 +111,17 @@ async function runPhase(phase, env, overlay, workspace, configuration) {
   currentPhase = phase
   phaseOutput = ''
   const reportPath = join(temp, `${phase}.json`)
+  let browserReady
+  const startBrowser = () => {
+    if (!checkWorkspaceBrowser || phase !== 'seed' || browserReady !== undefined) return
+    const match = /dsh web:\s+(https?:\/\/[^\s]+)/.exec(phaseOutput)
+    if (match === null) return
+    browserReady = import('./workspace-browser-proof.mjs')
+      .then(({ openWorkspaceBrowser }) => openWorkspaceBrowser(match[1], env.INITIAL_MODEL_PROOF_BROWSER_GATE,
+        join(project, 'output/playwright-workspace')))
+      .then(value => { workspaceBrowser = value })
+    return browserReady
+  }
   const result = await new Promise((resolveResult, reject) => {
     let stdout = ''
     let settled = false
@@ -128,12 +142,14 @@ async function runPhase(phase, env, overlay, workspace, configuration) {
     child.on('exit', (code, signal) => finish(new Error(`Phase ${phase} exited before its report (code=${code}, signal=${signal})`)))
     child.stderr.on('data', chunk => {
       phaseOutput = (phaseOutput + chunk.toString()).slice(-32_768)
+      startBrowser()?.catch(error => finish(error))
       const failure = /initial-model-proof-fixture[^\n]*(?:failed to import|pending \(waiting for)[^\n]*/.exec(phaseOutput)
       if (failure) finish(new Error(`Phase ${phase} fixture did not activate: ${sanitized(failure[0])}`))
     })
     child.stdout.on('data', chunk => {
       stdout += chunk.toString()
       phaseOutput = (phaseOutput + chunk.toString()).slice(-32_768)
+      startBrowser()?.catch(error => finish(error))
       let newline
       while ((newline = stdout.indexOf('\n')) !== -1) {
         const line = stdout.slice(0, newline).trim()
@@ -146,7 +162,6 @@ async function runPhase(phase, env, overlay, workspace, configuration) {
   })
   // Let queued Host configuration writes settle before shutdown and inspect the durable bytes afterward.
   await new Promise(resolve => setTimeout(resolve, 300))
-  await stopChild()
   const persisted = JSON.parse(await readFile(reportPath, 'utf8'))
   assert.equal(persisted.phase, result.phase, `Phase ${phase} stdout and persisted phase differ`)
   assert.equal(persisted.status, result.status, `Phase ${phase} stdout and persisted status differ`)
@@ -155,6 +170,14 @@ async function runPhase(phase, env, overlay, workspace, configuration) {
   assert.equal(persisted.status, 'PASS', `Phase ${phase}: ${persisted.error ?? JSON.stringify(persisted.checks)}`)
   assert.equal(persisted.paidModelCalls, 0, `Phase ${phase} made a paid model call`)
   assert.ok(Number.isInteger(persisted.mockModelCalls) && persisted.mockModelCalls >= 0, 'Fixture reports a mock call count')
+  if (checkWorkspaceBrowser && phase === 'seed') {
+    assert.ok(browserReady, 'Host exposed an authenticated browser URL')
+    await browserReady
+    workspaceBrowserEvidence = await workspaceBrowser.verify(persisted.workspacePlacement)
+    await workspaceBrowser.close()
+    workspaceBrowser = undefined
+  }
+  await stopChild()
   if (phase === 'seed' || phase === 'execute') {
     const profilePatch = await configContent(configuration.profilePatchPath)
     const overlayAfter = await configContent(overlay)
@@ -192,6 +215,8 @@ try {
     INITIAL_MODEL_PROOF_WORKSPACE: workspace,
     INITIAL_MODEL_PROOF_INSTALLATION_PACKAGE: installation.packageJson,
     INITIAL_MODEL_PROOF_PLUGIN: packedPlugin ? '1' : '0',
+    INITIAL_MODEL_PROOF_WORKSPACE_REPORT: join(temp, 'workspace-placement.json'),
+    ...(checkWorkspaceBrowser ? { INITIAL_MODEL_PROOF_BROWSER_GATE: join(temp, 'workspace-browser-ready') } : {}),
   }
   // Never let the project's development aliases or a source tree select Host packages.
   delete env.DSH_SOURCE_ROOT
@@ -204,12 +229,10 @@ try {
     cwd: workspace, env, timeout: 60_000, maxBuffer: 4 * 1024 * 1024,
   })
   if (packedPlugin) {
-    const { stdout } = await runFile('npm', ['pack', '--json', '--pack-destination', temp], { cwd: project, env, timeout: 60_000 })
-    const tarball = join(temp, JSON.parse(stdout)[0].filename)
-    await runFile(installation.binary, ['plugin', '--profile', 'initial-model-proof', 'add', '--ignore-scripts', '--config.auto-install-peers=false', tarball], { cwd: workspace, env, timeout: 120_000, maxBuffer: 4 * 1024 * 1024 })
+    await runFile(installation.binary, ['plugin', '--profile', 'initial-model-proof', 'add', '--ignore-scripts', '--config.auto-install-peers=false', `link:${project}`], { cwd: workspace, env, timeout: 120_000, maxBuffer: 4 * 1024 * 1024 })
   }
   const manifest = JSON.parse(await readFile(join(home, 'profiles/initial-model-proof/package.json'), 'utf8'))
-  assert.equal(Boolean(manifest.dependencies?.['dsh-session-link']), packedPlugin)
+  assert.equal(Boolean(manifest.dependencies?.['dsh-gc-duolink']), packedPlugin)
   const overlay = join(temp, 'initial-model-proof.patch.yml')
   const isolatedFixture = join(temp, 'initial-model-fixture.mjs')
   await copyFile(fixture, isolatedFixture)
@@ -225,6 +248,9 @@ try {
     '- id: agent-default-model', '  config:', '    provider: initial-proof', '    model: BASE', '    reasoningEffort: low',
     '- id: system-prompt', '  config:', "    personaPrefix: 'proof provider={{provider}} model={{model}}'",
     '- id: ui-settings-models', '  config:', '    credentialOnboarding: false',
+    // Match the shipped preview-copy version; acknowledging it in the browser
+    // would otherwise mutate profile configuration during the purity check.
+    ...(checkWorkspaceBrowser ? ['- id: ui-settings-general', '  config:', "    welcomeNoticeVersion: '2026-09-28.1'"] : []),
     '- id: ui-plugin-manager', '  config:', '    registryProbeEnabled: false',
     '- id: workspace-controller', '  config:', `    documentsDirectory: ${JSON.stringify(join(temp, 'Documents'))}`,
     '- insert:', '    - id: proof-diagnostics', `      name: ${JSON.stringify(diagnosticsFixture)}`,
@@ -238,17 +264,19 @@ try {
   }
   for (const phase of phases) {
     if (packedPlugin && phase === 'resume') {
-      await runFile(installation.binary, ['plugin', '--profile', 'initial-model-proof', 'remove', 'dsh-session-link'], { cwd: workspace, env, timeout: 120_000, maxBuffer: 4 * 1024 * 1024 })
+      await runFile(installation.binary, ['plugin', '--profile', 'initial-model-proof', 'remove', 'dsh-gc-duolink'], { cwd: workspace, env, timeout: 120_000, maxBuffer: 4 * 1024 * 1024 })
     }
     await runPhase(phase, env, overlay, workspace, configuration)
   }
   const mockModelCalls = reports.reduce((count, report) => count + report.mockModelCalls, 0)
   assert.ok(mockModelCalls > 0, 'Proof must exercise real Agent requests through the mock model provider')
-  summary = { status: 'PASS', installation, pluginInstalled: packedPlugin, pluginRemovedBeforeResume: packedPlugin, sourceCheckoutUsed: false, paidModelCalls: 0, mockModelCalls, configurationIntegrity, phases: reports }
+  summary = { status: 'PASS', installation, pluginInstalled: packedPlugin, installationMode: packedPlugin ? 'built directory link' : 'native only', pluginRemovedBeforeResume: packedPlugin, sourceCheckoutUsed: false, paidModelCalls: 0, mockModelCalls, configurationIntegrity, phases: reports,
+    ...(workspaceBrowserEvidence === undefined ? {} : { workspaceBrowser: workspaceBrowserEvidence }) }
 } catch (error) {
   summary = { status: 'FAIL', installation, phase: currentPhase, configurationIntegrity, phases: reports, error: sanitized(error.stack ?? error), diagnostics: sanitized(phaseOutput) }
   process.exitCode = 1
 } finally {
+  await workspaceBrowser?.close()
   await stopChild()
   if (temp) await rm(temp, { recursive: true, force: true })
 }

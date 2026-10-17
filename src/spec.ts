@@ -2,13 +2,15 @@
  * The Session Link domain declaration: durable schemas for link groups,
  * mailbox entries, and the throttle ledgers the service opens through
  * `ctx.storageDomain`.
- * @module dsh-session-link/spec
+ * @module dsh-gc-duolink/spec
  */
 
 import { z } from 'zod'
 import { brandString } from '@deepseek-ai/dsh-brand'
 import type { SessionId } from '@deepseek-ai/dsh-session'
+import type { WorkspaceId } from '@deepseek-ai/dsh-workspace'
 import { defineDomain, domainTable } from '@deepseek-ai/dsh-storage-domain'
+import type { Domain } from '@deepseek-ai/dsh-storage-domain'
 import { SessionLinkId, SessionLinkMessageId } from './types.ts'
 
 const sessionId = z.string().transform(value => brandString<SessionId>(value))
@@ -37,6 +39,8 @@ export const sessionLinkMessageSchema = z.object({
   targetId: sessionId,
   inReplyTo: messageId.optional(),
   text: z.string(),
+  /** Missing on old mail; only explicit false suppresses an idle wake request. */
+  wake: z.boolean().optional(),
   status: z.union([
     z.literal('pending'),
     z.literal('delivered'),
@@ -53,7 +57,7 @@ export const sessionLinkMessageSchema = z.object({
   idempotencyKey: z.string().optional(),
   /** Monotonic admission sequence; absent on messages admitted before 0.4.0. */
   seq: z.number().int().positive().optional(),
-  /** Set before the message is handed to the target; such a message is never made terminal. */
+  /** Pre-insertion intent, not a receipt; cold targets must conservatively be treated as holding it. */
   inserted: z.boolean().optional(),
   /** Legacy experimental report markers must survive decoding; 0.5 never executes them. */
   statusKind: z.json().optional(),
@@ -65,13 +69,6 @@ export type SessionLinkRecordData = z.infer<typeof sessionLinkRecordSchema>
 
 /** Inferred mailbox record type, shared with the runtime module. */
 export type SessionLinkMessageRecordData = z.infer<typeof sessionLinkMessageSchema>
-
-/**
- * Call-site idempotency map: `senderId:idempotencyKey` → admitted message id.
- * Read-only since 0.3.3, which stores the key on the message itself; kept for
- * messages admitted by earlier versions.
- */
-export const sessionLinkIdempotencySchema = z.record(z.string(), z.string())
 
 /** Per-session automatic-wake ledger: session id → day-keyed counter. */
 export const sessionLinkWakeLedgerSchema = z.record(
@@ -98,6 +95,11 @@ export const sessionLinkSpawnLedgerSchema = z.record(
     removed: z.boolean().optional(),
     /** Creation intent's original grants; replay cannot widen these from changed arguments. */
     autoWakeSessionIds: z.array(sessionId).optional(),
+    /** Target is fixed before attach; completion prevents replay from undoing human edits. */
+    workspacePlacement: z.object({
+      workspaceId: z.string().transform(value => brandString<WorkspaceId>(value)).optional(),
+      completed: z.boolean(),
+    }).optional(),
   }),
 )
 
@@ -121,15 +123,22 @@ export const initialModelSpawnSchema = z.object({
 export type InitialModelSpawnRecord = z.infer<typeof initialModelSpawnSchema>
 
 /**
- * One durable ledgers row: the idempotency map, the wake ledger, and the spawn
- * ledger. Rows written before the spawn ledger existed read it as empty.
+ * One durable DuoLink ledgers row: wake counters, spawn facts and extension receipts.
  */
 export const sessionLinkLedgersSchema = z.object({
-  idempotency: sessionLinkIdempotencySchema,
   wakes: sessionLinkWakeLedgerSchema,
   spawns: sessionLinkSpawnLedgerSchema.default({}),
   initialModelSpawns: z.record(z.string(), initialModelSpawnSchema).default({}),
-})
+  /** Append facts also serve as durable retry receipts; never delete them or reset wake history. */
+  chainWakeExtensions: z.record(z.string(), z.object({
+    rootId: messageId,
+    sessionId,
+    messageId,
+    additional: z.number().int().min(1).max(100),
+    expectedExtra: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+    createdAt: z.string(),
+  })).default({}),
+}).strict()
 
 /** Inferred ledgers row type, shared with the runtime module. */
 export type SessionLinkLedgersData = z.infer<typeof sessionLinkLedgersSchema>
@@ -140,11 +149,11 @@ export type SessionLinkLedgersData = z.infer<typeof sessionLinkLedgersSchema>
  * the domain's identity, version, and schemas.
  */
 export const sessionLinkDomainSpec = defineDomain({
-  name: 'session_link',
+  name: 'gc_duolink',
   version: 1,
   global: {
-    schema: z.object({ initialized: z.boolean() }),
-    initial: { initialized: true },
+    schema: z.object({ product: z.literal('dsh-gc-duolink'), initialized: z.boolean() }),
+    initial: { product: 'dsh-gc-duolink', initialized: false },
   },
   tables: {
     links: domainTable<SessionLinkId, SessionLinkRecordData>(sessionLinkRecordSchema),
@@ -152,3 +161,15 @@ export const sessionLinkDomainSpec = defineDomain({
     ledgers: domainTable<string, SessionLinkLedgersData>(sessionLinkLedgersSchema),
   },
 })
+
+/** Stamp a fresh domain; never adopt a nonempty store without DuoLink ownership. */
+export async function initializeDuolinkDomain(domain: Domain<typeof sessionLinkDomainSpec>): Promise<void> {
+  if (domain.global.get().initialized) return
+  for (const table of ['links', 'messages', 'ledgers'] as const) {
+    for (const _ of domain.table(table).entries()) {
+      throw new Error('DuoLink refuses records without its storage ownership marker; old or foreign data cannot be imported')
+    }
+  }
+  // The Host's global.initial is an in-memory default, so explicitly persist ownership.
+  await domain.global.set({ product: 'dsh-gc-duolink', initialized: true })
+}

@@ -5,6 +5,9 @@ import type {
   SessionLinkActivitySummary,
   SessionLinkActivityView,
   SessionLinkBlockingReason,
+  SessionLinkCancelResult,
+  SessionLinkExtendWakeResult,
+  SessionLinkWakeBudget,
   SessionLinkSessionView,
   SessionLinkSummary,
   SessionLinkView,
@@ -32,7 +35,7 @@ function session(value: unknown): value is SessionLinkSessionView {
 
 const STATUSES = new Set(['pending', 'delivered', 'cancelled', 'failed', 'revoked'])
 const REASONS = new Set<SessionLinkBlockingReason>([
-  'wake-unauthorized', 'wake-budget', 'archived', 'cold-target',
+  'wake-unauthorized', 'wake-not-requested', 'wake-budget', 'archived', 'cold-target',
   'delivery-unverified', 'link-revoked', 'unknown',
 ])
 
@@ -51,6 +54,38 @@ function activityEntry(value: unknown): value is SessionLinkActivityEntry {
     && typeof value.preview === 'string'
     && (value.lastError === undefined || typeof value.lastError === 'string')
     && typeof value.canCancel === 'boolean'
+    && (value.wakeBudget === undefined || isWakeBudget(value.wakeBudget))
+    && Array.isArray(value.blockingReasons) && value.blockingReasons.every(reason => REASONS.has(reason))
+}
+
+/** A bounded, internally consistent budget; malformed facts never reach controls. */
+export function isWakeBudget(value: unknown): value is SessionLinkWakeBudget {
+  if (!record(value) || typeof value.rootId !== 'string' || value.rootId.length === 0
+    || !record(value.chain) || !record(value.targetDay) || !record(value.message)
+    || typeof value.canExtend !== 'boolean') return false
+  const { chain, targetDay, message } = value
+  const safe = (number: unknown): number is number => typeof number === 'number' && Number.isSafeInteger(number) && number >= 0
+  return [chain.used, chain.baseLimit, chain.extra, chain.limit, chain.remaining,
+    targetDay.used, targetDay.limit, message.used, message.limit].every(safe)
+    && safe(chain.baseLimit) && safe(chain.extra) && safe(chain.limit) && safe(chain.used)
+    && chain.limit === chain.baseLimit + chain.extra
+    && chain.remaining === Math.max(0, chain.limit - chain.used)
+    && typeof targetDay.day === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(targetDay.day)
+    && typeof targetDay.resetsAt === 'string' && !Number.isNaN(Date.parse(targetDay.resetsAt))
+}
+
+/** Extension acknowledgements preserve the Host's continuation boundary. */
+export function isExtendWakeResult(value: unknown): value is SessionLinkExtendWakeResult {
+  return record(value) && typeof value.messageId === 'string' && value.messageId.length > 0
+    && typeof value.requestId === 'string' && value.requestId.length >= 1 && value.requestId.length <= 128
+    && typeof value.outcome === 'string' && ['applied', 'replayed', 'conflict'].includes(value.outcome)
+    && typeof value.status === 'string' && STATUSES.has(value.status)
+    && typeof value.continuation === 'string' && ['accepted', 'queued', 'not_pending', 'not_attempted'].includes(value.continuation)
+    && (value.continuation !== 'accepted' || value.status === 'delivered')
+    && (value.continuation !== 'queued' || value.status === 'pending')
+    && (value.continuation !== 'not_pending' || value.status !== 'pending')
+    && (value.outcome !== 'conflict' || value.continuation === 'not_attempted')
+    && isWakeBudget(value.budget)
     && Array.isArray(value.blockingReasons) && value.blockingReasons.every(reason => REASONS.has(reason))
 }
 function activitySummary(value: unknown): value is SessionLinkActivitySummary {
@@ -77,7 +112,7 @@ export function isLinkView(value: unknown): value is SessionLinkView {
 }
 
 /**
- * Narrow one `sessionLinks/activityView` response before entries reach controls.
+ * Narrow one `gcDuolink/activityView` response before entries reach controls.
  * @param value - untrusted wire response.
  * @returns whether it carries a consistent page, summary, and optional cursor.
  */
@@ -87,4 +122,12 @@ export function isActivityView(value: unknown): value is SessionLinkActivityView
     && Array.isArray(value.entries) && value.entries.every(activityEntry)
     && (value.nextCursor === undefined || typeof value.nextCursor === 'string')
     && activitySummary(value.summary)
+}
+
+/** A cancellation result reports the Host's actual boundary, never a void success. */
+export function isCancelResult(value: unknown): value is SessionLinkCancelResult {
+  if (!record(value) || typeof value.messageId !== 'string' || value.messageId.length === 0 || typeof value.status !== 'string') return false
+  return (value.outcome === 'cancelled' && value.status === 'cancelled')
+    || (value.outcome === 'already_terminal' && ['delivered', 'cancelled', 'failed', 'revoked'].includes(value.status))
+    || (value.outcome === 'too_late' && (value.status === 'pending' || value.status === 'delivered'))
 }

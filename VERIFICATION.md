@@ -1,8 +1,172 @@
-# Verification — 0.5.0 plugin-only initial model
+# Verification — independent DuoLink namespaces (working tree)
 
-日期：2026-10-13（M1 里程碑节与复审收尾节更新至 2026-10-14）。本节是 0.5.0 基线验收；**当前验收以「M1 里程碑验证」及其「第二轮/第三轮复审」小节为准**，下方折叠内容保留旧实验版历史，不构成本版依赖或需求。实施决策与任务关闭见 [PLUGIN_ONLY_EXECUTION.md](PLUGIN_ONLY_EXECUTION.md)。
+日期：2026-10-18。本节取代此前保留旧插件配置、存储路径和协议的决定；下方记录只说明当时的历史验证。`package.json` 版本仍为 0.6.1，本轮未生成或覆盖任何 tgz，也未 commit/push、修改实际用户 profile 或重启 Desktop。
 
-## 当前结果
+当前配置文件为 `gc-duolink.patch.yml`，配置行 `gc-duolink` / `tool-gc-duolink` / `command-gc-duolink`；服务/RPC 为 `gcDuolink`，存储域为 `gc_duolink`，默认 JSON 文件为 `$DSH_HOME/storages/gc_duolink.json`。命令 `/gc-duolink`，五个工具使用 `gc_duolink_` 前缀，来源标记 `gc-duolink-message`，初始模型元数据 `gc-duolink/initial-model`。客户端 locale、tab、轨迹节点、DOM 与 CSS 标识同步隔离。无旧名别名、旧路径回退或自动迁移；旧目录兼容软链接已移除。
+
+| 检查 | 当前结果与证据 |
+|---|---|
+| 客户端与 scope | PASS；`pnpm test:client`，111/111，含新 RPC/locale/轨迹工具名/复制功能 |
+| 初始模型单位测试 | PASS；两组测试 56/56，使用新的服务与工具名称 |
+| Host 源码辅助回归 | PASS；`DSH_SOURCE_ROOT=/Users/gc/Dev/Opensource/deepseek-harness pnpm test:host`，260/260，6 files |
+| 旧存储隔离与拒绝误接管 | PASS；Host 测试向旧 `session_link` 域放入不兼容记录/版本，新服务不读写它；复制旧 global 到新域明确拒绝；非空且 global 为 null 的旧格式也拒绝，不写身份标记；新域 marker 显式持久化 |
+| 类型、构建与运行时契约 | PASS；`pnpm typecheck`、`pnpm build`、`pnpm test:contracts`，3/3；配置文件/三行 ID、RPC 和 product schema 均核验 |
+| 安装目录模型 proof | PASS；`pnpm test:initial-model-installed`，`link:` 到构建目录，46 次 mock、0 付费调用，含新工具/元数据、重启幂等和卸载后原生恢复；[JSON](output/initial-model-installed-result.json) 的 `installationMode` 为 `built directory link` |
+| 真实浏览器隔离 | PASS；Brave + 官方 DSH 0.2.0-rc.2，构建目录链接到隔离 profile；旧配置故意填非法值仍不影响新配置、旧 RPC/service/tool/command 无别名、旧文件字节不变、新存储有身份标记；完整邮件/复制/唤醒 UI 通过，0 模型调用；[JSON](output/playwright-isolation/installed-smoke-result.json) |
+| 无版本/安装包迭代 | PASS；对照任务开始前快照，版本仍为 0.6.1，全部 tgz 清单和 SHA256 未变，HEAD/master 未变，独立复制插件未改；README 链接、配置文件清单和 `git diff --check` 通过 |
+
+存储身份处理先从浏览器复现出 `global.initial` 不自动写盘，再核对官方已安装 domain 实现，增加显式 `global.set` 和非空未标记存储拒绝检查。旧幂等账本字段/回退读取已删除；危险任务报告的防执行检查保留，它不导入旧插件数据。
+
+默认集成验证不再运行 `npm pack`，默认契约检查不再执行打包测试；显式 `test:pack-release` / `pack:release` 仅在用户要求打包时运行。既有 tgz 仍是此前的历史快照，不代表当前工作区。旧配置、互联关系与唤醒授权不会继承，使用新版本需重新配置与建链。旧用户存储没有删除，实际 Desktop 安装未切换；旧安装源路径的软链接已移除。
+
+默认不打包、不增版本的约定已写入 `AGENTS.md`。详细边界见 [DuoLink 隔离说明](docs/plans/duolink-isolation.md)。
+
+---
+
+# Verification — DuoLink 0.6.1 README and repository update
+
+日期：2026-10-18。经用户明确授权，GitHub 原仓库已更名为 `cskeleton/dsh-gc-duolink`，node ID 仍为 `R_kgDOVD0Qpw`，本地 `origin` 已更新；新地址及旧地址 API 均返回同一仓库，新 origin 的 `git ls-remote ... HEAD` 成功。未 commit、push 或发布本地代码，未修改实际用户 profile。
+
+默认英文 README 为 `README.md`，首行 `[中文](README.zh.md) | English`；中文移至 `README.zh.md`，首行提供英文入口。包的 `files` 清单同步更新；当前本地交付版本 0.6.1。README 相对文件链接、双向语言链接及打包文件存在性校验通过；`pnpm test:contracts` 4/4 与 `git diff --check` 通过。
+
+本次只调整文档、包版本及打包文件清单。`lib/` 全部运行时文件及 `cordis.patch.yml` 与已验证 0.6.0 交付清单的 SHA256 一致，0.6.0 历史 tgz SHA256 保持不变。未重复运行此前通过的客户端、模型和浏览器流程；运行时依据为下列 0.6.0 证据。0.6.1 使用新目录和新文件名交付，避免覆盖旧包。
+
+以下保留 0.6.0 本地实现阶段及更早的验证记录；其中尚未更名 GitHub 等陈述描述当时状态。
+
+---
+
+# Verification — DuoLink 0.6.0
+
+日期：2026-10-18。包和真实目录改名为 `dsh-gc-duolink`，展示名 DuoLink · 会话互联；整合独立复制 ID 插件的菜单功能。保留当前 `master`、HEAD、全部原有文件和未提交修改；独立 `dsh-client-ui-copy-session-id` 文件哈希未变化。旧目录名为兼容软链接，保留 Desktop 既有 0.5.3 安装包来源路径。
+
+| 检查 | 当前结果与证据 |
+|---|---|
+| 客户端与 scope | PASS；`pnpm test:client`，111/111，11 files；含完整 ID、异步成功、不可用/拒绝/同步抛错 fallback、失败提示/重试和 DOM/focus 清理 |
+| TypeScript 与构建 | PASS；`pnpm typecheck`、`pnpm build`；浏览器 loader ID、Cordis 三个导出入口均使用新包名 |
+| 构建与交付契约 | PASS；`pnpm test:contracts`，4/4；RPC 签名、冻结 React 模块、全部 bundle 行精确匹配和版本化打包拒绝覆盖 |
+| 初始模型单位测试 | PASS；`pnpm exec vitest run tests/initial-model.spec.ts tests/model-spawn.spec.ts`，56/56 |
+| 官方 native proof | PASS；4 阶段，19 次 mock、0 付费调用；[JSON](output/initial-model-proof-result.json) |
+| 新包安装后的模型/历史兼容 | PASS；`pnpm test:initial-model-installed`，46 次 mock、0 付费调用；含卸载后原生恢复；[JSON](output/initial-model-installed-result.json) |
+| 新包真实浏览器 | PASS；Brave + 官方 DSH 0.2.0-rc.2；隔离 profile 中安装新名字 tgz、完整 UI smoke、未互联会话菜单复制到系统剪贴板、当前会话不切换、0 模型调用；[JSON](output/playwright/installed-smoke-result.json)、[菜单截图](output/playwright/duolink-copy-session-id.png) |
+| 旧包更换为新包 | PASS；`SMOKE_UPGRADE_FROM=.../output/0.5.3/dsh-session-link-0.5.3.tgz` 的同一浏览器 runner：旧版创建真实互联，停止临时服务后更换包，存储/profile 配置字节保留、新包读取原互联不变、仅新 bundle 启用、完整 UI smoke 通过；[JSON](output/playwright-rename/installed-smoke-result.json) |
+| 工作区与旧插件保留 | PASS；对照任务开始前文件清单和哈希，原有文件均保留，旧复制插件未修改，HEAD 和 master 未变化；`git diff --check` 通过 |
+
+兼容契约仍为 `session_link` version 1、`sessionLinks` RPC、五个工具名、`/session-link`、原命令 definition ID、历史消息标记和元数据。UI 槽位和浏览器模块使用新包身份；SDK 中排除宿主旧内置同名模块的规则继续保留。
+
+本次未修改或安装实际用户 profile，未重启 Desktop，未 commit/push/发布，未更名 GitHub 仓库或更新 origin。Electron 实机运行与本次 Host source 辅助回归均为 NOT_RUN。GitHub 推荐沿用原仓库改名，等待明确授权；详见 [说明](docs/plans/duolink-rename.md)。当前校验使用隔离运行时和浏览器，不消耗付费模型。
+
+以下保留 0.5.3 及更早的历史记录，历史包名、路径和计数不代表当前版本。
+
+---
+
+# Verification — 0.5.3 spawn Workspace placement
+
+日期：2026-10-16。当前交付版本 **0.5.3**；在已有未提交工作区上局部实现，未提交、未发布、未安装到用户 profile，未重启 Desktop。执行计划见 [spawn-workspace-placement.md](docs/plans/spawn-workspace-placement.md)。以下 0.5.2/M1/M2/实验记录保留历史范围。
+
+## 0.5.3 目录继承与 Workspace 归类（2026-10-16）
+
+已核对运行中的 `/Applications/DeepSeek Harness.app` 0.2.0-rc.2 的 asar：Session Controller 只在请求带 `workspaceId` 时关联成员，GUI 按 Workspace 的 `sessionIds` 分组。已安装插件两条创建路径只传 `cwd`；本机 spawn ledger 六个 Session 都未登记成员，其中五个目录已有 Workspace。问题是缺少显式成员登记。
+
+本版 `cwd` 可选。省略时使用真实调用方 header.cwd，并继承调用方 Workspace；调用方未分组则新会话也未分组。显式绝对目录在原生创建后通过公开 `workspaceRegistry.create(cwd)` 创建或复用 Workspace、再 `attachSession`，无需事先在 Desktop 打开；软链接规范化复用，子目录独立归类。两条创建路径在建链后、首次任务前汇合，不修改初始模型预写/原生 owner。Workspace 归类意图及完成收据保存在原 spawn ledger；失败明确暴露、首任务不入队；重试不重复创建，已完成调用不恢复人类后续移除的成员/分组，待完成的目标注册被删除时拒绝重建。旧已完成调用及历史会话不自动迁移。
+
+| 检查 | 当前结果与证据 |
+|---|---|
+| 官方 SDK 构建 | PASS；`env -u DSH_SOURCE_ROOT pnpm build`，DSH 0.2.0-rc.2，TypeScript 与浏览器/Host 打包完成 |
+| 客户端与 scope | PASS；`env -u DSH_SOURCE_ROOT pnpm test:client`，105/105，10 files |
+| 初始模型单位测试 | PASS；`env -u DSH_SOURCE_ROOT pnpm exec vitest run tests/initial-model.spec.ts tests/model-spawn.spec.ts`，56/56；新增省略/显式 Workspace 摘要区别，保留旧显式目录摘要 |
+| Host 辅助回归 | PASS；`DSH_SOURCE_ROOT=/Users/gc/Dev/Opensource/deepseek-harness pnpm test:host`，258/258，6 files；工具失败/重试/并发/旧调用回归，以及真实 Workspace 服务的分组、规范化、持久收据、重启、人类移除检查。使用 source testkit，单独列作辅助证据 |
+| 构建与打包契约 | PASS；`pnpm test:contracts`，4/4；Remote 签名、浏览器模块、peer/export 与版本化交付拒绝覆盖 |
+| 官方 native proof | PASS；`env -u DSH_SOURCE_ROOT node tests/integration/initial-model-proof.mjs`，4 阶段、19 次 mock、0 付费调用；[JSON](output/initial-model-proof-result.json) |
+| 官方 packed + Workspace/GUI proof | PASS；`env -u DSH_SOURCE_ROOT BROWSER_EXECUTABLE_PATH='/Applications/Brave Browser.app/Contents/MacOS/Brave Browser' pnpm test:workspace-installed`，5 阶段、46 次 mock、0 付费调用；普通/选模均覆盖继承、未分组、未注册现有目录、新目录、软链接、实际 Host 重启、原生模型控制；[JSON](output/initial-model-installed-result.json) |
+| 真实浏览器归类 | PASS；隔离 Brave + shipped Web GUI，先订阅再创建；新分组无需 reload 即出现，新会话可打开，刷新仍保留，0 未处理浏览器错误；[截图](output/playwright-workspace/workspace-live-created.png)。预览提示确认状态预置在临时 overlay，保持 profile/overlay 配置不变的原检查 |
+| 发布包 | 通过 `pnpm pack:release` 生成 `output/0.5.3/dsh-session-link-0.5.3.tgz`；最终逐文件一致性、导出完整性及 SHA256 以同目录 `delivery-manifest.json` 和 `SHA256SUMS` 为准 |
+| 边界 | Desktop Electron 本体、用户现用 profile 安装/升级、完整旧邮箱 UI smoke、真实远端模型调用本轮均 NOT_RUN；未改动 Host checkout、用户会话或旧版交付包 |
+
+单位/回归/契约合计 **423 项**，均为当前工作区运行结果；历史记录的测试数量不并入本轮。
+
+## Historical verification
+
+日期：2026-10-14。**当前交付以本页「0.5.2 安装问题修复」为准；功能行为沿用下方唤醒额度追加验收**。M1 已在 `9b56e40` 提交，M2 未提交、未发布，包版本已更新为 0.5.2；下方 0.5.0/M1/旧实验版记录保留其历史范围，不构成本轮新的依赖或需求。
+
+## 0.5.2 安装问题修复（2026-10-14）
+
+用户在 Desktop 插件安装窗口重复选择同一路径的 0.5.1 包：pnpm exit 0，但 DSH 返回“无法从依赖变更中确定安装了哪一个包”。原因已直接验证：我们此前在同一个版本/路径覆盖了不同内容；Desktop 依赖仍指向该 file spec，锁文件 integrity 与当前 tarball 不同，已安装 client.js 为 89,692 字节而新包为 108,218 字节（旧包不含 extendChainWakeFrom）。主机安装器成功执行 pnpm 后按 dependencies 前后差异识别目标；同路径无差异，裸路径又不匹配其包名回退规则，触发 ambiguous-install。peer warnings 和 cloudflared ignored-builds 不是这个错误的直接原因。
+
+修复为新的 **0.5.2 / output/0.5.2/dsh-session-link-0.5.2.tgz**，不再覆盖旧交付；双语安装说明指向新路径。新增 `pnpm pack:release`：先核对包中文件与工作区、导出入口，再独占创建制品；相同字节允许重复打包，不同字节的同版本制品明确拒绝，要求升级版本号。旧 0.5.1 文件保留为历史。
+
+| 检查 | 证据 |
+|---|---|
+| 隔离旧包→新包升级 | PASS；从用户已安装 0.5.1 仅复制插件公开包文件生成 fixture，在临时 Web profile 内执行与 GUI 相同的 `pluginManager/installBundle` RPC；同路径重复安装复现 pnpm exit 0 / ambiguous-install，换 0.5.2 后 bundle 被识别并返回 restart-required |
+| 重启与完整 Web 场景 | PASS；只重启测试 profile 后运行整套 M1/M2/追加额度 UI smoke，0 次模型调用；[结果](output/playwright-install-upgrade/installed-smoke-result.json) 的 upgradeEvidence 为 0.5.1→0.5.2、samePathFailureReproduced=true、restartVerified=true |
+| 构建与契约 | `pnpm build` PASS；`pnpm test:contracts` **4/4**。新增隔离 fixture 回归验证初次打包、相同重试、修改文件后拒绝覆盖且旧 archive 字节不变 |
+| 运行代码比较 | 当前构建的 **63 个 lib 文件**逐字节等于前轮已通过 400 项功能测试及 native/packed proof 的 0.5.1 最新实现；此次没有改动产品功能源码，不重复声称在 0.5.2 重跑了所有单位或 native proofs |
+| 发布包 | `pack:release` 逐文件核对、导出完整性与 SHA256；证据随包存放于 output/0.5.2/delivery-manifest.json 与 SHA256SUMS |
+
+Desktop profile 全程只读，未安装、删除、重启或更改用户现用实例；未提交或发布，原会话和配置保留。真实 Electron 的安装升级未执行，隔离 Web 使用的是相同 Host 安装 RPC。
+
+## 唤醒额度追加验收（2026-10-14，0.5.1 未发布工作区）
+
+用户确认[专项开发计划](docs/plans/chain-wake-budget.md)后，两个 GPT-6.1-Sol / high 子代理分别完成服务端与弹窗，主代理检查实现并运行下列最终集成门禁。此前 M1/M2 改动保留，没有向其他 DSH session 派发工作。
+
+- 默认链/UTC 日/单消息额度为 **8/12/1**；原配置字段可覆盖，显式旧值不变。首任务继续计入链和日额度，不重置历史。
+- `extendChainWakeFrom` 仅供人类 UI，严格解析归属及链根；追加收据与去重事实一起保存在原 ledger。请求重试、重启、并发陈旧确认不会重复加额；只有所选 pending 消息会被尝试继续投递。
+- 消息旁入口主动打开原生模态窗口，选择 4/8/自定义 1–100；显示当前计数、新上限、接收方日额度和其他限制。取消不写入；成功与刷新失败分开反馈；冲突需再次确认；owner 切换、隐藏、卸载清理窗口，迟到结果不污染别的会话。
+- 每日/单消息预算、wake:false、双向授权、归档、legacy 隔离、FIFO、取消/解绑不复活和初始模型原生 ownership 保持。五个模型工具不变。
+
+| 最终检查 | 结果与证据 |
+|---|---|
+| 官方 SDK typecheck/build | PASS；`env -u DSH_SOURCE_ROOT pnpm typecheck` 与 `pnpm build`，0.5.1 / 官方 0.2.0-rc.2 peers |
+| `pnpm test` | PASS；client + scope **105/105**（10 files），initial-model/model-spawn **55/55**，built contracts **3/3**，另包括下方两个 installed proofs |
+| `pnpm test:host` | PASS；**237/237**（5 files），与上述单位/客户端/契约合计 **400 项** |
+| native proof | PASS；**19 次 mock、0 付费**；[结果](output/initial-model-proof-result.json) |
+| packed proof | PASS；**39 次 mock、0 付费**；[结果](output/initial-model-installed-result.json)。真实双方交替完成 8 次自动唤醒，第 9 条排队；人类 +4 后仅新增 1 次请求；同请求并发重放不二次加额/派发，旧总额确认返回 conflict；真实 Host 重启后再次重放保持 extra=4、used=9、零请求 |
+| packed Web / Brave | PASS；[结果](output/playwright-wake-extension/installed-smoke-result.json)。真实 RPC/界面验证默认计数、主动弹窗、默认4/选择8/自定义无效值、取消零写入及回焦、确认后 extra=4/limit=12、未授权情况下仍 queued、重复请求不加额、陈旧请求 conflict，以及原 M1/M2 场景；0 次模型调用 |
+| 视觉核对 | 已查看[浅色弹窗](output/playwright-wake-extension/session-link-wake-dialog.png)、[暗色弹窗](output/playwright-wake-extension/session-link-wake-dialog-dark.png)、[窄视口弹窗](output/playwright-wake-extension/session-link-wake-dialog-narrow.png)。原生模态遮罩、单选与确认/取消可读，窗口不横向溢出 |
+| diff | `git diff --check` PASS |
+
+浏览器 fixture 的耗尽链来自显式注入的前日历史，用来验证窗口与 RPC，不把它算成真实发生过的 8 次唤醒；真实扣减、解除链阻塞后的请求次数和重启去重由独立 packed mock proof 验证。两者均为隔离 home/profile，未修改用户运行实例。
+
+本轮复核补足：投递尝试耗尽后正确报告 failed/not_pending；成功追加且刷新失败时旧行显示新限额；响应不确定时保留相同 requestId/payload，实际拒绝原因不隐藏；显示“继续检查时状态”，不把历史回执冒充实时状态；严格拒绝矛盾的协议状态。现有测试未删除或 skip。
+
+本阶段历史交付为 `output/0.5.1/dsh-session-link-0.5.1.tgz`，同目录 SHA256SUMS 与 delivery-manifest.json 描述本次构建。旧 0.5.0 历史包不变。未提交、push、发布、安装现用 profile；Electron、付费模型与实验 profile 迁移仍为 **NOT_RUN**。M3/M4 暂缓结论不变。
+
+## M2 里程碑验证（2026-10-14，未发布工作区）
+
+接续 `session-53d3fc31-5833-49ef-8e80-d6373b690f40` 的最后状态与 [有效规划](ITERATION_ROADMAP_0_5_BASELINE.md)。当前分支直接开发，由主代理及 Sol high 子代理完成；未再向 DSH session 派发任务。M3 仍等待真实使用反馈，M4 仍等待可复现规模问题，不启动追溯扩建、GC 或宿主改造。
+
+**M2-A 先独立验收**：人类 RPC `cancelMessageFrom({ sessionId, messageId })` 在原串行临界区重读归属与目标持有证据，返回 cancelled / already_terminal / too_late 和检查时状态。原模型取消接口保持兼容；普通邮件仅限原始双方，断链不丢失归属，legacy 标记（含非字符串值）拒绝并保持只读。UI 共用写入门控，重复点击只发一次，owner 切换丢弃迟到反馈，刷新失败与已接受操作分开提示；解除确认说明不停止运行、不撤回交付内容。该阶段 typecheck/build、客户端、宿主 **178 项**、native **19** / packed **30** 次 mock 请求与隔离 Web smoke 均通过（[阶段结果](output/playwright-m2a/installed-smoke-result.json)）。
+
+**M2-B 后单独实施并最终合并验收**：仅 send 增加可选布尔 `wake`；新消息记录持久化意图，旧缺字段按 true。false 不主动冷恢复、不唤醒空闲目标、不扣额度，同 key 重放使用原值；running 的 next-turn、合法唤醒/人类活动带来的 FIFO 顺带交付保持。spawn 不接受 wake，初始模型和原生 owner 流程不变。activity/UI 以“此消息不申请唤醒”区别于授权不足。新提示计入字节限额，旧正文不重写，预览识别新旧精确框架；中英文说明记录降级可能丢失 wake 语义。
+
+| 最终检查 | 当前证据 |
+|---|---|
+| 官方 SDK typecheck / build | PASS；`env -u DSH_SOURCE_ROOT pnpm typecheck` / `pnpm build`，官方 0.2.0-rc.2 peers |
+| `pnpm test` | PASS；client **91/91**（9 files）、initial-model/model-spawn **55/55**、built contracts **3/3**；包括下方两个真实安装 proof |
+| 官方 native bootstrap | PASS；**19 次 mock、0 次付费**；[结果](output/initial-model-proof-result.json) |
+| 官方 packed 工具 proof | PASS；**30 次 mock、0 次付费**；额外验证真实 send 的 false→true 重放不升级、无新增请求、严格 wake/schema、接收方人类取消；[结果](output/initial-model-installed-result.json) |
+| `DSH_SOURCE_ROOT=/Users/gc/Dev/Opensource/deepseek-harness pnpm test:host` | PASS；**209/209**（5 files）：冷热/运行状态 × omitted/true/false、重启/旧记录、FIFO、预算、取消/插入/flush/解绑竞争、legacy 隔离、字节上限与工具严格参数 |
+| packed Web smoke | PASS；Brave + 隔离 profile，**0 次模型调用**；真实取消 UI/RPC、第三方拒绝、接收方重复取消、写后刷新、unlink 保留 cancelled、wake:false 阻塞文案，以及原 M1 生命周期场景；[结果](output/playwright-m2/installed-smoke-result.json) |
+| 图像核对 | 已查看最终[取消界面](output/playwright-m2/session-link-mail.png)、[窄栏](output/playwright-m2/session-link-narrow.png)、[暗色](output/playwright-m2/session-link-dark.png)，内容可读，无新增截断/重叠 |
+| 独立代码复核 | 修复 too_late/pending 缓存永久禁用：新权威快照可恢复取消；结果文案标为“取消检查时状态”，避免冒充实时状态。回归均纳入 client 门禁 |
+| `git diff --check` | PASS |
+
+本轮调试记录：首个浏览器取消拒绝断言错误地要求普通异常的 `code` 穿过宿主 RPC，改为核对真实公开的拒绝文本；服务端原始错误 code 仍由 host 测试校验。新增框架提示后，三个原 400 字节恢复测试无法再容纳合法短任务，限额改为 700；原 800 字符超长载荷仍被拒绝，并新增恰好上限/少一字节测试。没有删除或 skip 既有回归。
+
+边界：未提交、push、发布或安装到用户现用 profile；保留无关 `doraemon-bicycle.html`。Desktop Electron、真实收费模型、实验 profile 迁移为 **NOT_RUN**。取消只控制尚未被目标持有的投递，不停止运行、不撤回已交付内容。单测中的故障注入不作为真实磁盘断电证明。
+
+### 后续阶段门禁与本地交付（2026-10-14）
+
+用户在继续 Goal 时明确反馈“暂时没有明显追溯痛点”。Sol high 子代理只读复盘指定 session，确认四类历史案例：引用已有会话（seq 30）、两个独立研究返回（153/174/188）、指定初始模型的实施交接（525/571/589）、多轮 M1 复审及状态同步（589/742/973/1116/1198）。这些是 M2 实际使用前的通信事实，不证明新增折叠链会降低查日志成本；M3 按原计划保留最近列表。未确认跨目录、预算排队或取消错误消息的真实使用反馈，不以测试 fixture 冒充用户反馈。
+
+本地存储只读快照：9 组、38 条消息（其中 25 条带父引用）、120,786 字节；没有已报告或可复现的规模问题。没有因此启动 M4，也未把条数或文件大小当作性能基准。
+
+交付审计发现原 `output/dsh-session-link-0.5.0.tgz` 仍为 10 月 13 日基线，不能当作 M2 包。保留原历史包及其校验和；首次 M2 临时包独立放在 `output/m2-unreleased/dsh-session-link-0.5.0.tgz`，旁附 SHA256SUMS 与交付 manifest。该次临时快照当时沿用 0.5.0 package version，现已由下方 0.5.1 交付取代。包内补入 README 直接引用的有效规划与 ADR-001；其他源码/历史证据链接仍需仓库环境。
+
+### 首次 0.5.1 版本编号与交付（历史）
+
+按用户要求将当前 M1/M2 工作区正式编号为 0.5.1，但未执行发布、提交或现用 profile 安装。新包路径为 `output/0.5.1/dsh-session-link-0.5.1.tgz`；旧基线和 `m2-unreleased` 临时快照保留为历史，当前安装示例已指向 0.5.1。本次仅修改版本号与交付文档，功能验收仍以本页上方 358 项测试及 native/packed/Web 结果为准；版本交付另行检查 build、构建契约、包内版本、所有导出与逐文件一致性，结果随包记录在 `delivery-manifest.json` 和 `SHA256SUMS`。
+
+## 0.5.0 基线结果（历史）
 
 | 检查 | 当前证据 |
 |---|---|
@@ -337,7 +501,7 @@ The browser smoke exercised add, wake toggle, configured one-second polling of a
 
 The contract tests inspect the actual built host methods' `request` and final `signal` parameter names, Remote markers, every bundle export, declared host peers, and the browser factory's React-only runtime imports. No generated Remote metadata or DSH source modification is needed.
 
-Screenshots of the actual app were visually inspected in both themes. Detailed installed-smoke evidence is in [tests/integration/RESULTS.md](tests/integration/RESULTS.md); rerun instructions are in [README.md](README.md#开发与验证). Screenshots live in `output/playwright/`.
+Screenshots of the actual app were visually inspected in both themes. Detailed installed-smoke evidence is in [tests/integration/RESULTS.md](tests/integration/RESULTS.md); rerun instructions are in [README.zh.md](README.zh.md#开发与验证). Screenshots live in `output/playwright/`.
 
 UI changes in another window or from a command use polling, defaulting to 30 seconds; acknowledged writes refresh immediately. The plugin's `uiConversation` tail card is optional. Existing fork implementations must be disabled before activating the external plugin in the same profile.
 

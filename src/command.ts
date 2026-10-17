@@ -1,9 +1,9 @@
 /**
- * Human-facing `/session-link` command over the Session Link registry. Every
+ * Human-facing `/gc-duolink` command over the Session Link registry. Every
  * mutation records the human as its granting authority; the model never sees
  * this command. It registers in the scope of top-level Agents whose preset
  * the row config lists.
- * @module dsh-session-link/command-session-link
+ * @module dsh-gc-duolink/command-session-link
  */
 
 import type { Context } from '@deepseek-ai/cordis'
@@ -16,21 +16,21 @@ import type {} from './index.ts'
 import type {} from '@deepseek-ai/dsh-api-session-controller'
 import { mountPerPresetAgent, PresetScopeConfig, resolvePresets } from './scope.ts'
 
-export const name = 'command-session-link'
-export const inject = ['commands', 'sessionLinks', 'agents', 'sessions']
+export const name = 'command-gc-duolink'
+export const inject = ['commands', 'gcDuolink', 'agents', 'sessions']
 
 /** Row configuration: which presets' top-level Agents receive the command. */
 export type Config = PresetScopeConfig
 /** Loader-visible row schema. */
 export const Config = PresetScopeConfig
 
-const USAGE = 'Usage: /session-link [list|add <peer-session-id> [wake]|wake <peer-session-id> on|off|revoke <link-id>]'
+const USAGE = 'Usage: /gc-duolink [list|add <peer-session-id> [wake]|wake <peer-session-id> on|off|revoke <link-id>]'
 
 /** One successful listing row, rendered for the dispatching human. */
 function listing(ctx: Context, invocation: CommandInvocation): string {
-  const links = ctx.sessionLinks.list(invocation.agent.id)
+  const links = ctx.gcDuolink.list(invocation.agent.id)
   if (links.length === 0) {
-    return '本会话不属于任何会话互联组。用 /session-link add <另一个会话ID> 把另一个已有会话与本会话互联，对方会话 ID 可在其会话信息或 /session-link 输出中查看。'
+    return '本会话不属于任何会话互联组。用 /gc-duolink add <另一个会话ID> 把另一个已有会话与本会话互联，对方会话 ID 可在其会话信息或 /gc-duolink 输出中查看。'
   }
   return links.map((link) => {
     const peers = link.memberIds
@@ -45,7 +45,7 @@ function listing(ctx: Context, invocation: CommandInvocation): string {
   }).join('\n\n')
 }
 
-/** Parse `/session-link` grammar; anything unrecognized is a usage error. */
+/** Parse `/gc-duolink` grammar; anything unrecognized is a usage error. */
 function parse(input: string):
   | { readonly kind: 'list' }
   | { readonly kind: 'add'; readonly sessionId: SessionId; readonly wake: boolean }
@@ -69,7 +69,7 @@ function parse(input: string):
   return { kind: 'invalid' }
 }
 
-/** Execute one parsed `/session-link` invocation. */
+/** Execute one parsed `/gc-duolink` invocation. */
 async function execute(
   ctx: Context,
   invocation: CommandInvocation,
@@ -87,9 +87,9 @@ async function execute(
       const tail = String(parsed.sessionId).split('-').at(-1) ?? String(parsed.sessionId)
       let id: SessionLinkId
       try {
-        ctx.sessionLinks.assertOrdinaryTarget(invocation.agent.id, invocation.agent.session.header)
-        ctx.sessionLinks.assertOrdinaryTarget(parsed.sessionId, await ctx.sessionLinks.inspectHeader(parsed.sessionId))
-        ;({ id } = await ctx.sessionLinks.link(
+        ctx.gcDuolink.assertOrdinaryTarget(invocation.agent.id, invocation.agent.session.header)
+        ctx.gcDuolink.assertOrdinaryTarget(parsed.sessionId, await ctx.gcDuolink.inspectHeader(parsed.sessionId))
+        ;({ id } = await ctx.gcDuolink.link(
           `互联-${tail}`,
           [invocation.agent.id, parsed.sessionId],
           { kind: 'human' },
@@ -100,22 +100,22 @@ async function execute(
         return {
           kind: 'error',
           text: error.code === 'LINK_ALREADY_LINKED'
-            ? `会话 ${parsed.sessionId} 已与本会话互联，用 /session-link 查看现有互联组`
+            ? `会话 ${parsed.sessionId} 已与本会话互联，用 /gc-duolink 查看现有互联组`
             : error.message,
         }
       }
       return {
         kind: 'success',
-        text: `已把会话 ${parsed.sessionId} 与本会话互联（组 ${id}${parsed.wake ? '，auto-wake 已开' : ''}）：双方可用 session_send_session_message 互发消息；随时用 /session-link revoke ${id} 解除。`,
+        text: `已把会话 ${parsed.sessionId} 与本会话互联（组 ${id}${parsed.wake ? '，auto-wake 已开' : ''}）：双方可用 gc_duolink_send_message 互发消息；随时用 /gc-duolink revoke ${id} 解除。`,
       }
     }
     case 'revoke': {
-      const linked = ctx.sessionLinks.list(invocation.agent.id).find(link => link.id === parsed.linkId)
+      const linked = ctx.gcDuolink.list(invocation.agent.id).find(link => link.id === parsed.linkId)
       if (linked === undefined) {
-        return { kind: 'error', text: `当前会话不属于互联组 ${parsed.linkId}（用 /session-link 查看本会话的互联组）` }
+        return { kind: 'error', text: `当前会话不属于互联组 ${parsed.linkId}（用 /gc-duolink 查看本会话的互联组）` }
       }
       try {
-        await ctx.sessionLinks.unlink(parsed.linkId)
+        await ctx.gcDuolink.unlink(parsed.linkId)
       } catch (error: unknown) {
         if (error instanceof SessionLinkError) return { kind: 'error', text: error.message }
         throw error
@@ -126,7 +126,7 @@ async function execute(
       }
     }
     case 'wake': {
-      const owned = ctx.sessionLinks.list(invocation.agent.id)
+      const owned = ctx.gcDuolink.list(invocation.agent.id)
       const hit = owned
         .map(link => ({ link, peer: parsed.sessionId }))
         .filter(({ link, peer }) => link.memberIds.includes(peer))
@@ -138,7 +138,7 @@ async function execute(
       }
       try {
         for (const { link, peer } of hit) {
-          await ctx.sessionLinks.setMemberAutoWake(link.id, peer, parsed.on, invocation.agent.id)
+          await ctx.gcDuolink.setMemberAutoWake(link.id, peer, parsed.on, invocation.agent.id)
         }
       } catch (error: unknown) {
         if (error instanceof SessionLinkError) return { kind: 'error', text: error.message }
@@ -155,19 +155,19 @@ async function execute(
 }
 
 /**
- * Register the `/session-link` command in each eligible top-level Agent's scope.
+ * Register the `/gc-duolink` command in each eligible top-level Agent's scope.
  * @param ctx - registrant context carrying the command, Session Link, and Agent registries.
  * @param config - presets whose top-level Agents receive the command.
  */
 export function apply(ctx: Context, config: Config = {}): void {
   const command: CommandDefinition = {
-    definitionId: CommandDefinitionId('dsh-session-link/command'),
-    name: 'session-link',
+    definitionId: CommandDefinitionId('dsh-gc-duolink/command'),
+    name: 'gc-duolink',
     description: '查看本会话的互联组，开关对端自动唤醒，或解除互联',
     input: { hint: '[list|add <peer-session-id> [wake]|wake <peer-session-id> on|off|revoke <link-id>]' },
     handler: invocation => execute(ctx, invocation),
   }
-  mountPerPresetAgent(ctx, resolvePresets(config), 'session-link-command', ['commands'], (scoped) => {
+  mountPerPresetAgent(ctx, resolvePresets(config), 'gc-duolink-command', ['commands'], (scoped) => {
     scoped.commands.register(command)
   })
 }

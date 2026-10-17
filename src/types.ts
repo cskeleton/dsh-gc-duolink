@@ -1,6 +1,6 @@
 /**
  * Session Link vocabulary shared by the service, its tools, and durable state.
- * @module dsh-session-link/types
+ * @module dsh-gc-duolink/types
  */
 
 import type { Branded } from '@deepseek-ai/dsh-brand'
@@ -34,7 +34,7 @@ export function SessionLinkMessageId(value: string): SessionLinkMessageId {
 
 /** Stable sender attribution recorded in the target Session, never accepted from tool input. */
 export interface SessionLinkMessageSource {
-  readonly kind: 'session-link-message'
+  readonly kind: 'gc-duolink-message'
   /** Durable identity used for deduplication at the target Session. */
   readonly messageId: SessionLinkMessageId
   /** Group under which this message was admitted; recorded for forensics, not for live authorization. */
@@ -89,6 +89,8 @@ export interface SessionLinkMessageRecord {
   readonly inReplyTo?: SessionLinkMessageId
   /** Framed model-facing body, sender frame included; stored once at admission. */
   readonly text: string
+  /** Persisted send intent. False never requests an idle wake; old missing values mean true. */
+  readonly wake?: boolean
   readonly status: SessionLinkMessageStatus
   /** Counts each host-initiated automatic wake this message caused. */
   readonly wakesUsed: number
@@ -103,7 +105,7 @@ export interface SessionLinkMessageRecord {
   readonly idempotencyKey?: string
   /** Monotonic admission sequence; absent on messages admitted before 0.4.0. */
   readonly seq?: number
-  /** Set before the message is handed to the target; such a message is never made terminal. */
+  /** Pre-insertion intent marker: a cold target may hold it; a live target's log is authoritative. */
   readonly inserted?: boolean
 }
 
@@ -114,7 +116,7 @@ export interface SessionLinkWakeLedgerEntry {
   readonly wakes: number
 }
 
-/** The summary the `session_list_links` tool and future management surfaces read. */
+/** The summary the `gc_duolink_list_links` tool and future management surfaces read. */
 export interface SessionLinkSummary {
   readonly id: SessionLinkId
   readonly name: string
@@ -149,12 +151,46 @@ export type SessionLinkActivitySection = 'pending' | 'recent'
  */
 export type SessionLinkBlockingReason =
   | 'wake-unauthorized'
+  | 'wake-not-requested'
   | 'wake-budget'
   | 'archived'
   | 'cold-target'
   | 'delivery-unverified'
   | 'link-revoked'
   | 'unknown'
+
+/** Read-only counters for a reliably resolved ordinary reply chain. */
+export interface SessionLinkWakeBudget {
+  readonly rootId: SessionLinkMessageId
+  readonly chain: { readonly used: number; readonly baseLimit: number; readonly extra: number; readonly limit: number; readonly remaining: number }
+  /** The selected message's receiver, irrespective of the viewing participant. */
+  readonly targetDay: { readonly used: number; readonly limit: number; readonly day: string; readonly resetsAt: string }
+  readonly message: { readonly used: number; readonly limit: number }
+  readonly canExtend: boolean
+}
+
+/** Human confirmation of one idempotent, compare-and-set chain extension. */
+export interface SessionLinkExtendWakeRequest {
+  readonly sessionId: SessionId
+  readonly messageId: SessionLinkMessageId
+  /** Positive integer, 1 through 100. */
+  readonly additional: number
+  /** Previously observed total extension, a nonnegative safe integer. */
+  readonly expectedExtra: number
+  /** One confirmation identity, retained unchanged on network retries. */
+  readonly requestId: string
+}
+
+/** Extension receipt and actual selected-message continuation facts. */
+export interface SessionLinkExtendWakeResult {
+  readonly messageId: SessionLinkMessageId
+  readonly requestId: string
+  readonly outcome: 'applied' | 'replayed' | 'conflict'
+  readonly budget: SessionLinkWakeBudget
+  readonly continuation: 'accepted' | 'queued' | 'not_pending' | 'not_attempted'
+  readonly status: SessionLinkMessageStatus
+  readonly blockingReasons: readonly SessionLinkBlockingReason[]
+}
 
 /** One mailbox row as the activity view projects it; carries no model-visible body. */
 export interface SessionLinkActivityEntry {
@@ -178,6 +214,7 @@ export interface SessionLinkActivityEntry {
   readonly canCancel: boolean
   /** Known reasons this pending message has not moved; empty for terminal and delivered rows. */
   readonly blockingReasons: readonly SessionLinkBlockingReason[]
+  readonly wakeBudget?: SessionLinkWakeBudget
 }
 
 /** Live posture of one counterparty named on the returned page. */
@@ -223,7 +260,7 @@ export interface SessionLinkActivityView {
 }
 
 /**
- * Request accepted by the `sessionLinks/activityView` Remote: a read-only,
+ * Request accepted by the `gcDuolink/activityView` Remote: a read-only,
  * paginated mailbox observation. `sessionId` selects the viewed mailbox and is
  * not an identity credential; viewing grants no send rights.
  */
@@ -245,8 +282,8 @@ export interface SessionLinkActivityRequest {
 export type SessionLinkActivityQuery = Omit<SessionLinkActivityRequest, 'sessionId'>
 
 /**
- * Request accepted by the `sessionLinks/linkFrom` Remote: link the caller's
- * Session with one peer, granted as `{ kind: 'human' }` like the `/session-link`
+ * Request accepted by the `gcDuolink/linkFrom` Remote: link the caller's
+ * Session with one peer, granted as `{ kind: 'human' }` like the `/gc-duolink`
  * command path.
  */
 export interface SessionLinkAddRequest {
@@ -260,18 +297,31 @@ export interface SessionLinkAddRequest {
   readonly autoWakeCaller?: boolean
 }
 
-/** Result of one accepted `sessionLinks/linkFrom` Remote call. */
+/** Result of one accepted `gcDuolink/linkFrom` Remote call. */
 export interface SessionLinkAddResult {
   readonly linkId: SessionLinkId
 }
 
-/** Request accepted by the `sessionLinks/unlinkFrom` Remote; the caller must be a member. */
+/** Request accepted by the `gcDuolink/unlinkFrom` Remote; the caller must be a member. */
 export interface SessionLinkRevokeRequest {
   readonly callerId: SessionId
   readonly linkId: SessionLinkId
 }
 
-/** Request accepted by the `sessionLinks/setAutoWakeFrom` Remote: toggle one member's auto-wake in one group. */
+/** Human-only mailbox control, scoped to either original participant. */
+export interface SessionLinkCancelRequest {
+  readonly sessionId: SessionId
+  readonly messageId: SessionLinkMessageId
+}
+
+/** The observed cancellation boundary, never a promise to stop a running turn. */
+export interface SessionLinkCancelResult {
+  readonly messageId: SessionLinkMessageId
+  readonly outcome: 'cancelled' | 'already_terminal' | 'too_late'
+  readonly status: SessionLinkMessageStatus
+}
+
+/** Request accepted by the `gcDuolink/setAutoWakeFrom` Remote: toggle one member's auto-wake in one group. */
 export interface SessionLinkWakeRequest {
   readonly callerId: SessionId
   readonly linkId: SessionLinkId
@@ -307,6 +357,8 @@ export interface SessionLinkSendResult {
 export interface SessionLinkSendRequest {
   readonly targetId: SessionId
   readonly text: string
+  /** False queues without requesting an idle wake or cold resume; omitted means true. */
+  readonly wake?: boolean
   /** Original message this replies to; must be one the caller received. */
   readonly inReplyTo?: SessionLinkMessageId
   /** Call-site idempotency identity: a resubmitted key returns the original admission result. */
@@ -315,7 +367,7 @@ export interface SessionLinkSendRequest {
   readonly signal?: AbortSignal
 }
 
-/** Deployment limits for the Session Link service. */
+/** Deployment limits resolved at plugin load; reload the plugin after changing configuration. */
 export interface Config {
   /** Browser catalog refresh interval in milliseconds, from 1000 to 2147483647. @default 30000 */
   readonly uiPollIntervalMs?: number
@@ -325,11 +377,11 @@ export interface Config {
   readonly maxPendingPerTarget?: number
   /** Maximum UTF-8 bytes of one sender-framed message body. @default 16384 */
   readonly maxMessageBytes?: number
-  /** Maximum automatic wakes a Session may spend in one UTC day. @default 6 */
+  /** Maximum automatic wakes a Session may spend in one UTC day. @default 12 */
   readonly maxAutoWakesPerSessionPerDay?: number
   /** Maximum automatic wake claims any single message may cause. @default 1 */
   readonly maxAutoWakesPerMessage?: number
-  /** Maximum automatic wakes spent on one reply chain across the link. @default 4 */
+  /** Base maximum automatic wakes spent on one reply chain across groups and both directions. @default 8 */
   readonly maxAutoWakesPerChain?: number
   /** Failed cold-target resumes after which a message the target does not hold becomes terminal `failed`. @default 3 */
   readonly maxDeliveryAttempts?: number
@@ -360,6 +412,9 @@ export class SessionLinkError extends Error {
       | 'MAILBOX_FULL'
       | 'MESSAGE_TOO_LARGE'
       | 'WAKE_BUDGET_EXHAUSTED'
+      | 'WAKE_CHAIN_INVALID'
+      | 'WAKE_EXTENSION_INVALID'
+      | 'WAKE_EXTENSION_REQUEST_CONFLICT'
       | 'TARGET_NOT_ORDINARY'
       | 'TARGET_ARCHIVED'
       | 'TARGET_OWNED_BY_SUBAGENT'
