@@ -8,6 +8,12 @@ Bidirectional Session messaging and utilities for DeepSeek Harness Desktop and W
 
 **Preview release: [0.6.1-beta](https://github.com/cskeleton/dsh-gc-duolink/releases/tag/v0.6.1-beta).** DuoLink uses independent configuration, storage and protocol identities. It does not load or migrate old `dsh-session-link` settings, mail, link groups or ledgers. Disable or uninstall the old plugin and recreate links and wake grants in DuoLink. Keep old storage files if you need them; do not rename or copy them into the new domain. See [namespace isolation](docs/plans/duolink-isolation.md) and [verification](VERIFICATION.md).
 
+## Visual guide
+
+![DuoLink in normal use: Session sidebar, conversation and management panel in one window](docs/images/introduction/en/00-cover.png)
+
+The cover shows a normal working window: the Session sidebar, a live conversation and the DuoLink management panel. A tour in six figures of the main features and UI interactions — entry points, the quick linker, the management panel, the mailbox, wake-budget extension and spawned Sessions — is in [docs/introduction.md](docs/introduction.md) ([中文](docs/introduction.zh.md)).
+
 ## Usage
 
 Use DSH's built-in **Copy Session ID** action in a Session row's `…` menu. DuoLink does not add a second copy action. Its **Session links…** entry uses the Host's menu component for matching typography and spacing.

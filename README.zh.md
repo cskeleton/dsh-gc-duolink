@@ -8,6 +8,12 @@ DeepSeek Harness Desktop / Web 的会话互联与消息插件：建立互联、�
 
 **预发布版本：[0.6.1-beta](https://github.com/cskeleton/dsh-gc-duolink/releases/tag/v0.6.1-beta)。** DuoLink 使用独立的配置、存储与协议标识，不读取或迁移旧 `dsh-session-link` 的配置、互联组、邮箱和账本。请先停用或卸载旧插件，再在 DuoLink 中重新建立互联与唤醒授权；旧存储文件可保留，请勿改名或复制到新存储域。详见 [命名空间隔离](docs/plans/duolink-isolation.md) 和 [验证记录](VERIFICATION.md)。
 
+## 图文介绍
+
+![DuoLink 正常使用中的完整窗口：会话侧栏、对话与管理面板同屏](docs/images/introduction/zh/00-cover.png)
+
+首图展示正常使用中的完整窗口：会话侧栏、对话与管理面板同屏；六张截图串起主要功能与界面交互：三个入口、快速互联、右侧管理面板、邮箱与取消、追加唤醒额度、新建会话。完整说明见 [docs/introduction.zh.md](docs/introduction.zh.md)（[English](docs/introduction.md)）。
+
 ## 使用
 
 复制会话 ID 使用 DSH 在会话列表 `…` 菜单中的内置入口，DuoLink 不再新增重复入口。「会话互联…」使用宿主菜单组件，字号和间距与原生菜单保持一致。
